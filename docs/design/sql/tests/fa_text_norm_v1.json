@@ -1,0 +1,26 @@
+{
+  "format": "hk-test-vectors/1",
+  "normalizer": "fa-norm-v1",
+  "note": "Shared vectors for core.fa_normalize_text / fa_normalize_ident / fa_search_key (SQL) and hesabketab.core.text (Python). Every implementation must produce exactly these outputs. Strings use JSON \\u escapes for invisible characters.",
+  "vectors": [
+    {"id": "arabic-yeh-kaf", "input": "يك كتابي", "text": "یک کتابی", "ident": "یک کتابی", "search": "یک کتابی"},
+    {"id": "alef-maksura", "input": "موسى", "text": "موسی", "ident": "موسی", "search": "موسی"},
+    {"id": "persian-digits", "input": "کد ۱۲۳۴", "text": "کد ۱۲۳۴", "ident": "کد 1234", "search": "کد 1234"},
+    {"id": "arabic-indic-digits", "input": "١٢٣", "text": "۱۲۳", "ident": "123", "search": "123"},
+    {"id": "zwnj-preserved", "input": "می\u200cروم", "text": "می\u200cروم", "ident": "میروم", "search": "میروم"},
+    {"id": "zwnj-runs-and-edges", "input": "\u200cکتاب\u200c\u200cها\u200c نو\u200c", "text": "کتاب\u200cها نو", "ident": "کتابها نو", "search": "کتابها نو"},
+    {"id": "kashida-and-bidi", "input": "\u200fسلــام\u200e", "text": "سلام", "ident": "سلام", "search": "سلام"},
+    {"id": "whitespace-collapse", "input": "  الف\t\u00a0 ب  ", "text": "الف ب", "ident": "الف ب", "search": "الف ب"},
+    {"id": "newlines", "input": "a \r\n b\r\rc\n\n\n\nd", "text": "a\nb\n\nc\n\nd", "ident": "a b c d", "search": "a b c d"},
+    {"id": "diacritics-nfkc-reorder", "input": "م\u064fح\u064eم\u0651\u064eد", "text": "م\u064fح\u064eم\u064e\u0651د", "ident": "م\u064fح\u064eم\u064e\u0651د", "search": "محمد", "note": "NFKC canonically reorders combining marks (fatha ccc=30 before shadda ccc=33)"},
+    {"id": "alef-hamza-variants", "input": "آب أحمد إیران", "text": "آب أحمد إیران", "ident": "آب أحمد إیران", "search": "اب احمد ایران"},
+    {"id": "teh-marbuta-heh-yeh", "input": "مدرسة خانۀ", "text": "مدرسة خانۀ", "ident": "مدرسة خانۀ", "search": "مدرسه خانه"},
+    {"id": "nfkc-presentation", "input": "\ufefb \ufb8e", "text": "لا ک", "ident": "لا ک", "search": "لا ک"},
+    {"id": "nfkc-rial-sign", "input": "100\ufdfc", "text": "100ریال", "ident": "100ریال", "search": "100ریال"},
+    {"id": "latin-case", "input": "LED-A60 ＡＢ", "text": "LED-A60 AB", "ident": "LED-A60 AB", "search": "led-a60 ab"},
+    {"id": "heh-goal", "input": "ہال", "text": "هال", "ident": "هال", "search": "هال"},
+    {"id": "mixed-national-id", "input": "\u200e۰۰۱۲۳۴۵۶۷۸ ", "text": "۰۰۱۲۳۴۵۶۷۸", "ident": "0012345678", "search": "0012345678"},
+    {"id": "only-invisibles", "input": "\u200c\u200f ـ", "text": "", "ident": "", "search": ""},
+    {"id": "empty", "input": "", "text": "", "ident": "", "search": ""}
+  ]
+}
