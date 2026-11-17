@@ -1,0 +1,14 @@
+{
+  "format": "hk-vectors/1",
+  "name": "assistant.provider_fingerprint",
+  "algorithm": "hex(sha256(utf8('hkllm1|' + lower(trim(operator)) + '|' + lower(host(base_url)) + '|' + data_location)))",
+  "twins": ["SQL assistant.provider_fingerprint", "Python hesabketab.assistant.domain.provider.fingerprint"],
+  "vectors": [
+    {"operator": "Iranian AI Co", "base_url": "https://API.Example.ir/v1", "data_location": "iran",
+     "expected": "4a43acd40cff6f3730caef30f6d857ecf139d4ed89d983b1c2e435f9ebb2f8f2"},
+    {"operator": "  Our LAN vLLM ", "base_url": "http://10.0.0.5:8000/v1", "data_location": "lan",
+     "expected": "78d64de18c546ad3ac0e81d061d818428e6861248a39ebb766c73ccf8c1b2e8e"},
+    {"operator": "شرکت هوش ایران", "base_url": "https://llm.hooshiran.ir:8443/openai/v1", "data_location": "iran",
+     "expected": "da5ba91c78fbaf85dc3aad3834ae740cb300f798034ed343b00cd8a200eb868a"}
+  ]
+}

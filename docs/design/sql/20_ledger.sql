@@ -575,6 +575,10 @@ CREATE TABLE IF NOT EXISTS ledger.journal_draft (
   recurring_occurrence  date,
   input_amount_unit     core.amount_unit,
   legacy_ref            text,
+  -- منشأ پیش‌نویس؛ سرویس از principal تعیین می‌کند و کلاینت نمی‌تواند آن را بفرستد.
+  -- 'assistant' = پیشنهاد دستیار هوشمند (Q-F): فقط کاربر انسانی می‌تواند آن را ارسال (submit) کند.
+  created_via           text NOT NULL DEFAULT 'user'
+                        CHECK (created_via IN ('user','api','recurring','copy','import','assistant')),
   created_by            uuid,
   created_at            timestamptz NOT NULL DEFAULT now(),
   updated_at            timestamptz NOT NULL DEFAULT now(),
@@ -583,7 +587,8 @@ CREATE TABLE IF NOT EXISTS ledger.journal_draft (
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, branch_id) REFERENCES core.branch(tenant_id, company_id, id),
-  CHECK ((recurring_journal_id IS NULL) = (recurring_occurrence IS NULL))
+  CHECK ((recurring_journal_id IS NULL) = (recurring_occurrence IS NULL)),
+  CHECK (created_via <> 'recurring' OR recurring_journal_id IS NOT NULL)
 );
 SELECT core.enable_tenant_rls('ledger.journal_draft');
 CREATE UNIQUE INDEX IF NOT EXISTS journal_draft_recurring_uq ON ledger.journal_draft (tenant_id, recurring_journal_id, recurring_occurrence)
@@ -994,6 +999,7 @@ CREATE TABLE IF NOT EXISTS ledger.integrity_run (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, fiscal_year_id) REFERENCES ledger.fiscal_year(tenant_id, company_id, id),
   CHECK ((status = 'ok') = (violations = 0))
 );
 SELECT core.enable_tenant_rls('ledger.integrity_run');
@@ -2606,7 +2612,8 @@ INSERT INTO ledger.posting_key (key, owner_module, expected_account_types, is_re
   ('payroll.salary_expense',           'payroll',   '{expense}',          false, 'هزینهٔ حقوق و دستمزد', '1.0'),
   ('payroll.salary_payable',           'payroll',   '{liability}',        false, 'حقوق پرداختنی', '1.0'),
   ('payroll.insurance_payable',        'payroll',   '{liability}',        false, 'حق بیمهٔ پرداختنی', '1.0'),
-  ('payroll.tax_payable',              'payroll',   '{liability}',        false, 'مالیات حقوق پرداختنی', '1.0')
+  ('payroll.tax_payable',              'payroll',   '{liability}',        false, 'مالیات حقوق پرداختنی', '1.0'),
+  ('payroll.employer_insurance_expense','payroll',   '{expense}',          false, 'حق بیمهٔ سهم کارفرما', '1.0')
 ON CONFLICT (key) DO NOTHING;
 
 -- ---------- قالب کدینگ عمومی (نمونهٔ v1؛ پیش از انتشار تولیدی باید حسابدار رسمی بازبینی کند) ----------
@@ -2736,7 +2743,8 @@ INSERT INTO ledger.coa_template_posting_rule (template_code, template_version, p
   ('ir.general', 1, 'assets.cost', '2102'), ('ir.general', 1, 'assets.accumulated_depreciation', '2190'),
   ('ir.general', 1, 'assets.depreciation_expense', '7204'),
   ('ir.general', 1, 'payroll.salary_expense', '7201'), ('ir.general', 1, 'payroll.salary_payable', '3205'),
-  ('ir.general', 1, 'payroll.insurance_payable', '3204'), ('ir.general', 1, 'payroll.tax_payable', '3203')
+  ('ir.general', 1, 'payroll.insurance_payable', '3204'), ('ir.general', 1, 'payroll.tax_payable', '3203'),
+  ('ir.general', 1, 'payroll.employer_insurance_expense', '7201')
 ON CONFLICT DO NOTHING;
 
 -- ---------- قالب‌های صورت مالی (استانداردهای حسابداری ایران؛ اسکلت نسخه‌دار، نیازمند بازبینی) ----------

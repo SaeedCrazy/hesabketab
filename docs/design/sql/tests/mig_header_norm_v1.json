@@ -1,0 +1,115 @@
+{
+ "name": "mig_header_norm",
+ "version": 1,
+ "note": "migration.norm_header (SQL) == hesabketab.migration.domain.headers.norm_header (Python)",
+ "vectors": [
+  {
+   "input": "كد  حساب",
+   "expected": "کد حساب"
+  },
+  {
+   "input": "گردش‌بدهکار",
+   "expected": "گردش بدهکار"
+  },
+  {
+   "input": "شماره (سند)",
+   "expected": "شماره سند"
+  },
+  {
+   "input": "مبلغ_بدهکار:",
+   "expected": "مبلغ بدهکار"
+  },
+  {
+   "input": "Account-Code",
+   "expected": "account code"
+  },
+  {
+   "input": "کد ۱۳ رقمي",
+   "expected": "کد 13 رقمی"
+  },
+  {
+   "input": "٣ بدهکار",
+   "expected": "3 بدهکار"
+  },
+  {
+   "input": "بد/بس",
+   "expected": "بد بس"
+  },
+  {
+   "input": "تاریخ‏ سند",
+   "expected": "تاریخ سند"
+  },
+  {
+   "input": "شرح‎سند",
+   "expected": "شرحسند"
+  },
+  {
+   "input": "شماره‌ی منحصر به فرد مالیاتی",
+   "expected": "شماره ی منحصر به فرد مالیاتی"
+  },
+  {
+   "input": "ـمانـده ـحساب",
+   "expected": "مانده حساب"
+  },
+  {
+   "input": "مَبلغ",
+   "expected": "مبلغ"
+  },
+  {
+   "input": "نام و نام خانوادگی",
+   "expected": "نام و نام خانوادگی"
+  },
+  {
+   "input": "  GL   Code  ",
+   "expected": "gl code"
+  },
+  {
+   "input": "ﻛﺪ ﻣﻠﻰ",
+   "expected": "کد ملی"
+  },
+  {
+   "input": "شناسهٔ ملی",
+   "expected": "شناسه ملی"
+  },
+  {
+   "input": "موجودي (عدد)",
+   "expected": "موجودی عدد"
+  },
+  {
+   "input": "آدرس#1",
+   "expected": "ادرس 1"
+  },
+  {
+   "input": "ؤ ئ ة ۀ أ إ",
+   "expected": "و ی ه ه ا ا"
+  },
+  {
+   "input": "کد\tکالا",
+   "expected": "کد کالا"
+  },
+  {
+   "input": "Debit/Dr",
+   "expected": "debit dr"
+  },
+  {
+   "input": "[کد] {تفصیلی}",
+   "expected": "کد تفصیلی"
+  },
+  {
+   "input": "٪ درصد",
+   "expected": "درصد"
+  },
+  {
+   "input": "x\\y",
+   "expected": "x y"
+  },
+  {
+   "input": "",
+   "expected": ""
+  },
+  {
+   "input": "100% مالیات",
+   "expected": "100% مالیات"
+  }
+ ]
+}

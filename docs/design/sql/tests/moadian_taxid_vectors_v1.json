@@ -1,0 +1,17 @@
+{
+  "version": "moadian-taxid-v1",
+  "source": "RC_DCPS.SN V1.3 examples and accepted production/sandbox taxids, research 03 §2-6 and §3-7; line math from RC_TICS sample and truncation rule (RC_IITP V7.8)",
+  "note": "Shared by SQL (tests/50_compliance_test.sql), Python (tests/unit/tax/test_taxid.py) and TypeScript (packages/tax-kit). The check digit uses the OFFICIAL SDK Verhoeff permutation table (rows 4 and 7 differ from the textbook table). standard_verhoeff_taxid is what a textbook Verhoeff library produces and MUST be rejected.",
+  "official": [
+    {"memory": "DEF5GH", "day": 18463, "serial": 12,        "control": "68697057172018463000000000012", "taxid": "DEF5GH0481F000000000C2", "standard_verhoeff_taxid": "DEF5GH0481F000000000C0"},
+    {"memory": "DEF5GH", "day": 18463, "serial": 8173,      "control": "68697057172018463000000008173", "taxid": "DEF5GH0481F0000001FED8", "standard_verhoeff_taxid": "DEF5GH0481F0000001FED7"},
+    {"memory": "DEF5GH", "day": 18463, "serial": 2572613409, "control": "68697057172018463002572613409", "taxid": "DEF5GH0481F009956F7211", "standard_verhoeff_taxid": "DEF5GH0481F009956F7214"}
+  ],
+  "accepted": ["A1121604C220002F095011", "A111DW04E8300004349008", "A2HP31050B0006A607FE39"],
+  "invalid": ["DEF5GH0481F000000000C0", "DEF5GH0481000000F1FED8", "def5gh0481f000000000c2", "DEF5GH0481F000000000C", "A111DW04E8300004349007"],
+  "line_math": [
+    {"label": "RC_TICS sample", "am": "2", "fee": "10000", "dis": "500", "vra": "9", "prdis": "20000", "adis": "19500", "vam": "1755", "tsstam": "21255"},
+    {"label": "truncate not round", "am": "1", "fee": "99999", "dis": "0", "vra": "10", "prdis": "99999", "adis": "99999", "vam": "9999", "tsstam": "109998"},
+    {"label": "fractional quantity", "am": "1.5", "fee": "33333", "dis": "0", "vra": "10", "prdis": "49999", "adis": "49999", "vam": "4999", "tsstam": "54998"}
+  ]
+}

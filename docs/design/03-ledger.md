@@ -36,10 +36,10 @@
 - **گزارش‌ها همه از یک primitive می‌آیند:** تراز ۲، ۴، ۶ و ۸ ستونی در هر سطح، کارت حساب و کارت تفصیلی، و دفتر روزنامه و دفتر کل قانونی. صورت‌های مالی ایرانی (وضعیت مالی، سود و زیان، و اسکلت جریان وجوه نقد) با قالب‌های نسخه‌دار ساخته می‌شوند. هر قالب ردیف کنترلی دارد که باید صفر بماند.
 - **خروجی «دفاتر تجاری الکترونیکی»** با رابط `ELedgerExporter` تولید می‌شود. هر دو نسخهٔ قالب (بهمن ۱۴۰۳ گردش‌محور و اردیبهشت ۱۴۰۴ سندمحور) پشتیبانی می‌شوند و مشخصات قالب از موتور قواعد می‌آید.
 - **وضعیت اعتبارسنجی:**
-  - SQL روی PostgreSQL 18.7 در دو ترتیب اعمال شد: `00 → 20` و `00 → 10 → 20`.
-  - `core.security_lint()` روی جدول‌های ledger خالی است.
-  - ۲۰۰+ ادعای پایگاه داده‌ای پاس شدند.
-  - ۳۰ جهش (mutation) عمدی روی تریگرها همه توسط آزمون‌ها گرفته شدند.
+  - SQL روی PostgreSQL 18.7 در دو ترتیب اعمال شد: `00 → 20` و `00 → 10 → 20`. روی `00 → 10 → 20 → 25` هم، همراه با هر ۲۱ FK بیرونی §۱۲، بی‌خطا اعمال شد.
+  - `core.security_lint()` روی اشیای ledger خالی است.
+  - آزمون پایگاه داده (۲۱ گروه T00 تا T20، حدود ۲۶۰ ادعا) در هر دو ترتیب سبز است. هر بررسی با الگوی دقیق کد و پیام خودش آزموده می‌شود.
+  - آزمون جهش: هر ۱۴۲ محل خطای فایل SQL یکی‌یکی خنثی شد. ۱۴۰ جهش با آزمون‌ها کشته شدند. دو بازمانده دسترس‌ناپذیر (دفاع لایه‌ای) هستند و اثباتشان در §۹ آمده است.
 
 ## ۲. دامنه
 
@@ -70,6 +70,7 @@
 - **ویرایش و انتشار قالب‌های کدینگ و صورت مالی در پنل مالک:** بخش پلتفرم. ledger کاتالوگ را می‌خواند.
 - **آداپترهای مهاجرت** (هلو، سپیدار، حسابفا، Excel): `migration`. ledger نقطهٔ ورود افتتاحیه و سند تاریخی را می‌دهد.
 - **رابط گزارش‌ساز و Pivot:** `reports`. ledger سرویس پرس‌وجو و ویوها را می‌دهد.
+- **دستیار هوشمند** (پیکربندی ارائه‌دهندهٔ مدل، گفت‌وگو، پیشنهاد): بخش ۱۰. ledger فقط سطح پرس‌وجو، dry-run و ساخت پیش‌نویس را می‌دهد و ثبت از مسیر دستیار را رد می‌کند (§۵-۱۸).
 - **بودجه، تلفیق و بین‌شرکتی، و درآمد و هزینهٔ معوق:** v2، در همین ماژول یا ماژول بعدی (§۱۰).
 
 ## ۳. تصمیم‌های طراحی
@@ -363,11 +364,12 @@
 - **تصمیم:**
   - رابط `ELedgerExporter` و دو پیاده‌سازی دارد:
     - **`1403-11-turnover`:** گردش‌محور با تفصیلی. ستون‌های قالب: کد و عنوان کل، کد و عنوان معین، کد و عنوان تفصیلی، گردش بدهکار، گردش بستانکار، تاریخ.
-    - **`1404-02-document`:** سندمحور، ۹ ستون: شماره سند، کل، معین، بدهکار، بستانکار، تاریخ، شرح.
+    - **`1404-02-document`:** سندمحور، ۹ ستون: شماره سند، کد حساب کل، عنوان حساب کل، کد حساب معین، عنوان حساب معین، مبلغ بدهکار، مبلغ بستانکار، تاریخ سند، شرح سند. ستون تفصیلی ندارد.
   - **از پارامتر قواعد `tax.eledger.format`:** عنوان دقیق ستون‌ها، ترتیب، قالب تاریخ (`YYYY/MM/DD` یا `DD/MM/YYYY`، ناهم‌خوان در منابع)، نوع فایل، واحد مبلغ، و شمارهٔ سند افتتاحیه («ردیف صفر»). نسخهٔ قاعده در `eledger_export.format_version` snapshot می‌شود.
   - **منبع داده:** فقط اسناد دائم.
   - **نگاشت سطح:** «کل» و «معین» از `company_config.eledger_kol_level` و `eledger_moein_level` می‌آیند. «تفصیلی» از `eledger_detail_source` می‌آید: `dim_slot:1` یا `level:4`.
   - **پس از ثبت رسید ارسال:** دوره‌های پوشش‌داده‌شده قفل می‌شوند.
+  - **سمت ورود:** خواندن همین فایل از نرم‌افزار قبلی (ELedgerAdapter مهاجرت، با تشخیص نسخه از سرستون‌ها) با بخش مهاجرت است و همان `FormatSpec` قاعدهٔ `tax.eledger.format` را به کار می‌برد، پس هر دو جهت با یک تعریف قالب کار می‌کنند.
 - **دلیل:** پژوهش نسخهٔ جاری را نامطمئن می‌داند (اطمینان پایین تا متوسط). پس هر چیزی جز منطق تجمیع پارامتر است.
 - **مرجع:** [۰۲ §۴.۳](../research/02-migration-enterprise-and-generic.md#۴۳-دفاتر-تجاری-الکترونیکی-قالب-ملی-دفتر-روزنامه-و-کل)، [۰۳ §۲-۱۳](../research/03-iran-tax-and-legal.md#۲-۱۳-دفاتر-قانونی-و-دفاتر-تجاری-الکترونیکی-ماده-۹۵)، [۰۳ §۳-۴](../research/03-iran-tax-and-legal.md#۳-۴-گزارشها-و-تکالیف-دورهای)
 
@@ -390,7 +392,7 @@
     - `verify_permanent_chain` کل سال را می‌سنجد.
     - `fiscal_year.chain_head_hash` با آخرین سند برابر نگه داشته می‌شود.
 - **دلیل:** دفاتر قانونی باید «بدون دست‌کاری» باشند. زنجیرهٔ ممیزی core تغییر رکوردها را ثبت می‌کند، ولی محتوای سند را مهر نمی‌کند.
-- **ردشده:** امضای دیجیتال هر سند (v2؛ وابسته به کلید شرکت و Q-C).
+- **ردشده (برای v1):** امضای دیجیتال هر سند دائم (later، §۱۰). وقتی بیاید، همان انتخاب نگهداری کلید Q-C را می‌گیرد: پیش‌فرض امضا روی سرور با KMS داخلی؛ اگر مشتری کلید را روی دستگاه خودش نگه داشته باشد، امضا با عامل امضای همان دستگاه و فقط وقتی برخط است انجام می‌شود. زنجیرهٔ hash به امضا وابسته نیست و قطعی کردن هرگز منتظر امضا نمی‌ماند.
 
 ### D-L23 — تریگرهای deferred و زمینهٔ مستأجر
 - **تصمیم:** همهٔ تریگرهای deferred با `ledger.assert_tenant_context(NEW.tenant_id)` شروع می‌شوند. تعویض `app.tenant_id` وسط تراکنش هر بررسی deferred را با خطای صریح `HK_LEDGER_TENANT_CONTEXT` رد می‌کند. بدون این بررسی، RLS ردیف‌ها را پنهان می‌کرد و بعضی بررسی‌ها «بی‌صدا» می‌گذشتند.
@@ -481,7 +483,7 @@ erDiagram
 | جدول | نقش |
 |---|---|
 | `ledger.journal_type` | نوع سند و رفتار آن. ستون‌ها:<br>• `entry_class`: opening، regular یا closing<br>• `class_rank`: ۰، ۱ یا ۲<br>• `origin`: manual، module، system، mirror یا import<br>• پرچم‌های `skip_line_rules`، `bypass_posting_policy`، `allows_base_only_lines`، `requires_input_unit` و `excluded_from_subledger_check`<br><br>۱۵ نوع: manual، adjustment، prior_period_adjustment، recurring، module، fx_revaluation، fx_revaluation_reversal، reversal، void، opening، opening_import، history_import، closing_pl، closing_re، closing_balance |
-| `ledger.posting_key` | کلیدهای نگاشت حساب، با ماژول مالک و انواع حساب مورد انتظار. نوع حساب نگاشت‌شده با تریگر سنجیده می‌شود. ۴۳ کلید آغازین برای ledger و ماژول‌های مرحلهٔ ۲. مالکان می‌توانند با migration خود کلید بیفزایند |
+| `ledger.posting_key` | کلیدهای نگاشت حساب، با ماژول مالک و انواع حساب مورد انتظار. نوع حساب نگاشت‌شده با تریگر سنجیده می‌شود. ۴۴ کلید آغازین برای ledger و ماژول‌های مرحلهٔ ۲. مالکان می‌توانند با migration خود کلید بیفزایند |
 | `ledger.dimension_type_catalog` | انواع بُعد سیستمی و جایگاهشان: party، bank_account، cash_box، petty_cash، pos_terminal، employee و fixed_asset در جایگاه ۱؛ cost_center در ۲؛ project در ۳ |
 | `ledger.coa_template` و `coa_template_account` و `coa_template_posting_rule` | قالب کدینگ بستهٔ صنفی (کد، نسخه، بسته، سطوح، حالت کد، منبع، اطمینان، بازبین)، حساب‌ها (با قواعد بُعد jsonb) و نگاشت پیش‌فرض. نمونهٔ `ir.general v1` (۹۰ حساب) در SQL هست. انتشار تولیدی آن پیش از بازبینی حسابدار رسمی ممنوع است (`confidence='low'`) |
 | `ledger.subledger_source` | ثبت تابع ماندهٔ هر زیردفتر (§۵-۱۴) |
@@ -511,7 +513,7 @@ erDiagram
 
 | جدول | توضیح |
 |---|---|
-| `ledger.journal_draft` و `journal_draft_line` | پیش‌نویس تغییرپذیر. وضعیت: editing، pending_approval یا approved. پیوند به `approval_request_id`، `recurring_journal_id` و `recurring_occurrence` (یکتا). سطر پیش‌نویس می‌تواند ناقص باشد |
+| `ledger.journal_draft` و `journal_draft_line` | پیش‌نویس تغییرپذیر. وضعیت: editing، pending_approval یا approved. پیوند به `approval_request_id`، `recurring_journal_id` و `recurring_occurrence` (یکتا). `created_via` منشأ را نشان می‌دهد: user، api، recurring، copy، import یا assistant (پیشنهاد دستیار هوشمند؛ §۵-۱۸). سرویس آن را از principal تعیین می‌کند و کلاینت نمی‌فرستد. سطر پیش‌نویس می‌تواند ناقص باشد |
 | `ledger.journal` | سرسند. ستون‌ها:<br>• **هویت و جایگاه:** شرکت، سال و دوره (FKهای ترکیبی سه‌ستونی)، `branch_id` (دامنهٔ دسترسی)، `journal_date`<br>• **نوع:** `journal_type`، `entry_class` و `class_rank` (تریگر از نوع پر می‌کند)<br>• **وضعیت و شماره:** `status`، `reference_no` و `reference_text` (عطف)، `number_issued_id`، `permanent_no` و `daily_no`<br>• **مبدأ:** `source_module`، `source_doc_type`، `source_doc_id`، `source_doc_no`، `source_event` و `request_hash`<br>• **مقادیر کنترلی:** `base_currency`، `line_count`، `total_*_base` و `memo_*_base`<br>• **سایر:** `input_amount_unit`، `soft_close_override`، `reversal_of_journal_id`، `void_of_journal_id`، `adjusts_journal_id`، `recurring_journal_id`، `approval_request_id`، `legacy_ref`، `legacy_permanent_no`، `void_reason`، کنشگر و زمان ثبت، بررسی و قطعی شدن، و `chain_prev_hash` و `chain_hash`<br><br>ایندکس‌های یکتای جزئی: کلید مبدأ (باطل‌نشده)، یک برگشت فعال، یک ابطال. ایندکس جزئی اسناد موقت برای قطعی کردن |
 | `ledger.journal_line` | **تنها منبع حقیقت.** ستون‌ها:<br>• `line_no`<br>• **رونوشت سرسند** (تریگر پر می‌کند): `company_id`، `fiscal_year_id`، `period_id`، `journal_date` و `entry_class`<br>• `is_memo`<br>• **حساب و ابعاد:** `account_id`، `branch_id` و `dim1..6`<br>• **مبلغ:** `currency`، `exchange_rate`، `rate_type_id`، `debit_txn`، `credit_txn`، `debit_base`، `credit_base` و `line_kind`<br>• **سایر:** `quantity`، `description`، `posting_key`، `posting_rule_id` و `source_line_ref`<br><br>ایندکس‌ها:<br>• پوششی کارت حساب: `(tenant, company, account, date, journal, line) INCLUDE (amounts)`<br>• دوره و حساب<br>• یک ایندکس جزئی برای هر جایگاه بُعد |
 | `ledger.balance_bucket` | سطل مانده (مشتق). کلید = (دوره، حساب، کلاس، شعبه، ۶ بُعد، ارز). ستون‌ها: جمع چهار مبلغ، `line_count` و `is_compacted`. فقط توابع definer می‌نویسند |
@@ -667,10 +669,10 @@ class LedgerPostingService:
     async def void(self, uow: UnitOfWork, journal_id: UUID, *, reason: str, caller_module: str) -> PostingResult: ...
 
 class ManualJournalService:     # سند دستی (پیش‌نویس → ارسال)
-    async def create_draft(self, uow, cmd: DraftCreate) -> DraftOut: ...
+    async def create_draft(self, uow, cmd: DraftCreate) -> DraftOut: ...   # created_via از principal: user | api (کلید API/سرویس) | assistant (is_ai_assistant)
     async def update_draft(self, uow, draft_id: UUID, cmd: DraftUpdate, row_version: int) -> DraftOut: ...
     async def discard_draft(self, uow, draft_id: UUID, row_version: int) -> None: ...
-    async def submit(self, uow, draft_id: UUID, row_version: int) -> PostingResult: ...   # نیاز به تأیید → pending_approval
+    async def submit(self, uow, draft_id: UUID, row_version: int) -> PostingResult: ...   # نیاز به تأیید → pending_approval؛ principal.is_ai_assistant → 403
     async def mark_reviewed(self, uow, journal_id: UUID) -> None: ...                      # تفکیک وظایف: بررسی‌کننده ≠ ثبت‌کننده
     async def copy_to_draft(self, uow, journal_id: UUID, *, reversed_sides: bool = False) -> DraftOut: ...
 
@@ -1045,13 +1047,24 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 | `HK_LEDGER_AMOUNT_PRECISION`، `_BASE_MISMATCH` و `_BASE_ONLY_LINE` | `ledger.journal_line.amount_invalid` | 422 |
 | `HK_LEDGER_MAPPING_MISSING` و `_AMBIGUOUS` | `ledger.mapping.missing` و `ledger.mapping.ambiguous` | 422 |
 | `HK_LEDGER_VOID_*` و `HK_LEDGER_REVERSAL_*` و `HK_LEDGER_MIRROR` | `ledger.journal.void_not_allowed` و `ledger.journal.reversal_not_allowed` | 409 |
-| `HK_LEDGER_PERMANENT_*`، `HK_LEDGER_CHAIN_*`، `HK_LEDGER_FINALIZE_*` و `HK_LEDGER_OPENING_PENDING` | `ledger.finalize.not_allowed` | 409 |
-| `HK_LEDGER_PERIOD_*` و `HK_LEDGER_FY_*` (گذار) | `ledger.period.transition_not_allowed` و `ledger.fiscal_year.transition_not_allowed` | 409 |
+| `HK_LEDGER_PERMANENT_*`، `HK_LEDGER_CHAIN_*`، `HK_LEDGER_FINALIZE_*`، `HK_LEDGER_DAILY_NO`، `HK_LEDGER_NOT_REVIEWED` و `HK_LEDGER_OPENING_PENDING` | `ledger.finalize.not_allowed` (پارامتر `reason`) | 409 |
+| `HK_LEDGER_PERIOD_*`، `HK_LEDGER_UNLOCK_APPROVAL` و `HK_LEDGER_FY_*` (گذار) | `ledger.period.transition_not_allowed` و `ledger.fiscal_year.transition_not_allowed` | 409 |
+| `HK_LEDGER_REASON_REQUIRED` | `ledger.reason_required` | 422 |
+| `HK_LEDGER_ACCOUNT_CODE`، `_DEPTH`، `_LEVEL`، `_TYPE_MISMATCH` و `HK_LEDGER_PARENT_NOT_GROUP` | `ledger.account.invalid_tree` | 422 |
+| `HK_LEDGER_ACCOUNT_IMMUTABLE`، `_TYPE_LOCKED`، `_HAS_POSTINGS` و `_HAS_CHILDREN` | `ledger.account.locked` | 409 |
+| `HK_LEDGER_RULE_ON_GROUP` و `HK_LEDGER_RULE_SLOT_CONFLICT` | `ledger.account.dimension_rule_invalid` | 422 |
+| `HK_LEDGER_MAPPING_ACCOUNT_TYPE` | `ledger.mapping.account_type_mismatch` | 422 |
+| `HK_LEDGER_COA_NOT_EMPTY`، `HK_LEDGER_TEMPLATE_NOT_FOUND`، `_EXTENDS`، `_PARENT` و `HK_LEDGER_DIM_TYPE_MISSING` | `ledger.coa.template_not_applicable` | 409 |
+| `HK_LEDGER_REPORT_RANGE` | `ledger.report.invalid_range` | 422 |
+| `HK_LEDGER_JOURNAL_NOT_FOUND` | `ledger.journal.not_found` | 404 |
+| `HK_LEDGER_JOURNAL_TYPE`، `HK_LEDGER_JOURNAL_INSERT`، `HK_LEDGER_SOURCE_MODULE`، `HK_LEDGER_BASE_CURRENCY`، `HK_LEDGER_ROUNDING_MODE` و `HK_LEDGER_TEMPLATE_FORMULA` (قالب منتشرشده از دروازهٔ انتشار گذشته است) | `ledger.internal.invariant` (باگ سرویس: سرویس این مقادیر را خودش می‌سازد؛ با شناسهٔ رهگیری ثبت و هشدار می‌شود) | 500 |
 | `HK_LEDGER_OPENING_CLEARING` | `ledger.opening.clearing_not_zero` | 409 |
 | `HK_LEDGER_INPUT_UNIT` | `ledger.import.amount_unit_required` | 422 |
 | `HK_LEDGER_TENANT_CONTEXT` | `core.tenant.context_violation` | 500 (باگ) |
 | unique `journal_source_uq` | `ledger.posting.source_conflict` | 409 |
 | exclusion `posting_rule_*` | `ledger.mapping.duplicate_rule` | 409 |
+
+ترتیب تطبیق در `errors.yaml`: نخست کد دقیق، سپس الگوی `*` (مثلاً `HK_LEDGER_DIM_TYPE_MISSING` به ردیف قالب کدینگ می‌رود، نه `HK_LEDGER_DIM_*`). آزمون `unit/test_error_map.py::test_every_sql_error_code_is_mapped` همهٔ کدهای `HK_*` فایل SQL را استخراج می‌کند و بدون نگاشت شکست می‌خورد.
 
 ### ۵-۱۷. همروندی و کارایی
 
@@ -1062,6 +1075,22 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 - **retry:** خطاهای `40001` و `40P01` (deadlock) را `UnitOfWork` با همان کلید idempotency تکرار می‌کند.
 - **تریگر سطر:** هر سطر حدود ۶ تا ۹ index lookup دارد. هدف: ۱۰٬۰۰۰ سطر در کمتر از ۲ ثانیه (سند بستن سال)، و مهاجرت ۱ میلیون سطر در کمتر از ۵ دقیقه با COPY.
 - **تراز سال:** با سطل‌های فشرده کمتر از ۱ ثانیه برای ۱۰ میلیون سطر در سال (معیار `bench_trial_balance_10m`). کارت حساب با ایندکس پوششی، کمتر از ۲۰۰ میلی‌ثانیه برای صفحهٔ ۲۰۰تایی.
+
+### ۵-۱۸. سطح دستیار هوشمند (Q-F: در محصول، اختیاری)
+
+دستیار (بخش ۱۰) در مدل core یک principal از نوع `service` با قالب نقش `ai_assistant` است (بخش ۰۲، Q-F) که به نیابت از یک کاربر انسانی و حداکثر با مجوزهای همان کاربر کار می‌کند. ledger آن را با `ctx.principal.is_ai_assistant` می‌شناسد (درخواست C-L17). ledger برای آن هیچ مسیر یا جدول ویژه‌ای ندارد و فقط این سرویس‌های موجود را در اختیارش می‌گذارد:
+
+| نوع | سرویس | قید |
+|---|---|---|
+| خواندن | `AccountQuery` (درخت، جست‌وجو، نقش)، `FiscalYearQuery.for_date`، `BalanceQuery` (مانده به حساب، بُعد، ارز، تاریخ)، `LedgerReportQuery` (تراز، کارت حساب، دفتر روزنامه)، `StatementQuery.evaluate`، `MappingService.resolve` (فقط توضیح حل حساب) | همان RLS، دامنهٔ شعبه و بُعد، و مجوزهای `*.read` کاربر |
+| آزمون خشک | `ManualJournalService.validate` (`POST /journals/validate`) | بدون نوشتن |
+| پیشنهاد | `ManualJournalService.create_draft` و `copy_to_draft` | پیش‌نویس با `created_via='assistant'` و وضعیت `editing`. هیچ اثری بر دفتر کل، شماره یا مانده ندارد |
+
+قواعد:
+1. **دستیار هرگز ثبت نمی‌کند.** قالب نقش `ai_assistant` از مجوزهای ledger فقط `*.read` و `ledger.journal.create` را دارد و هیچ‌کدام از `post`، `review`، `void`، `reverse`، `finalize`، وضعیت دوره و سال، نگاشت، کدینگ، افتتاحیه و خروجی دفاتر را ندارد. چون `ledger.journal.post` برای حساب‌های سرویس یکپارچگی مجاز است (`allow_service_account=true`)، این سقف به‌تنهایی کافی نیست: `ManualJournalService.submit`، `LedgerPostingService.post/reverse/void`، `FinalizationService`، `YearEndService` و `FiscalCalendarService` مستقل از مجوز، `ctx.principal.is_ai_assistant` را با `ledger.journal.assistant_cannot_post` (403) رد می‌کنند (دفاع لایه‌ای).
+2. **ارسال فقط با انسان:** کاربری با `ledger.journal.post` پیش‌نویس پیشنهادی را در UI می‌بیند (نشان «پیشنهاد دستیار»)، در صورت نیاز ویرایش می‌کند و ارسال می‌کند. `posted_by` همان کاربر است. شناسهٔ پیشنهاد دستیار در جزئیات `core.audit_log` رویداد ارسال می‌آید.
+3. **استقلال حسابداری:** ماژول ledger هیچ import، job، تریگر یا گزارشی وابسته به دستیار ندارد (قرارداد import-linter: `hesabketab.ledger` ↛ `hesabketab.assistant`). خاموش بودن، قطع بودن یا خطای ارائه‌دهندهٔ مدل هیچ اثری بر ثبت، بستن یا گزارش ندارد.
+4. **بدون دسترسی مستقیم به پایگاه داده:** دستیار SQL نمی‌سازد و ویوها را مستقیم نمی‌خواند. فقط از سرویس‌های بالا، که مجوز را می‌سنجند، استفاده می‌کند.
 
 ## ۶. API
 
@@ -1135,6 +1164,8 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 
 `PostingRequest` مسیر HTTP عمومی ندارد. ماژول‌ها درون‌فرایندی صدا می‌زنند. API عمومی (یکپارچگی بیرونی) سند را از مسیر پیش‌نویس می‌سازد، یا از سند مبدأ ماژول صاحب آن.
 
+`created_via` پیش‌نویس از principal درخواست تعیین می‌شود (کاربر → `user`، کلید API → `api`، دستیار → `assistant`) و در بدنهٔ `POST /journals` پذیرفته نمی‌شود. دستیار هوشمند فقط مسیرهای GET، `POST /journals`، `POST /journals/validate` و `POST /journals/{id}/copy` را می‌تواند صدا بزند (§۵-۱۸).
+
 ## ۷. ناوردایی‌ها
 
 نام آزمون‌های SQL برچسب‌های `tests/20_ledger_test.sql` هستند. آزمون‌های پایتون در `backend/tests/ledger/` قرار می‌گیرند.
@@ -1146,44 +1177,47 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 | INV-LED-03 | سطرهای انتظامی در هر سند میان خود تراز هستند | CHECK memo + `journal_verify` | T05 «memo lines balance among themselves» |
 | INV-LED-04 | سطر یک‌طرفه است؛ طرف ارزی = طرف پایه؛ سطر تمام‌صفر ممنوع؛ `base_adjustment` مبلغ ارزی صفر دارد | CHECKهای `journal_line` | T05 «a line has a single side»، «zero lines rejected» |
 | INV-LED-05 | دقت هر مبلغ ≤ `minor_unit` ارز خودش (ریال صحیح) | `journal_line_guard` | T05 «IRR has no decimals»، «txn precision» |
-| INV-LED-06 | سطر ارز پایه: نرخ ۱ و ارزی = پایه. سطر ارزی: \|پایه − ارزی×نرخ\| < یک واحد پایه. سرویس حالت دقیق شرکت را اعمال می‌کند | تریگر + `LedgerPostingService` | T05 «base-currency line has rate 1»، «base = round(txn x rate)»؛ `property/test_rounding.py::test_base_matches_company_mode` |
+| INV-LED-06 | سطر ارز پایه: نرخ ۱ و ارزی = پایه. سطر ارزی: \|پایه − ارزی×نرخ\| < یک واحد پایه. سرویس حالت دقیق شرکت را اعمال می‌کند | تریگر + `LedgerPostingService` | T05 «base-currency line has rate 1»، «base = round(txn x rate)»؛ `property/test_rounding.py::test_base_matches_company_mode`؛ T20 «unknown rounding mode» |
 | INV-LED-07 | سطر فقط-پایه فقط در نوع سندهای مجاز | تریگر (`allows_base_only_lines`) | T05 «base-only lines only for permitted journal types» |
 | INV-LED-08 | سطر دفتر هرگز تغییر یا حذف نمی‌شود. محتوای سرسند تغییرناپذیر است. سرسند حذف نمی‌شود، حتی توسط مالک جدول | grant + `trg_immutable` + `trg_before_update` (jsonb) + `trg_nodelete` | T07 (چهار مورد permission)؛ T19 «owner …» (پنج مورد) |
-| INV-LED-09 | سند temporary یا voided درج می‌شود. فقط temporary→permanent یا voided مجاز است. permanent و voided پایانی‌اند. بررسی فقط یک بار | `journal_before_insert` و `journal_before_update` | T07 «no direct jump to permanent»، «review is recorded once»؛ T08 «a voided journal cannot be voided» |
+| INV-LED-09 | سند temporary یا voided درج می‌شود. فقط temporary→permanent یا voided مجاز است. permanent و voided پایانی‌اند. بررسی فقط یک بار | `journal_before_insert` و `journal_before_update` | T07 «no direct jump to permanent»، «review is recorded once»؛ T08 «a voided journal cannot be voided»؛ T20 «unknown journal type»، «permanent fields cannot be set on insert»، «a regular journal is inserted as temporary»، «permanent needs number and finalization time»، «unknown journal status rejected by the state machine»، «a permanent journal cannot even be marked reviewed»، «a voided journal is final»، «no lines on a permanent journal» |
 | INV-LED-10 | هیچ ثبتی در حساب گروه (غیربرگ) نیست | تریگر + `kind` | T05 «no posting into group accounts» |
 | INV-LED-11 | حساب سطر به شرکت سند تعلق دارد و فعال است (به‌جز سند آینه و بستن) | FK سه‌ستونی + تریگر | T05 «account must belong to the journal company»، «inactive account rejected» |
 | INV-LED-12 | حساب کنترلی فقط از ماژول‌های مجاز ثبت می‌گیرد. حساب `system_only` سند دستی و ورودی نمی‌پذیرد | تریگر | T06 «control account rejects manual journals»، «system-only account …» |
 | INV-LED-13 | قواعد بُعد برقرارند. شرایط:<br>• مقدار اجباری با نوع درست هست<br>• نوع ممنوع یا فهرست‌نشده نیست<br>• مقدار در جایگاه نوع خودش است<br>• مقدار فعال است، گروه نیست، و هم‌شرکت یا مشترک است<br>• قاعدهٔ شعبه برقرار است | تریگر | T06 (هشت مورد) |
 | INV-LED-14 | در هر جایگاهِ حساب حداکثر یک نوع اجباری هست، و نوع اجباری انحصاری است. قاعدهٔ بُعد فقط روی حساب برگ است | `account_rule_verify` (deferred) | T02 «required slot excludes other types»، «rules only on posting accounts» |
 | INV-LED-15 | جایگاه مقدار بُعد = جایگاه نوعش. جایگاه نوعِ استفاده‌شده تغییرناپذیر است | FK ترکیبی (tenant, type, slot) | T00 «value slot copied»؛ T02 «slot of a used dimension type is immutable» |
-| INV-LED-16 | درخت حساب: سطح = والد+۱ (پس بی‌دور)، والد گروه و هم‌شرکت و هم‌نوع، عمق ≤ سطوح تعریف‌شده، کد سلسله‌مراتبی (پیشوند و طول). پس از سند، نوع ثابت است و برگ گروه نمی‌شود | `account_guard` + `account_children_verify` (deferred) + FK | T02 (هشت مورد) |
-| INV-LED-17 | سال‌های یک شرکت هم‌پوشانی ندارند و پیوسته‌اند. یک سال اول. ارز پایه = ارز شرکت هنگام ساخت. تاریخ‌ها تغییرناپذیر | EXCLUDE + `fiscal_year_guard` + ایندکس یکتا | T03 (شش مورد) |
+| INV-LED-16 | درخت حساب: سطح = والد+۱ (پس بی‌دور)، والد گروه و هم‌شرکت و هم‌نوع، عمق ≤ سطوح تعریف‌شده، کد سلسله‌مراتبی (پیشوند و طول). پس از سند، نوع ثابت است و برگ گروه نمی‌شود | `account_guard` + `account_children_verify` (deferred) + FK | T02 (هشت مورد)؛ T20 «account level is immutable»، «account type locked after postings»، «account with postings cannot become a group»، «group with children cannot become a posting account» |
+| INV-LED-17 | سال‌های یک شرکت هم‌پوشانی ندارند و پیوسته‌اند. یک سال اول. ارز پایه = ارز شرکت هنگام ساخت. تاریخ‌ها تغییرناپذیر | EXCLUDE + `fiscal_year_guard` + ایندکس یکتا | T03 (شش مورد)؛ T20 «a new year starts open»، «a non-first year starts with a pending opening» |
 | INV-LED-18 | دوره‌ها سال را دقیقاً افراز می‌کنند، به ترتیب تاریخ شماره دارند، داخل سال‌اند، و تاریخشان تغییرناپذیر است | EXCLUDE + `fiscal_year_verify` (deferred) + `fiscal_period_guard` | T03 «periods must cover the year»، «period inside its year»، «period dates immutable» |
 | INV-LED-19 | دورهٔ closed یا locked ثبت عادی نمی‌پذیرد. soft_closed فقط با override. قفل ماژولی همان ماژول را می‌بندد. ثبت عادی فقط در سال open | `journal_before_insert` (+ سرویس برای مجوز override) | T09 (چهار مورد) |
-| INV-LED-20 | گذارهای دوره طبق گراف‌اند: بستن ترتیبی، بازگشایی با دلیل، قفل پس از قطعی شدن، قفل‌گشایی با تأیید. هر گذار یک رویداد فقط‌افزودنی دارد | `fiscal_period_guard` + `fiscal_period_history` | T09 «periods close in order»، «open -> locked not allowed»، «reopen requires a reason»، «status history recorded»؛ T10 «unlock needs approval» |
+| INV-LED-20 | گذارهای دوره طبق گراف‌اند: بستن ترتیبی، بازگشایی با دلیل، قفل پس از قطعی شدن، قفل‌گشایی با تأیید. هر گذار یک رویداد فقط‌افزودنی دارد | `fiscal_period_guard` + `fiscal_period_history` | T09 «periods close in order»، «open -> locked not allowed»، «reopen requires a reason»، «status history recorded»؛ T10 «unlock needs approval»؛ T20 «a new period starts open»، «a fully finalized period cannot be reopened»، «a period of a closing year cannot be reopened»، «periods of a locked year cannot be unlocked» |
 | INV-LED-21 | بُرش نهایی‌سازی: درج با تاریخ ≤ بُرش ممنوع؛ بُرش فقط جلو می‌رود؛ هیچ موقتی ≤ بُرش؛ دائم ⇔ تاریخ ≤ بُرش | `journal_before_insert`، `fiscal_year_guard`، `journal_permanent_verify` (deferred) | T10 «no posting on finalized dates»، «cut-off moves forward only»، «cut-off cannot skip temporary»، «permanent journal outside the cut-off» |
-| INV-LED-22 | شمارهٔ دائم در (شرکت، سال) ۱..n پیوسته است، به ترتیب (تاریخ، کلاس) غیرنزولی است، موقت‌های زودتر پیش‌تر دائم می‌شوند، شمارهٔ روزانه هر روز از ۱ است، و شمارندهٔ سال = بیشینه | UNIQUE + `journal_before_update` + `fiscal_year_guard` | T10 «gapless and date-ordered»، «permanent numbers cannot skip»، «follow date order»، «earlier temporary journals block»، «daily numbers restart»؛ T15 «opening first, closing last» |
-| INV-LED-23 | زنجیرهٔ hash: پیوند به hash قبلی (یا genesis) و hash = sha256(قبلی ‖ متعارف). دست‌کاری آشکار می‌شود | `journal_before_update` + `verify_permanent_chain` | T10 «chain link enforced»، «chain hash must match canonical content»، «hash chain verifies»؛ T19 «tampering detected by the hash chain» |
-| INV-LED-24 | ابطال فقط برای موقت است. سند ابطال هم‌تاریخ، هم‌شرکت و هم‌مبدأ است و سطر به سطر آینه است. هر دو در یک تراکنش باطل می‌شوند. سند دارای برگشت فعال باطل نمی‌شود. باطل‌ها شمارهٔ دائم ندارند و کلید مبدأ را آزاد می‌کنند | تریگرها + `journal_verify` + ایندکس‌های جزئی | T08 (هفت مورد)؛ T10 «permanent journal cannot be voided» |
-| INV-LED-25 | برگشت فقط برای سند عادیِ موقت یا دائم است. تاریخ ≥ اصل و مبدأ یکسان. آینهٔ سطر به سطر، پس خالص صفر برای هر حساب، بُعد و ارز (پایه و ارزی). یک برگشت فعال. تسعیر فقط با نوع خودش برگشت می‌خورد | تریگر + `journal_verify` + ایندکس یکتا | T08 «reversal nets to zero per account»، «at most one active reversal»، «reversal dated on/after original»، «voided journals cannot be reversed»، «reversal journal must mirror» |
+| INV-LED-22 | شمارهٔ دائم در (شرکت، سال) ۱..n پیوسته است، به ترتیب (تاریخ، کلاس) غیرنزولی است، موقت‌های زودتر پیش‌تر دائم می‌شوند، شمارهٔ روزانه هر روز از ۱ است، و شمارندهٔ سال = بیشینه | UNIQUE + `journal_before_update` + `fiscal_year_guard` | T10 «gapless and date-ordered»، «permanent numbers cannot skip»، «follow date order»، «earlier temporary journals block»، «daily numbers restart»؛ T15 «opening first, closing last»؛ T20 «daily number restarts on a new date»، «cut-off must lie inside the year» |
+| INV-LED-23 | زنجیرهٔ hash: پیوند به hash قبلی (یا genesis) و hash = sha256(قبلی ‖ متعارف). دست‌کاری آشکار می‌شود | `journal_before_update` + `verify_permanent_chain` | T10 «chain link enforced»، «chain hash must match canonical content»، «hash chain verifies»؛ T19 «tampering detected by the hash chain»؛ T20 «first permanent journal links to genesis»، «first permanent journal has daily number 1» |
+| INV-LED-24 | ابطال فقط برای موقت است. سند ابطال هم‌تاریخ، هم‌شرکت و هم‌مبدأ است و سطر به سطر آینه است. هر دو در یک تراکنش باطل می‌شوند. سند دارای برگشت فعال باطل نمی‌شود. باطل‌ها شمارهٔ دائم ندارند و کلید مبدأ را آزاد می‌کنند | تریگرها + `journal_verify` + ایندکس‌های جزئی | T08 (هفت مورد)؛ T10 «permanent journal cannot be voided»؛ T20 «void reason has at least three characters»، «void journal has the date of its original»، «void of a missing journal» |
+| INV-LED-25 | برگشت فقط برای سند عادیِ موقت یا دائم است. تاریخ ≥ اصل و مبدأ یکسان. آینهٔ سطر به سطر، پس خالص صفر برای هر حساب، بُعد و ارز (پایه و ارزی). یک برگشت فعال. تسعیر فقط با نوع خودش برگشت می‌خورد | تریگر + `journal_verify` + ایندکس یکتا | T08 «reversal nets to zero per account»، «at most one active reversal»، «reversal dated on/after original»، «voided journals cannot be reversed»، «reversal journal must mirror»؛ T20 «fx_revaluation_reversal only reverses an fx revaluation»، «reversal of a missing journal»، «reversal date must be inside a fiscal year» |
 | INV-LED-26 | برای هر (شرکت، ماژول، نوع، شناسهٔ مبدأ، رویداد) حداکثر یک سند باطل‌نشده وجود دارد. تکرار با hash یکسان همان سند را برمی‌گرداند و با hash دیگر 409 می‌دهد | `journal_source_uq` + سرویس | T08 «idempotent source reference»؛ `integration/test_posting_service.py::test_replay_returns_same_journal`، `::test_same_source_different_payload_conflicts` |
-| INV-LED-27 | مبدأ سند با نوعش می‌خواند (دستی و سیستمی ⇔ ledger؛ ماژولی ≠ ledger). نوع ورودی واحد مبلغ صریح دارد | `journal_before_insert` | T05 «manual journals belong to ledger»، «module journals name their module»، «imported amounts declare their unit» |
-| INV-LED-28 | کلاس افتتاحیه فقط روز اول سالِ open است: `opening` فقط وقتی سال قبل closing است، `opening_import` فقط در سال اولِ pending. کلاس اختتامیه فقط روز آخرِ سالِ closing است | `journal_before_insert` | T05 «opening journals only on the first day»؛ T15 «closing journals only while closing»؛ T17 «no opening import after the opening is posted» |
-| INV-LED-29 | ماشین حالت سال: open→closing فقط با همهٔ دوره‌های بسته؛ closed فقط با افتتاحیهٔ بعدی؛ open دوباره فقط پس از ابطال اسناد بستن؛ closing دوباره فقط پیش از قطعی شدن؛ locked فقط با قطعی شدن کامل و دوره‌های قفل | `fiscal_year_guard` | T15 (شش مورد) |
-| INV-LED-30 | `opening_state=posted` فقط با سند افتتاحیه و حساب تراز افتتاحیهٔ صفر. قطعی کردن فقط وقتی `opening_state ≠ pending` | `fiscal_year_guard` + `journal_before_update` | T10 «finalization waits for the opening decision»؛ T17 «opening incomplete while clearing account is not zero» |
+| INV-LED-27 | مبدأ سند با نوعش می‌خواند (دستی و سیستمی ⇔ ledger؛ ماژولی ≠ ledger). نوع ورودی واحد مبلغ صریح دارد | `journal_before_insert` | T05 «manual journals belong to ledger»، «module journals name their module»، «imported amounts declare their unit»؛ T20 «system journal types belong to the ledger»، «journal base currency equals the year base currency»، «explicit period must contain the journal date» |
+| INV-LED-28 | کلاس افتتاحیه فقط روز اول سالِ open است: `opening` فقط وقتی سال قبل closing است، `opening_import` فقط در سال اولِ pending. کلاس اختتامیه فقط روز آخرِ سالِ closing است | `journal_before_insert` | T05 «opening journals only on the first day»؛ T15 «closing journals only while closing»؛ T17 «no opening import after the opening is posted»؛ T20 «year-close opening needs the previous year closing» |
+| INV-LED-29 | ماشین حالت سال: open→closing فقط با همهٔ دوره‌های بسته؛ closed فقط با افتتاحیهٔ بعدی؛ open دوباره فقط پس از ابطال اسناد بستن؛ closing دوباره فقط پیش از قطعی شدن؛ locked فقط با قطعی شدن کامل و دوره‌های قفل | `fiscal_year_guard` | T15 (شش مورد)؛ T20 «open -> locked is not a year transition»، «reopen requires voided closing journals»، «reopen requires voiding the next opening» |
+| INV-LED-30 | `opening_state=posted` فقط با سند افتتاحیه و حساب تراز افتتاحیهٔ صفر. قطعی کردن فقط وقتی `opening_state ≠ pending` | `fiscal_year_guard` + `journal_before_update` | T10 «finalization waits for the opening decision»؛ T17 «opening incomplete while clearing account is not zero»؛ T20 «opening posted requires an opening journal»، «cut-off cannot move while the opening is pending»، «a journal cannot become permanent while the opening is pending»، «only the first year may skip the opening»، «not_required -> posted is not allowed»، «opening cannot be reset after finalization» |
 | INV-LED-31 | پس از بستن سال: حساب‌های موقت پیش از اختتامیه صفرند؛ همهٔ حساب‌ها پس از اختتامیه صفرند؛ افتتاحیهٔ بعد = قرینهٔ اختتامیه برای هر حساب، بُعد و ارز | `check_year_close` (شرط `YearEndService` پیش از `closed`، و job) | T15 «year close verified»؛ `property/test_year_close_props.py::test_close_then_check_is_empty` |
-| INV-LED-32 | تراز آزمایشی در هر دوره، هر سطح و هر بازه تراز است | ناشی از INV-01 + `check_trial_balance` و `trial_balance_rollup` | T11 (چهار مورد)؛ T19 «… trial balance check» |
+| INV-LED-32 | تراز آزمایشی در هر دوره، هر سطح و هر بازه تراز است | ناشی از INV-01 + `check_trial_balance` و `trial_balance_rollup` | T11 (چهار مورد)؛ T19 «… trial balance check»؛ T20 «report range must be ordered and inside one year» |
 | INV-LED-33 | سطل‌ها = سطرها برای هر کلید. فشرده‌سازی و بازسازی جمع را حفظ می‌کنند. فقط توابع definer می‌نویسند | تریگر سطح دستور + grant + `verify_balance_buckets` | T01 «buckets are not writable»؛ T11 «compaction preserves sums»، «rebuild equals lines»، «not deletable»؛ T19 «bucket verification» |
-| INV-LED-34 | ماندهٔ GL حساب کنترلی (به بُعد مؤثر و ارز، بدون تسعیر) = ماندهٔ زیردفتر ثبت‌شده | `check_control_accounts` (job، و شرط بستن سال) | T14 «GL equals subledger»، «difference detected»، «merged dimension resolved» |
-| INV-LED-35 | صورت‌ها: `BS_CHECK` = ۰، `CF_CHECK` = ۰، `PL_CHECK` = ۰. هر حساب برگ غیرانتظامی دقیقاً در یک ردیف BS یا PL است | `evaluate_statement` + `report_coverage` (دروازهٔ انتشار قالب) | T15 «balance sheet balances»، «cash flow reconciles»، «P&L rows cover»، «every leaf account maps to one row»؛ T16 |
+| INV-LED-34 | ماندهٔ GL حساب کنترلی (به بُعد مؤثر و ارز، بدون تسعیر) = ماندهٔ زیردفتر ثبت‌شده | `check_control_accounts` (job، و شرط بستن سال) | T14 «GL equals subledger»، «difference detected»، «merged dimension resolved»؛ T20 «control check date must be inside a year» |
+| INV-LED-35 | صورت‌ها: `BS_CHECK` = ۰، `CF_CHECK` = ۰، `PL_CHECK` = ۰. هر حساب برگ غیرانتظامی دقیقاً در یک ردیف BS یا PL است | `evaluate_statement` + `report_coverage` (دروازهٔ انتشار قالب) | T15 «balance sheet balances»، «cash flow reconciles»، «P&L rows cover»، «every leaf account maps to one row»؛ T16؛ T20 «formula may reference only earlier rows» |
 | INV-LED-36 | نگاشت قطعی است: قاعدهٔ تکراری با اعتبار هم‌پوشان رد می‌شود؛ گره و نبود قاعده خطاست؛ حساب مقصد برگ است و نوع مورد انتظار را دارد؛ شکل شرط معتبر است | EXCLUDE + `posting_rule_guard` + `resolve_account` + CHECK | T12 (نه مورد)؛ `property/test_resolution_props.py::test_resolution_independent_of_insert_order` |
 | INV-LED-37 | نرخ مثبت و یکتا برای (نوع، جفت، تاریخ) است. جست‌وجو آخرین نرخ ≤ تاریخ را برمی‌گرداند | CHECK + UNIQUE + `rate_on` | T13 |
-| INV-LED-38 | جداسازی مستأجر: RLS اجباری روی همهٔ جدول‌ها، FK ترکیبی، و رد تعویض مستأجر وسط تراکنش | `core.enable_tenant_rls` + `assert_tenant_context` | T01؛ T17 (هفت مورد)؛ `core.security_lint()` خالی |
-| INV-LED-39 | مقدار ادغام‌شده غیرفعال است. مقصد هم‌نوع، هم‌جنس و ادغام‌نشده است. ادغام برگشت‌ناپذیر است. گزارش و تطبیق مقدار مؤثر را می‌بینند | CHECK + `dimension_value_guard` + `v_dimension_effective` | T14 (چهار مورد) |
+| INV-LED-38 | جداسازی مستأجر: RLS اجباری روی همهٔ جدول‌ها، FK ترکیبی، و رد تعویض مستأجر وسط تراکنش | `core.enable_tenant_rls` + `assert_tenant_context` | T01؛ T17 (هفت مورد)؛ `core.security_lint()` خالی؛ T20 «provision/compaction/rebuild require a tenant context»؛ T19 «bucket trigger rejects lines outside the tenant context» |
+| INV-LED-39 | مقدار ادغام‌شده غیرفعال است. مقصد هم‌نوع، هم‌جنس و ادغام‌نشده است. ادغام برگشت‌ناپذیر است. گزارش و تطبیق مقدار مؤثر را می‌بینند | CHECK + `dimension_value_guard` + `v_dimension_effective` | T14 (چهار مورد)؛ T20 «dimension type of a value is immutable»، «parent value must be a group of the same type»، «a merge is re-pointed only along its chain» |
 | INV-LED-40 | شمارهٔ عطف در (شرکت، سال) یکتا و بی‌فاصله است | UNIQUE + `core.number_next` در همان تراکنش + `core.number_gaps` در job | `integration/test_numbering.py::test_reference_numbers_gapless_under_concurrency` |
 | INV-LED-41 | هر مبلغ واردشده واحد اعلام‌شده دارد. تبدیل صریح است و ضریبش در سند ثبت می‌شود. ضرب بی‌صدا وجود ندارد | `requires_input_unit` + `AmountUnitConverter` | T05؛ `unit/test_amount_unit.py::test_irt_irr_new_conversion_explicit` |
 | INV-LED-42 | خروجی دفاتر فقط اسناد دائم را دارد، در یک سال است، هر ردیف یک‌طرفه است، جمع‌ها برابرند، و هر حساب به کل و معین نگاشت دارد | سرویس + CHECK جمع `eledger_export` | `unit/test_eledger_formats.py::*`، `integration/test_eledger_export.py::test_only_permanent_rows` |
 | INV-LED-43 | تولید سند تکرارشونده برای هر نوبت یک بار است | ایندکس یکتای پیش‌نویس + کلید مبدأ `occ:` | `integration/test_recurring.py::test_occurrence_idempotent` |
+| INV-LED-44 | دستیار هوشمند هرگز سند ثبت، ارسال، ابطال، برگشت یا قطعی نمی‌کند و وضعیت دوره، سال، نگاشت یا کدینگ را تغییر نمی‌دهد. فقط پیش‌نویس می‌سازد (`created_via='assistant'`). خاموش یا قطع بودن آن اثری بر ledger ندارد | قالب نقش `ai_assistant` (core) + بررسی `principal.is_ai_assistant` در `ManualJournalService.submit`، `LedgerPostingService` و سرویس‌های قطعی کردن، بستن و دوره + قرارداد import-linter | `integration/test_assistant_boundary.py::test_assistant_can_create_draft_only`، `::test_assistant_submit_and_post_rejected`، `::test_ledger_suite_with_assistant_disabled`؛ `arch/test_import_contracts.py::test_ledger_does_not_import_assistant` |
+| INV-LED-45 | پیش‌نویس با `created_via='recurring'` همیشه به الگوی تکرارشونده و نوبتش پیوند دارد. `created_via` فقط یکی از شش مقدار مجاز است | CHECKهای `journal_draft` | T20 «draft provenance recorded»، «… defaults to user»، «… recurring requires a recurring template»، «… is one of the allowed origins» |
+| INV-LED-46 | قالب کدینگ فقط روی شرکتِ بدون حساب اعمال می‌شود، فقط نسخهٔ منتشرشده و مسطح (بدون `extends`)، و هر حساب قالب والد موجود و هر نوع بُعدِ قاعده‌اش در مستأجر provision شده دارد؛ در غیر این صورت کل اعمال برمی‌گردد | `ledger.apply_coa_template` (یک تراکنش) | T00 «template applied»؛ T20 «template applies only to an empty chart»، «unknown template»، «only flattened templates are applied»، «template account parent must exist»، «template dimension type must be provisioned» |
 
 ## ۸. سناریوهای مرزی و خطا
 
@@ -1219,9 +1253,14 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 ## ۹. برنامهٔ آزمون
 
 **پایگاه داده (اجراشده):**
-- **فایل:** `docs/design/sql/tests/20_ledger_test.sql`. ۱۸ گروه T00 تا T19 و ۲۰۰+ ادعا دارد، با نقش `hk_app`، `hk_readonly` و postgres (دست‌کاری و ROLLBACK).
+- **فایل:** `docs/design/sql/tests/20_ledger_test.sql`. ۲۱ گروه T00 تا T20 و حدود ۲۶۰ ادعا دارد، با نقش `hk_app`، `hk_readonly` و postgres (دست‌کاری و ROLLBACK). هر `expect_error` الگوی دقیق کد و پیام را می‌خواهد، تا لایهٔ دفاعی دیگری که همان نقض را می‌گیرد آزمون را «سبز» نکند.
 - **در CI:** با `tests/db/test_sql_suites.py::test_20_ledger_suite` در هر دو ترتیب (`00→20` و `00→10→20`)، و `test_security_lint_clean`.
-- **آزمون جهش** (`tools/db/mutate_triggers.py`): هر بررسی تریگر را با `IF false` خنثی می‌کند و انتظار شکست مجموعه را دارد. ۳۰ جهش اجرا و همه کشته شدند.
+- **آزمون جهش** (`tools/db/mutate_raise_sites.py`، job شبانهٔ CI؛ بازماندهٔ جدید = شکست):
+  - **روش:** هر فراخوانی `PERFORM ledger.raise_error(...)` (۱۳۷ محل) یکی‌یکی به تابع بی‌اثر `ledger.mutant_noop` تبدیل می‌شود، و هر `RAISE EXCEPTION 'HK_...'` مستقیم (۵ محل) به `RAISE NOTICE`. هر جهش روی پایگاه تازه (کپی template دارای `00_foundation.sql`) اعمال و کل مجموعه اجرا می‌شود. شکست مجموعه یعنی جهش کشته شده است.
+  - **دور اول (پیش از T20):** ۸۵ از ۱۴۲ کشته شدند. ۵۷ بازمانده یا آزمون نداشتند (مثل `HK_LEDGER_JOURNAL_TYPE`، `HK_LEDGER_BASE_CURRENCY`، `HK_LEDGER_ACCOUNT_TYPE_LOCKED`، مسیرهای خطای اعمال قالب) یا با الگوی «یا این کد یا آن» آزموده می‌شدند. گروه T20 برای هر کدام آزمون دقیق افزود.
+  - **دور دوم:** ۱۴۰ از ۱۴۲ کشته شدند. دو بازماندهٔ مجاز، جهش معادل‌اند (دسترس‌ناپذیر) و به‌عنوان دفاع لایه‌ای می‌مانند:
+    1. `HK_LEDGER_YEAR_NOT_OPEN` در `journal_before_insert`: سال فقط وقتی از `open` بیرون می‌رود که همهٔ دوره‌هایش `closed` یا `locked` باشند (`HK_LEDGER_FY_PERIODS_OPEN`)، و دورهٔ سالِ غیرباز بازگشایی نمی‌شود (`HK_LEDGER_PERIOD_TRANSITION`). پس هر ثبت عادی در سال غیرباز پیش‌تر با `HK_LEDGER_PERIOD_CLOSED` رد می‌شود.
+    2. شاخهٔ `soft_closed → open` در `fiscal_period_guard` («سال باز نیست»): به همان دلیل، دورهٔ `soft_closed` در سال غیرباز وجود ندارد.
 
 **واحد** (`backend/tests/ledger/unit/`):
 - `test_rounding.py`: سه حالت گرد کردن در برابر `ledger.round_amount` با بردارهای طلایی مشترک.
@@ -1230,6 +1269,8 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 - `test_amount_unit.py` و `test_eledger_formats.py`: هر دو نسخه، با spec جعلی از rules؛ «ردیف صفر»؛ قالب تاریخ.
 - `test_recurring_schedule.py`: آخر ماه جلالی ۲۹، ۳۰ و ۳۱؛ اسفند کبیسه.
 - `test_canonical.py`: شکل متعارف پایتون = SQL.
+- `test_error_map.py::test_every_sql_error_code_is_mapped`: هر کد `HK_*` فایل SQL در `errors.yaml` نگاشت دارد (§۵-۱۶).
+- `arch/test_import_contracts.py::test_ledger_does_not_import_assistant`: قرارداد import-linter (INV-LED-44).
 
 **property-based** (hypothesis، روی PostgreSQL واقعی):
 
@@ -1263,6 +1304,7 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 - `test_restore_hook.py`: صدور، درون‌ریزی replica، قلاب، و رد بستهٔ دست‌کاری‌شده.
 - `test_control_totals.py`، `test_recurring.py` و `test_eledger_export.py`.
 - `test_rls_ledger.py`: هر endpoint با کاربر مستأجر دیگر → 404.
+- `test_assistant_boundary.py`: principal دستیار پیش‌نویس می‌سازد؛ submit، post، void، reverse، finalize و گذار دوره با 403 رد می‌شوند؛ کل مجموعهٔ آزمون ledger با دستیار خاموش و با ارائه‌دهندهٔ مدلِ قطع (mock که timeout می‌دهد) سبز است.
 
 **E2E (Playwright، `frontend/e2e/ledger/`):**
 - `manual-journal.spec.ts`: ساخت، تراز زنده، ارسال، بررسی با کاربر دوم، ابطال، و نمایش شماره‌ها.
@@ -1286,7 +1328,7 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 
 | قابلیت | فاز |
 |---|---|
-| کدینگ درختی، سطوح، کد سلسله‌مراتبی یا آزاد، legacy، و قالب `ir.general`. قالب‌های کافه، کفش و پوشاک، و لوازم برقی به‌صورت داده | v1 |
+| کدینگ درختی، سطوح، کد سلسله‌مراتبی یا آزاد، legacy، و قالب `ir.general`. قالب‌های چهار بستهٔ صنفی v1 (کافه و رستوران، کفش و پوشاک، کالای برق، کسب‌وکار عمومی) به‌صورت داده (Q-A) | v1 |
 | ابعاد ۶ جایگاه و شعبه، قواعد حساب، مرکز هزینه و پروژهٔ سلسله‌مراتبی، ابعاد کاربر، ادغام | v1 |
 | سال و دوره، چهار وضعیت، قفل ماژولی، تاریخچه، ثبت هم‌زمان در دو سال | v1 |
 | پیش‌نویس، موقت، دائم، ابطال، برگشت، سند اصلاحی، تأیید (core)، بررسی با تفکیک وظایف | v1 |
@@ -1301,7 +1343,7 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 | صورت وضعیت مالی، سود و زیان، و اسکلت جریان وجوه نقد با قالب‌های داده‌ای و ردیف کنترلی | v1 |
 | قالب‌ساز صورت مالی در UI؛ صورت تغییرات حقوق مالکانه؛ یادداشت‌ها | v2 |
 | خروجی دفاتر تجاری الکترونیکی، هر دو نسخه | v1 |
-| ارسال خودکار به سامانه (اگر API منتشر شود؛ وابسته به Q-C برای امضا) | later |
+| ارسال خودکار دفاتر به سامانه (اگر API منتشر شود؛ امضا طبق انتخاب نگهداری کلید Q-C) | later |
 | سطل‌ها، فشرده‌سازی، راستی‌آزمایی، مقادیر کنترلی، قلاب درون‌ریزی | v1 |
 | بودجه و کنترل تعهد | v2 |
 | تلفیق، حذف معاملات بین‌شرکتی، FCTR | v2 |
@@ -1310,21 +1352,25 @@ VALUES ('cheque_receivable', 'treasury', 'treasury.ledger_subledger_cheques', 1,
 | سری عطف به ازای شعبه، برای حجم بسیار بالا | v2 |
 | پارتیشن `journal_line` (HASH tenant) | later |
 | امضای دیجیتال سند دائم با کلید شرکت | later |
+| کلیدهای نگاشت و قالب کدینگ صنف‌های بعدی (تولید، پخش، پیمانکاری، داروخانه) به‌صورت بستهٔ صنفی؛ اسکیما بدون تغییر | later (Q-A) |
 | حساب‌های فلز گرانبها و واحدهای شمارشی (طلا) | later (Q-A) |
-| پیشنهاد هوشمند نگاشت حساب یا سند (مدل خودمیزبان) | later (Q-F) |
+| سطح دستیار هوشمند: سرویس‌های پرس‌وجوی فقط‌خواندنی، dry-run و ساخت پیش‌نویس با `created_via='assistant'`؛ رد ثبت توسط دستیار (§۵-۱۸) | v1 (Q-F) |
+| نشان «پیشنهاد دستیار» و مقایسهٔ پیشنهاد با نسخهٔ ارسال‌شده در UI سند | v1 (Q-F؛ UI در بخش ۱۰) |
 
 ## ۱۱. وابستگی‌ها و تصمیم‌های باز
 
-| پرسش | اثر بر این بخش | اگر «بله / گسترده» | اگر «نه / محدود» |
+پاسخ‌های صاحب محصول (دور دوم، [`00-decisions.md`](../00-decisions.md)) دریافت شده‌اند. جدول زیر برای هر پرسش پاسخ، اثرش بر این بخش، و این را نشان می‌دهد که اگر پاسخ بعداً تغییر کند چه چیزی عوض می‌شود. در هیچ‌کدام اسکیمای دفتر کل تغییر نمی‌کند.
+
+| پرسش | پاسخ | اثر بر این بخش | اگر پاسخ تغییر کند |
 |---|---|---|---|
-| Q-A دامنهٔ صنف | قالب کدینگ، انواع بُعد کاربر و کلیدهای نگاشت | فقط داده اضافه می‌شود:<br>• **تولید:** WIP، مرکز هزینهٔ تولید، کلیدهای `manufacturing.*`<br>• **پیمانکاری:** پروژه و قرارداد به‌عنوان بُعد، کلیدهای صورت وضعیت<br>• **داروخانه، پخش:** بُعد مسیر<br>• **طلا:** حساب مقداری، `quantity` در سطر و پرچم آینده `tracks_quantity`<br><br>اسکیمای دفتر کل تغییر نمی‌کند | فقط قالب‌های چهار صنف v1 |
-| Q-B سیستم‌عامل On-prem | ندارد. SQL و پایتون مستقل از سیستم‌عامل‌اند | — | — |
-| Q-C نگهداری کلید مؤدیان | فقط ارسال خودکار دفاتر و امضای سند دائم (later) | امضا سمت سرور با KMS | امضا روی دستگاه مشتری؛ v1 فقط فایل تولید می‌کند و کاربر در سامانه بارگذاری و امضا می‌کند |
-| Q-D حقوق | نوع بُعد `employee`، کلیدهای `payroll.*`، کارگاه بیمه | کارگاه‌های متعدد = بُعد کاربر در جایگاه ۴ یا ۵ (`insurance_workshop`)؛ کمیسیون = کلید جدید | همان کلیدهای پایه |
-| Q-E پورتال نمایندگان | ندارد | — | — |
-| Q-F دستیار هوش مصنوعی | ندارد. اگر v1 باشد، فقط از API و سرویس‌های پرس‌وجوی همین بخش استفاده می‌کند و هرگز مستقیم در جدول نمی‌نویسد | پیشنهاد نگاشت و حساب در مهاجرت | — |
-| Q-G نرم‌افزار و پشتیبان پایلوت | مهاجرت کدینگ (`legacy_*`، `code_mode`)، `legacy_permanent_no`، افتتاحیه | با نمونهٔ واقعی، قالب نگاشت هلو و سپیدار به `ir.general` تنظیم می‌شود | ورود Excel قالب جامع و `report_account_map` دستی |
-| Q-H مبنای قیمت‌گذاری | شمارش شرکت، شعبه و سطر برای مصرف؛ فعال‌سازی ماژول‌ها (چندارزی، تسعیر، تلفیق) | entitlement در سرویس، با `core.entitlement` snapshot. اسکیما مستقل است | — |
+| Q-A دامنهٔ صنف | v1 کامل: کافه و رستوران، کفش و پوشاک، کالای برق، کسب‌وکار عمومی. صنف‌های دیگر بعداً به‌شکل بستهٔ صنفی | v1 چهار قالب کدینگ به‌صورت داده: `ir.general` (موجود در SQL) و قالب‌های `ir.cafe`، `ir.apparel` و `ir.electrical` که با `extends_code=ir.general` و `industry_pack` فقط حساب‌ها و نگاشت‌های اختصاصی را می‌افزایند (انتشار از پنل مالک پس از بازبینی حسابدار)، و کلیدهای نگاشت پایه. ساختار برای صنف‌های بعدی آماده است و فقط داده می‌خواهد:<br>• **تولید:** WIP و مرکز هزینهٔ تولید (بُعد `cost_center`)، کلیدهای `manufacturing.*` با migration ماژول تولید<br>• **پیمانکاری:** پروژه (جایگاه ۳) و قرارداد به‌عنوان بُعد کاربر، کلیدهای صورت وضعیت<br>• **پخش و داروخانه:** بُعد کاربر مسیر یا ویزیتور<br>• **طلا:** `quantity` در سطر هست؛ پرچم آیندهٔ `tracks_quantity` روی حساب (later) | آوردن هر صنف به v1 = افزودن قالب و کلید (داده) + YearEndHook ماژول آن. بدون migration اسکیمای ledger |
+| Q-B سیستم‌عامل On-prem | v1 فقط لینوکس (Docker) | ندارد. SQL و پایتون مستقل از سیستم‌عامل‌اند و ledger فایل یا مسیر سیستمی ندارد (خروجی‌ها در `core.attachment`) | Windows Server بعدی اثری بر این بخش ندارد |
+| Q-C نگهداری کلید مؤدیان | انتخاب مشتری: پیش‌فرض روی سرور با KMS داخلی و قرارداد مسئولیت؛ گزینهٔ کلید روی دستگاه مشتری (عامل امضا) | v1: ledger چیزی امضا نمی‌کند. دفاتر الکترونیکی فایل تولید می‌کنند و کاربر آن را در سامانه بارگذاری و همان‌جا امضا می‌کند. امضای سند دائم و ارسال خودکار دفاتر (later) همان انتخاب را می‌گیرند (D-L22)؛ اگر کلید روی دستگاه است، امضا فقط وقتی دستگاه برخط است انجام می‌شود و قطعی کردن هرگز منتظر آن نمی‌ماند | ندارد؛ زنجیرهٔ hash مستقل از کلید است |
+| Q-D حقوق v1 | کارکنان مشمول قانون کار + ساعتی و پاره‌وقت؛ فیش، بیمه و مالیات حقوق؛ فایل بیمه و مالیات برای بارگذاری دستی | نوع بُعد `employee` (جایگاه ۱، مالک payroll). کلیدهای `payroll.salary_expense`، `salary_payable`، `insurance_payable`، `tax_payable` و `employer_insurance_expense` (افزوده‌شده در این دور) در کاتالوگ و قالب `ir.general`. ساعتی و پاره‌وقت اثری بر دفتر کل ندارد | چند کارگاه بیمه: نوع بُعد کاربر `insurance_workshop` در جایگاه ۴ یا ۵ و قاعدهٔ «اجباری» روی حساب بیمهٔ پرداختنی؛ کمیسیون: کلید جدید `payroll.commission_expense` با migration payroll. بدون تغییر اسکیما |
+| Q-E شبکهٔ نمایندگی | مدل داده v1، پرتال v1.1 | ندارد (پایگاه کنترل، نه دادهٔ مستأجر) | — |
+| Q-F دستیار هوشمند | در محصول؛ ارائه‌دهندهٔ مدل قابل تنظیم (API سازگار با OpenAI)؛ اختیاری؛ فقط پیشنهاد | §۵-۱۸: فقط سرویس‌های پرس‌وجو، dry-run و ساخت پیش‌نویس (`created_via='assistant'`). INV-LED-44: ثبت توسط دستیار ممکن نیست و ledger به دستیار وابسته نیست | خاموش کردن دستیار برای پلتفرم یا مستأجر هیچ تغییری در ledger نمی‌خواهد |
+| Q-G نرم‌افزار مبدأ و نمونهٔ داده | هلو، سپیدار، حسابفا، Excel و دفتر دستی و سایر؛ آداپتر هلو، سپیدار، حسابفا و Excel در v1؛ نمونهٔ واقعی با رضایت کتبی | نقاط ورود v1: `apply_coa_template` یا کدینگ «حفظ‌شده» (`code_mode='free'`، `legacy_code`، `report_account_map`)، `opening_import` با `amount_unit` اجباری، `history_import` با `legacy_permanent_no`، و `report_coverage` به‌عنوان دروازهٔ پایان مهاجرت. نمونه‌های واقعی دیتاست‌های طلایی تراز و صورت‌ها را برای هر آداپتر می‌سازند (بخش مهاجرت) | آداپتر بیشتر (محک، ...) فقط سمت migration است |
+| Q-H مبنای قیمت‌گذاری | هنوز باز؛ کاملاً قابل تنظیم در پنل مالک | ledger هیچ محدودیت قیمتی را در SQL ندارد. شمارش شرکت، شعبه و سند برای مصرف از ویو یا `LedgerControlTotals` خوانده می‌شود. فعال بودن قابلیت‌ها (چندارزی، تسعیر، تلفیق) در سرویس با `core.entitlement` سنجیده می‌شود | هر مبنایی (کاربر، شرکت، شعبه، POS، ماژول، حجم فاکتور) فقط پیکربندی پنل مالک است |
 
 **عدم قطعیت‌های پژوهش** (همه پارامتر یا داده، نه کد):
 - قالب جاری دفاتر الکترونیکی (هر دو نسخه، قالب تاریخ، «ردیف صفر»). اطمینان پایین تا متوسط ([۰۲ §۴.۳](../research/02-migration-enterprise-and-generic.md#۴۳-دفاتر-تجاری-الکترونیکی-قالب-ملی-دفتر-روزنامه-و-کل)).
@@ -1362,11 +1408,35 @@ ALTER TABLE ledger.fiscal_year ADD CONSTRAINT fk_fiscal_year__core_tenant_member
   FOREIGN KEY (tenant_id, closed_by) REFERENCES core.tenant_membership (tenant_id, user_id);
 ALTER TABLE ledger.fiscal_year ADD CONSTRAINT fk_fiscal_year__core_tenant_membership_locked
   FOREIGN KEY (tenant_id, locked_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.fiscal_period ADD CONSTRAINT fk_fiscal_period__core_tenant_membership_status
+  FOREIGN KEY (tenant_id, status_changed_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.period_status_event ADD CONSTRAINT fk_period_status_event__core_tenant_membership
+  FOREIGN KEY (tenant_id, actor_user_id) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.period_module_lock ADD CONSTRAINT fk_period_module_lock__core_tenant_membership
+  FOREIGN KEY (tenant_id, locked_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.exchange_rate ADD CONSTRAINT fk_exchange_rate__core_tenant_membership
+  FOREIGN KEY (tenant_id, entered_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.recurring_journal ADD CONSTRAINT fk_recurring_journal__core_tenant_membership
+  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.year_close_run ADD CONSTRAINT fk_year_close_run__core_tenant_membership
+  FOREIGN KEY (tenant_id, started_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.fx_revaluation_run ADD CONSTRAINT fk_fx_revaluation_run__core_tenant_membership
+  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+ALTER TABLE ledger.eledger_export ADD CONSTRAINT fk_eledger_export__core_tenant_membership
+  FOREIGN KEY (tenant_id, generated_by) REFERENCES core.tenant_membership (tenant_id, user_id);
+-- کنشگر سیستمی (job، بستن خودکار، سند ماژولی بدون کاربر) = NULL؛ نوع کنشگر در core.audit_log است.
 
 -- ledger → parties (هم‌جهت DAG: L3 → L2). آزموده روی 00→10→20→25.
 ALTER TABLE ledger.dimension_value ADD CONSTRAINT fk_dimension_value__parties_party
   FOREIGN KEY (tenant_id, party_id) REFERENCES parties.party (tenant_id, id);
 ```
+
+همهٔ ۲۱ دستور بالا روی پایگاه تازهٔ `00 → 10 → 20 → 25` بدون خطا اعمال شدند (پیش از درج داده؛ fixture آزمون `20_ledger_test.sql` عضویت ندارد، پس 99 باید پس از آن یا روی پایگاه بدون fixture اجرا شود).
+
+**ستون‌های مرجعِ عمداً بدون FK** (بررسی کاتالوگ: هر ستون uuid دیگرِ `*_id`/`*_by`/`*_ref` در اسکیمای ledger یا FK درون‌فایل دارد یا در بالا آمده است):
+- `ledger.journal.source_doc_id` و `ledger.dimension_value.source_entity_id`: چندریختی (به جدول ماژول مبدأ بسته به `source_module`). یکپارچگی با کلید یکتای مبدأ و FK معکوس از سند مبدأ (`.journal_id`) تضمین می‌شود. `party_id` ستون مولد همان مقدار است تا FK به `parties.party` ممکن شود.
+- `ledger.journal_line.fiscal_year_id` و `period_id`: رونوشت سرسند که تریگر `journal_line_guard` پر می‌کند. FK سرسند کافی است و FK اضافه روی جدول پرحجم هزینهٔ درج دارد.
+- `ledger.balance_bucket.*`: دادهٔ مشتق که فقط تابع definer از سطرهای معتبر می‌سازد. درستی آن با `verify_balance_buckets` سنجیده می‌شود، نه FK.
 
 **FKهای ورودی به ledger** که مالکشان بخش‌های دیگرند (برای هماهنگی):
 - `core.role_assignment_scope.cost_center_id → ledger.dimension_value` (اعلام‌شده در بخش ۰۲).
@@ -1394,3 +1464,6 @@ ALTER TABLE ledger.dimension_value ADD CONSTRAINT fk_dimension_value__parties_pa
 | C-L14 | وضعیت `reversed` در شرح وظیفهٔ این بخش آمده است | به‌عمد ذخیره نمی‌شود (D-L04). `v_journal_line.is_reversed` و فیلد API `is_reversed` آن را نمایش می‌دهند |
 | C-L15 | تسعیر ارز در شرح وظیفه آمده، ولی پژوهش آن را v2 گذاشته است (۰۶ V2-02) | طراحی و اسکیما کامل در v1؛ فعال‌سازی در v2. صاحب محصول می‌تواند آن را برای واردکنندگان (لوازم برقی) به v1 بیاورد، بدون migration |
 | C-L16 | سریال شدن ثبت‌های یک (شرکت، سال) روی شمارندهٔ عطف core | برای POS پرحجم: بخش POS سند تجمیعی بسازد. در v2، core «سری با بازهٔ رزرو سمت سرور برای هر worker» را بررسی کند. یکتایی عطف در سال باید حفظ شود |
+| C-L17 | پاسخ Q-F: دستیار پیش‌نویس پیشنهاد می‌دهد، ولی بخش ۰۲ قالب `ai_assistant` را «فقط خواندنی» تعریف کرده و principal دستیار را فقط با `kind='service'` نشان می‌دهد؛ از سایر حساب‌های سرویس (یکپارچگی‌هایی که `ledger.journal.post` دارند) قابل تشخیص نیست | بخش ۰۲: (۱) `Principal.is_ai_assistant` (یا `PrincipalKind='assistant'`) و `actor_kind` متناظر در `core.audit_log`؛ (۲) قالب `ai_assistant` شامل `ledger.journal.create` (فقط پیش‌نویس) به‌اضافهٔ `*.read`؛ (۳) سقف: مجوزهای دستیار ⊆ مجوزهای کاربرِ نیابت‌دهنده. ledger تا آن زمان بررسی لایه‌ای §۵-۱۸ را بر همین پرچم بنا می‌کند |
+| C-L18 | FKهای کنشگر §۱۲ (به `core.tenant_membership`) روی پایگاهی که کاربر سیستمی یا fixture بدون عضویت دارد شکست می‌خورند | یکپارچه‌ساز `99_cross_fk.sql` را پیش از دادهٔ آزمون اعمال کند و fixtureهای آزمون مشترک (بخش ۰۲) برای کاربر آزمون عضویت بسازند؛ کنشگر سیستمی همیشه NULL است (§۱۲) |
+| C-L19 | آزمون جهش نشان داد بررسی‌هایی که دو لایه دارند (مثلاً سال `closing` و دورهٔ `closed`) با الگوی «یا این کد یا آن» آزموده می‌شوند و حذف یک لایه دیده نمی‌شود | قرارداد مشترک کیفیت: هر بررسی پایگاه داده‌ای با الگوی دقیق کد و پیام خودش آزموده شود، و job CI آزمون جهش (`tools/db/mutate_raise_sites.py`، §۹) برای همهٔ فایل‌های SQL ماژول‌ها اجرا شود؛ بازماندهٔ مجاز فقط با اثبات دسترس‌ناپذیری و فهرست صریح |

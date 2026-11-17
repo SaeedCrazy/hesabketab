@@ -16,6 +16,7 @@
 --   بخش ۲ (assert، «SET ROLE hk_app»): همهٔ ناوردایی‌های پایگاه داده‌ای با DO block؛ هر DO یک تراکنش است و
 --         تریگرهای deferred در commit آن اجرا می‌شوند. موارد منفیِ deferred با «SET CONSTRAINTS ALL IMMEDIATE»
 --         درون زیرتراکنش expect_error آزموده می‌شوند. زمینهٔ مستأجر با set_config('app.tenant_id', ..., true).
+--         T20 هر بررسی تریگر/تابعی را که آزمون جهش (neutralize هر raise_error) بی‌آزمون یافت، با الگوی دقیق کد و پیام می‌آزماید.
 --   بخش ۳ (tamper، نقش postgres، ROLLBACK): دست‌کاری مستقیم سطر دائم با غیرفعال کردن تریگر و کشف آن با
 --         verify_permanent_chain و verify_balance_buckets؛ و آزمون hk_readonly.
 -- خروجی موفق با «ALL 20_ledger TESTS PASSED» پایان می‌یابد؛ هر شکست «TEST FAILED: ...» است و psql با کد ≠ ۰ خارج می‌شود.
@@ -34,7 +35,10 @@ INSERT INTO core.tenant (id, slug, display_name) VALUES
 INSERT INTO core.company (tenant_id, id, code, name) VALUES
   ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c1', 'C1', 'شرکت الف'),
   ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c2', 'C2', 'شرکت الف ۲'),
-  ('0b000000-0000-7000-8000-000000000001', '0b000000-0000-7000-8000-0000000000c1', 'C1', 'شرکت ب');
+  ('0b000000-0000-7000-8000-000000000001', '0b000000-0000-7000-8000-0000000000c1', 'C1', 'شرکت ب'),
+  -- T20 (شکاف‌های آزمون جهش): CA3 با کدینگ و سال، CA4 خالی (بدون حساب و سال)
+  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c3', 'C3', 'شرکت الف ۳'),
+  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c4', 'C4', 'شرکت الف ۴');
 INSERT INTO core.branch (tenant_id, id, company_id, code, name) VALUES
   ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000b1', '0a000000-0000-7000-8000-0000000000c1', 'BR1', 'شعبه ۱'),
   ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000b2', '0a000000-0000-7000-8000-0000000000c2', 'BR1', 'شعبه ۱'),
@@ -177,6 +181,40 @@ LANGUAGE sql STABLE AS $$
 $$;
 INSERT INTO ledger.subledger_source (subledger_kind, owner_module, balance_function, dim_slot, compare_txn, introduced_in)
 VALUES ('party', 'tests', 'public.t_party_subledger', 1, true, 'test');
+
+-- سرسند خام با مقادیر قابل‌بازنویسی (برای آزمون مستقیم هر بررسی journal_before_insert؛ T20)
+-- p_over: jsonb با نام ستون‌های ledger.journal؛ دو سطر ۵۱۰۱ بدهکار ۱ / ۵۲۰۱ بستانکار ۱
+CREATE OR REPLACE FUNCTION public.t_raw(p_company uuid, p_date date, p_over jsonb DEFAULT '{}')
+RETURNS uuid LANGUAGE plpgsql AS $$
+DECLARE r ledger.journal; v_fy ledger.fiscal_year;
+BEGIN
+  SELECT * INTO v_fy FROM ledger.fiscal_year f WHERE f.company_id = p_company AND p_date BETWEEN f.start_date AND f.end_date;
+  r.tenant_id := core.current_tenant_id(); r.id := uuidv7(); r.company_id := p_company; r.fiscal_year_id := v_fy.id;
+  r.journal_date := p_date; r.journal_type := 'manual'; r.status := 'temporary';
+  r.reference_no := public.t_ref(p_company, p_date); r.reference_text := 'R-' || r.reference_no;
+  r.description := 'raw'; r.source_module := 'ledger'; r.source_event := 'post'; r.base_currency := COALESCE(v_fy.base_currency, 'IRR');
+  r.line_count := 2; r.total_debit_base := 1; r.total_credit_base := 1; r.memo_debit_base := 0; r.memo_credit_base := 0;
+  r.soft_close_override := false; r.posted_at := now(); r.updated_at := now(); r.row_version := 1;
+  r := jsonb_populate_record(r, p_over);
+  INSERT INTO ledger.journal SELECT r.*;
+  INSERT INTO ledger.journal_line (tenant_id, journal_id, line_no, account_id, currency, exchange_rate, debit_txn, credit_txn, debit_base, credit_base)
+  VALUES (r.tenant_id, r.id, 1, public.t_acc(p_company, '5101'), 'IRR', 1, 1, 0, 1, 0),
+         (r.tenant_id, r.id, 2, public.t_acc(p_company, '5201'), 'IRR', 1, 0, 1, 0, 1);
+  RETURN r.id;
+END $$;
+
+-- کاتالوگ‌های معیوب برای آزمون مسیرهای خطای اعمال قالب و ارزیابی صورت (T20)
+INSERT INTO ledger.coa_template (code, version, industry_pack, extends_code, extends_version, name_fa, code_mode, levels, source, confidence) VALUES
+  ('test.ext', 1, 'test', 'ir.general', 1, 'آزمون extends', 'hierarchical', '[{"level":1,"name_fa":"گروه","segment_length":1}]', 'test', 'low'),
+  ('test.badparent', 1, 'test', NULL, NULL, 'آزمون والد', 'free',
+   '[{"level":1,"name_fa":"گروه","segment_length":1},{"level":2,"name_fa":"کل","segment_length":1}]', 'test', 'low'),
+  ('test.baddim', 1, 'test', NULL, NULL, 'آزمون بُعد', 'free', '[{"level":1,"name_fa":"گروه","segment_length":1}]', 'test', 'low');
+INSERT INTO ledger.coa_template_account (template_code, template_version, code, parent_code, level, name_fa, kind, account_type, dimension_rules) VALUES
+  ('test.badparent', 1, '91', '9', 2, 'بی‌والد', 'posting', 'asset', '{}'),
+  ('test.baddim', 1, '1', NULL, 1, 'حساب', 'posting', 'asset', '{"no_such_type":"optional"}');
+INSERT INTO ledger.report_template (code, version, kind, name_fa) VALUES ('test.badformula', 1, 'custom', 'آزمون فرمول');
+INSERT INTO ledger.report_template_row (template_code, template_version, row_code, sort_order, label_fa, row_type, formula)
+VALUES ('test.badformula', 1, 'TOTAL', 1, 'جمع', 'formula', 'AAA + BBB');
 COMMIT;
 
 -- =====================================================================
@@ -897,6 +935,218 @@ BEGIN
   PERFORM assert_true(NOT EXISTS (SELECT 1 FROM ledger.account WHERE company_id = CB), 'T17 A cannot see B accounts');
 END $$;
 
+-- ---------- T20: شکاف‌های آزمون جهش (هر بررسی تریگر/تابع با خطای دقیق خودش) ----------
+-- هر expect_error الگوی کد و پیام دقیق را می‌خواهد تا لایهٔ دفاعی دیگری که همان نقض را می‌گیرد آزمون را «سبز» نکند.
+-- CA3: کدینگ ir.general، سال ۱۴۰۵ (و ۱۴۰۶)؛ CA4: بدون حساب و سال.
+DO $$
+DECLARE CA3 uuid := '0a000000-0000-7000-8000-0000000000c3';
+BEGIN
+  PERFORM t_ctx('A');
+  PERFORM ledger.apply_coa_template(CA3, 'ir.general', 1);
+  PERFORM t_make_year(CA3, '1405', '2026-03-21', NULL);
+  PERFORM t_post(CA3, '2026-04-01', '[{"a":"5101","dr":10},{"a":"5201","cr":10}]');
+END $$;
+
+DO $$
+DECLARE CA3 uuid := '0a000000-0000-7000-8000-0000000000c3'; fy uuid; j1 uuid; j2 uuid; j3 uuid; j4 uuid;
+        x ledger.journal; fyr ledger.fiscal_year; h bytea;
+BEGIN
+  PERFORM t_ctx('A');
+  fy := t_fy(CA3, '1405');
+  SELECT id INTO j1 FROM ledger.journal WHERE company_id = CA3 AND journal_date = '2026-04-01';
+  -- کدینگ
+  PERFORM expect_error(format($q$UPDATE ledger.account SET level = 2 WHERE company_id = %L AND code = '1'$q$, CA3),
+     '^HK_LEDGER_ACCOUNT_IMMUTABLE', 'T20 account level is immutable');
+  PERFORM expect_error(format($q$UPDATE ledger.account SET account_type = 'expense' WHERE company_id = %L AND code = '5101'$q$, CA3),
+     '^HK_LEDGER_ACCOUNT_TYPE_LOCKED', 'T20 account type locked after postings');
+  PERFORM expect_error(format($q$UPDATE ledger.account SET kind = 'group' WHERE company_id = %L AND code = '5101'$q$, CA3),
+     '^HK_LEDGER_ACCOUNT_HAS_POSTINGS', 'T20 account with postings cannot become a group');
+  PERFORM expect_error(format($q$UPDATE ledger.account SET kind = 'posting' WHERE company_id = %L AND code = '51'$q$, CA3),
+     '^HK_LEDGER_ACCOUNT_HAS_CHILDREN', 'T20 group with children cannot become a posting account');
+  -- سال با افتتاحیهٔ معلق
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET finalized_through = '2026-03-21' WHERE id = %L$q$, fy),
+     '^HK_LEDGER_OPENING_PENDING', 'T20 cut-off cannot move while the opening is pending');
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent', permanent_no = 1, daily_no = 1, finalized_at = now(),
+     chain_prev_hash = '\x00', chain_hash = '\x00' WHERE id = %L$q$, j1),
+     '^HK_LEDGER_OPENING_PENDING', 'T20 a journal cannot become permanent while the opening is pending');
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET opening_state = 'posted' WHERE id = %L$q$, fy),
+     '^HK_LEDGER_FY_NO_OPENING', 'T20 opening posted requires an opening journal');
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET status = 'locked' WHERE id = %L$q$, fy),
+     '^HK_LEDGER_FY_TRANSITION', 'T20 open -> locked is not a year transition');
+  UPDATE ledger.fiscal_year SET opening_state = 'not_required' WHERE id = fy;
+  -- گذار مستقیم به دائم
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent' WHERE id = %L$q$, j1),
+     '^HK_LEDGER_BAD_TRANSITION', 'T20 permanent needs number and finalization time');
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent', permanent_no = 1, daily_no = 1, finalized_at = now(),
+     chain_prev_hash = '\x00', chain_hash = '\x00' WHERE id = %L$q$, j1),
+     '^HK_LEDGER_CHAIN_LINK', 'T20 first permanent journal links to genesis');
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent', permanent_no = 1, daily_no = 2, finalized_at = now(),
+     chain_prev_hash = ledger.chain_genesis(%L, %L), chain_hash = '\x00' WHERE id = %L$q$, CA3, fy, j1),
+     '^HK_LEDGER_CHAIN_LINK', 'T20 first permanent journal has daily number 1');
+  PERFORM assert_true(ledger.finalize_through(fy, '2026-04-01') = 1, 'T20 finalize first journal');
+  PERFORM expect_error(format($q$SELECT ledger.finalize_through(%L, '2030-01-01')$q$, fy),
+     '^HK_LEDGER_FINALIZE_RANGE', 'T20 cut-off must lie inside the year');
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET reviewed_at = now(), reviewed_by = core.current_user_id() WHERE id = %L$q$, j1),
+     '^HK_IMMUTABLE: a permanent journal cannot change', 'T20 a permanent journal cannot even be marked reviewed');
+  PERFORM expect_error(format($q$INSERT INTO ledger.journal_line (tenant_id, journal_id, line_no, account_id, currency, exchange_rate, debit_txn, debit_base)
+     VALUES (core.current_tenant_id(), %L, 1, %L, 'IRR', 1, 1, 1)$q$, j1, t_acc(CA3, '5101')),
+     '^HK_IMMUTABLE: lines cannot be added', 'T20 no lines on a permanent journal');
+  -- شمارهٔ روزانه و وضعیت ناشناخته
+  j2 := t_post(CA3, '2026-04-02', '[{"a":"5101","dr":2},{"a":"5201","cr":2}]');
+  SELECT * INTO fyr FROM ledger.fiscal_year WHERE id = fy;
+  SELECT * INTO x FROM ledger.journal WHERE id = j2;
+  x.permanent_no := 2;
+  h := sha256(fyr.chain_head_hash || convert_to(ledger.journal_canonical(x), 'UTF8'));
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent', permanent_no = 2, daily_no = 2, finalized_at = now(),
+     chain_prev_hash = %L, chain_hash = %L WHERE id = %L$q$, fyr.chain_head_hash, h, j2),
+     '^HK_LEDGER_DAILY_NO', 'T20 daily number restarts on a new date');
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'archived' WHERE id = %L$q$, j2),
+     '^HK_LEDGER_BAD_TRANSITION: journal transition', 'T20 unknown journal status rejected by the state machine');
+  -- عملیات روی سند ناموجود یا تاریخ بیرون از سال
+  PERFORM expect_error($q$SELECT ledger.void_journal(uuidv7(), uuidv7(), 9001, 'V-x', 'reason')$q$,
+     '^HK_LEDGER_JOURNAL_NOT_FOUND', 'T20 void of a missing journal');
+  PERFORM expect_error($q$SELECT ledger.reverse_journal(uuidv7(), uuidv7(), '2026-05-01', 9002, 'R-x')$q$,
+     '^HK_LEDGER_JOURNAL_NOT_FOUND', 'T20 reversal of a missing journal');
+  PERFORM expect_error(format($q$SELECT ledger.reverse_journal(%L, uuidv7(), '2031-01-01', 9003, 'R-y')$q$, j2),
+     '^HK_LEDGER_NO_FISCAL_YEAR: no fiscal year contains', 'T20 reversal date must be inside a fiscal year');
+  -- ابطال
+  j3 := t_post(CA3, '2026-05-01', '[{"a":"5101","dr":3},{"a":"5201","cr":3}]');
+  PERFORM expect_error(format($q$SELECT ledger.void_journal(%L, uuidv7(), t_ref(%L, '2026-05-01'), 'V-3', 'ab')$q$, j3, CA3),
+     '^HK_LEDGER_REASON_REQUIRED', 'T20 void reason has at least three characters');
+  PERFORM ledger.void_journal(j3, uuidv7(), t_ref(CA3, '2026-05-01'), 'V-3', 'آزمون ابطال');
+  PERFORM expect_error(format($q$UPDATE ledger.journal SET void_reason = 'دلیل دیگر' WHERE id = %L$q$, j3),
+     '^HK_IMMUTABLE: a voided journal cannot change', 'T20 a voided journal is final');
+  -- بررسی‌های درج سرسند، هرکدام جدا
+  j4 := t_post(CA3, '2026-05-01', '[{"a":"5101","dr":4},{"a":"5201","cr":4}]');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-01', '{"journal_type":"no_such_type"}')$q$, CA3),
+     '^HK_LEDGER_JOURNAL_TYPE', 'T20 unknown journal type');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-01', '{"permanent_no":1}')$q$, CA3),
+     '^HK_LEDGER_JOURNAL_INSERT: permanent/review fields', 'T20 permanent fields cannot be set on insert');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-01', '{"status":"voided","void_reason":"xyz"}')$q$, CA3),
+     '^HK_LEDGER_JOURNAL_INSERT: a journal is inserted as temporary', 'T20 a regular journal is inserted as temporary');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-01', jsonb_build_object('period_id', (SELECT id FROM ledger.fiscal_period WHERE fiscal_year_id = %L AND period_no = 1)))$q$, CA3, fy),
+     '^HK_LEDGER_NO_PERIOD', 'T20 explicit period must contain the journal date');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-01', '{"base_currency":"USD"}')$q$, CA3),
+     '^HK_LEDGER_BASE_CURRENCY', 'T20 journal base currency equals the year base currency');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-01', '{"journal_type":"fx_revaluation","source_module":"sales"}')$q$, CA3),
+     '^HK_LEDGER_SOURCE_MODULE: system journal types', 'T20 system journal types belong to the ledger');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-02', jsonb_build_object('journal_type','void','status','voided','void_of_journal_id',%L::uuid,'void_reason','xyz'))$q$, CA3, j4),
+     '^HK_LEDGER_VOID_PAIR: a void journal mirrors its original', 'T20 void journal has the date of its original');
+  PERFORM expect_error(format($q$SELECT t_raw(%L, '2026-05-03', jsonb_build_object('journal_type','fx_revaluation_reversal','reversal_of_journal_id',%L::uuid))$q$, CA3, j4),
+     '^HK_LEDGER_REVERSAL_TYPE', 'T20 fx_revaluation_reversal only reverses an fx revaluation');
+  -- وضعیت افتتاحیه
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET opening_state = 'posted' WHERE id = %L$q$, fy),
+     '^HK_LEDGER_FY_OPENING_STATE: invalid opening_state transition', 'T20 not_required -> posted is not allowed');
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET opening_state = 'pending' WHERE id = %L$q$, fy),
+     '^HK_LEDGER_FY_OPENING_STATE: opening can be reset only', 'T20 opening cannot be reset after finalization');
+  -- گزارش و توابع کمکی
+  PERFORM expect_error(format($q$SELECT * FROM ledger.trial_balance(%L, '2026-05-01', '2026-04-01')$q$, CA3),
+     '^HK_LEDGER_REPORT_RANGE', 'T20 report range must be ordered and inside one year');
+  PERFORM expect_error(format($q$SELECT * FROM ledger.check_control_accounts(%L, '2035-01-01')$q$, CA3),
+     '^HK_LEDGER_NO_FISCAL_YEAR', 'T20 control check date must be inside a year');
+  PERFORM expect_error(format($q$SELECT * FROM ledger.evaluate_statement(%L, 'test.badformula', 1, '2026-03-21', '2026-04-30')$q$, CA3),
+     '^HK_LEDGER_TEMPLATE_FORMULA', 'T20 formula may reference only earlier rows');
+  PERFORM expect_error($q$SELECT ledger.round_amount(1.5, 0::smallint, 'bogus')$q$,
+     '^HK_LEDGER_ROUNDING_MODE', 'T20 unknown rounding mode');
+  -- دورهٔ تماماً قطعی‌شده بازگشایی نمی‌شود
+  PERFORM ledger.finalize_through(fy, '2026-04-20');
+  UPDATE ledger.fiscal_period SET status = 'closed' WHERE fiscal_year_id = fy AND period_no = 1;
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_period SET status = 'open', status_reason = 'بازگشایی آزمون' WHERE fiscal_year_id = %L AND period_no = 1$q$, fy),
+     '^HK_LEDGER_PERIOD_FINALIZED', 'T20 a fully finalized period cannot be reopened');
+END $$;
+
+DO $$
+DECLARE CA3 uuid := '0a000000-0000-7000-8000-0000000000c3'; CA4 uuid := '0a000000-0000-7000-8000-0000000000c4';
+        fy uuid; fy4 uuid; cpl uuid; i integer;
+BEGIN
+  PERFORM t_ctx('A');
+  fy := t_fy(CA3, '1405');
+  fy4 := t_make_year(CA3, '1406', '2027-03-21', fy);
+  PERFORM expect_error(format($q$INSERT INTO ledger.fiscal_year (tenant_id, company_id, code, name, start_date, end_date, base_currency, previous_year_id, opening_state)
+     SELECT core.current_tenant_id(), %L, '1407', 'x', f.end_date + 1, f.end_date + 365, 'IRR', f.id, 'not_required'
+       FROM ledger.fiscal_year f WHERE f.id = %L$q$, CA3, fy4),
+     '^HK_LEDGER_FY_INSERT: opening of a non-first year', 'T20 a non-first year starts with a pending opening');
+  PERFORM expect_error(format($q$INSERT INTO ledger.fiscal_year (tenant_id, company_id, code, name, start_date, end_date, base_currency, status)
+     VALUES (core.current_tenant_id(), %L, '1405', 'x', '2026-03-21', '2027-03-20', 'IRR', 'closed')$q$, CA4),
+     '^HK_LEDGER_FY_INSERT: a new fiscal year starts open', 'T20 a new year starts open');
+  PERFORM expect_error(format($q$INSERT INTO ledger.fiscal_period (tenant_id, company_id, fiscal_year_id, period_no, name, start_date, end_date, status)
+     VALUES (core.current_tenant_id(), %L, %L, 13, 'x', '2027-03-21', '2027-03-25', 'closed')$q$, CA3, fy4),
+     '^HK_LEDGER_PERIOD_INSERT', 'T20 a new period starts open');
+  PERFORM expect_error(format($q$SELECT t_post(%L, '2027-03-21', '[{"a":"5101","dr":1},{"a":"5201","cr":1}]', 'opening')$q$, CA3),
+     '^HK_LEDGER_OPENING_STATE: a year-close opening journal requires', 'T20 year-close opening needs the previous year closing');
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET opening_state = 'not_required' WHERE id = %L$q$, fy4),
+     '^HK_LEDGER_FY_OPENING_STATE: only the first fiscal year', 'T20 only the first year may skip the opening');
+  -- بستن سال ۱۴۰۵ شرکت CA3 و بازگشایی‌های نامعتبر
+  FOR i IN 2..12 LOOP
+    UPDATE ledger.fiscal_period SET status = 'closed' WHERE fiscal_year_id = fy AND period_no = i;
+  END LOOP;
+  UPDATE ledger.fiscal_year SET status = 'closing' WHERE id = fy;
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_period SET status = 'open', status_reason = 'بازگشایی آزمون' WHERE fiscal_year_id = %L AND period_no = 12$q$, fy),
+     '^HK_LEDGER_PERIOD_TRANSITION: cannot reopen', 'T20 a period of a closing year cannot be reopened');
+  cpl := t_post(CA3, '2027-03-20', '[{"a":"5101","dr":3},{"a":"5201","cr":3}]', 'closing_pl');
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET status = 'open' WHERE id = %L$q$, fy),
+     '^HK_LEDGER_FY_CLOSING_JOURNALS: void closing journals', 'T20 reopen requires voided closing journals');
+  PERFORM t_post(CA3, '2027-03-21', '[{"a":"5101","dr":3},{"a":"5201","cr":3}]', 'opening');
+  PERFORM ledger.void_journal(cpl, uuidv7(), t_ref(CA3, '2027-03-20'), 'V-CPL', 'آزمون بازگشایی سال');
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET status = 'open' WHERE id = %L$q$, fy),
+     '^HK_LEDGER_FY_CLOSING_JOURNALS: void the opening journal', 'T20 reopen requires voiding the next opening');
+END $$;
+
+DO $$
+DECLARE CA2 uuid := '0a000000-0000-7000-8000-0000000000c2'; CA4 uuid := '0a000000-0000-7000-8000-0000000000c4';
+        m1 uuid; m2 uuid; m3 uuid; t_proj uuid; d uuid;
+BEGIN
+  PERFORM t_ctx('A');
+  -- سال قفل‌شدهٔ CA2 (پس از T15): دوره قفل‌گشایی نمی‌شود
+  PERFORM expect_error(format($q$UPDATE ledger.fiscal_period SET status = 'closed', status_approval_ref = uuidv7(), status_reason = 'قفل‌گشایی آزمون'
+     WHERE fiscal_year_id = %L AND period_no = 1$q$, t_fy(CA2, '1405')),
+     '^HK_LEDGER_PERIOD_TRANSITION: periods of a locked', 'T20 periods of a locked year cannot be unlocked');
+  -- اعمال قالب
+  PERFORM expect_error(format($q$SELECT ledger.apply_coa_template(%L, 'ir.general', 1)$q$, '0a000000-0000-7000-8000-0000000000c3'),
+     '^HK_LEDGER_COA_NOT_EMPTY', 'T20 template applies only to an empty chart');
+  PERFORM expect_error(format($q$SELECT ledger.apply_coa_template(%L, 'no.such', 1)$q$, CA4),
+     '^HK_LEDGER_TEMPLATE_NOT_FOUND', 'T20 unknown template');
+  PERFORM expect_error(format($q$SELECT ledger.apply_coa_template(%L, 'test.ext', 1)$q$, CA4),
+     '^HK_LEDGER_TEMPLATE_EXTENDS', 'T20 only flattened templates are applied');
+  PERFORM expect_error(format($q$SELECT ledger.apply_coa_template(%L, 'test.badparent', 1)$q$, CA4),
+     '^HK_LEDGER_TEMPLATE_PARENT', 'T20 template account parent must exist');
+  PERFORM expect_error(format($q$SELECT ledger.apply_coa_template(%L, 'test.baddim', 1)$q$, CA4),
+     '^HK_LEDGER_DIM_TYPE_MISSING', 'T20 template dimension type must be provisioned');
+  -- ابعاد
+  SELECT id INTO t_proj FROM ledger.dimension_type WHERE code = 'project';
+  PERFORM expect_error(format($q$UPDATE ledger.dimension_value SET dimension_type_id = %L WHERE code = 'CC1'$q$, t_proj),
+     '^HK_LEDGER_DIM_IMMUTABLE', 'T20 dimension type of a value is immutable');
+  PERFORM expect_error($q$INSERT INTO ledger.dimension_value (tenant_id, dimension_type_id, code, name, parent_id)
+     SELECT core.current_tenant_id(), t.id, 'CC9', 'زیر برگ', t_dim('cost_center', 'CC1') FROM ledger.dimension_type t WHERE t.code = 'cost_center'$q$,
+     '^HK_LEDGER_DIM_PARENT', 'T20 parent value must be a group of the same type');
+  INSERT INTO ledger.dimension_value (tenant_id, dimension_type_id, code, name)
+  SELECT core.current_tenant_id(), t_proj, v.c, v.c FROM (VALUES ('M1'), ('M2'), ('M3')) v(c);
+  m1 := t_dim('project', 'M1'); m2 := t_dim('project', 'M2'); m3 := t_dim('project', 'M3');
+  UPDATE ledger.dimension_value SET merged_into_id = m2, is_active = false WHERE id = m1;
+  PERFORM expect_error(format($q$UPDATE ledger.dimension_value SET merged_into_id = %L WHERE id = %L$q$, m3, m1),
+     '^HK_LEDGER_DIM_MERGE: a merge can only be re-pointed', 'T20 a merge is re-pointed only along its chain');
+  -- توابع definer و provision بدون زمینهٔ مستأجر
+  PERFORM t_ctx('');
+  PERFORM expect_error($q$SELECT ledger.provision_tenant()$q$, '^HK_LEDGER_TENANT_CONTEXT', 'T20 provision requires a tenant context');
+  PERFORM expect_error(format($q$SELECT ledger.compact_balance_buckets(%L, uuidv7())$q$, CA2),
+     '^HK_LEDGER_TENANT_CONTEXT', 'T20 compaction requires a tenant context');
+  PERFORM expect_error(format($q$SELECT ledger.rebuild_balance_buckets(%L, uuidv7())$q$, CA2),
+     '^HK_LEDGER_TENANT_CONTEXT', 'T20 rebuild requires a tenant context');
+  PERFORM t_ctx('A');
+  -- منشأ پیش‌نویس (INV-LED-45)
+  INSERT INTO ledger.journal_draft (tenant_id, company_id, journal_date, created_via)
+  VALUES (core.current_tenant_id(), CA2, '2026-05-01', 'assistant') RETURNING id INTO d;
+  PERFORM assert_true((SELECT created_via FROM ledger.journal_draft WHERE id = d) = 'assistant', 'T20 draft provenance recorded');
+  PERFORM assert_true((SELECT created_via FROM ledger.journal_draft WHERE id <> d LIMIT 1) IS DISTINCT FROM 'assistant', 'T20 draft provenance defaults to user');
+  PERFORM expect_error(format($q$INSERT INTO ledger.journal_draft (tenant_id, company_id, journal_date, created_via)
+     VALUES (core.current_tenant_id(), %L, '2026-05-01', 'recurring')$q$, CA2),
+     'journal_draft_check', 'T20 draft provenance recurring requires a recurring template');
+  PERFORM expect_error(format($q$INSERT INTO ledger.journal_draft (tenant_id, company_id, journal_date, created_via)
+     VALUES (core.current_tenant_id(), %L, '2026-05-01', 'robot')$q$, CA2),
+     'created_via_check', 'T20 draft provenance is one of the allowed origins');
+  DELETE FROM ledger.journal_draft WHERE id = d;
+END $$;
+
 -- ---------- T18: hk_readonly ----------
 RESET ROLE;
 SET ROLE hk_readonly;
@@ -928,6 +1178,13 @@ BEGIN
   PERFORM expect_error(format($q$UPDATE ledger.journal SET journal_date = journal_date + 1 WHERE company_id = %L AND status = 'temporary'$q$, CA),
      'HK_IMMUTABLE', 'T19 owner cannot move a temporary journal date');
   PERFORM expect_error(format($q$DELETE FROM ledger.journal WHERE company_id = %L$q$, CA), 'HK_IMMUTABLE', 'T19 owner delete blocked');
+END $$;
+-- تریگر سطل (SECURITY DEFINER) سطر بیرون از زمینهٔ مستأجر را صریحاً رد می‌کند (مالک جدول RLS را دور می‌زند؛ تریگر نه)
+DO $$
+BEGIN
+  PERFORM t_ctx('A');
+  PERFORM expect_error($q$SELECT t_raw('0b000000-0000-7000-8000-0000000000c1', '2026-06-01', '{"tenant_id":"0b000000-0000-7000-8000-000000000001"}')$q$,
+     '^HK_LEDGER_TENANT_CONTEXT: lines outside', 'T19 bucket trigger rejects lines outside the tenant context');
 END $$;
 ALTER TABLE ledger.journal_line DISABLE TRIGGER USER;
 UPDATE ledger.journal_line l SET debit_base = debit_base + 1, debit_txn = debit_txn + 1

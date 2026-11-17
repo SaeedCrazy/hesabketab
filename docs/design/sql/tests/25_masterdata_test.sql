@@ -8,15 +8,15 @@
 --   psql -h localhost -p 5433 -U postgres -d ds_masterdata -v ON_ERROR_STOP=1 -f docs/design/sql/00_foundation.sql
 --   psql -h localhost -p 5433 -U postgres -d ds_masterdata -v ON_ERROR_STOP=1 -f docs/design/sql/25_masterdata.sql
 --   psql -h localhost -p 5433 -U postgres -d ds_masterdata -v ON_ERROR_STOP=1 -f docs/design/sql/tests/25_masterdata_test.sql
--- (در پایگاه یکپارچه، 10_core.sql بین 00 و 25 هم اجرا می‌شود؛ این آزمون در هر دو حالت سبز است.)
+-- (در پایگاه یکپارچه، 10_core.sql و 20_ledger.sql بین 00 و 25 اجرا می‌شوند و سپس FKهای سند §۱۲؛ این آزمون در هر دو حالت سبز است.)
 --
 -- ساختار (یک نشست psql که با superuser وصل می‌شود):
 --   بخش ۱ (fixture)  — با نقش postgres: مستأجر A و B، دو شرکت A، شعبه، استان/شهر آزمایشی در ref،
 --                      توابع کمکی md_expect_error / md_assert.
---   بخش ۲ (assert)   — پس از «SET ROLE hk_app» (نه مالک، NOBYPASSRLS). هر DO block مستأجر را با
+--   بخش ۲ (assert)   — T01..T18 پس از «SET ROLE hk_app» (نه مالک، NOBYPASSRLS). هر DO block مستأجر را با
 --                      set_config('app.tenant_id', '<uuid>', true) تنظیم می‌کند. موارد deferred با
 --                      SET CONSTRAINTS ALL IMMEDIATE درون زیرتراکنش آزموده می‌شوند.
---   بخش ۳ (readonly) — «SET ROLE hk_readonly»: فقط خواندن.
+--   بخش ۳ (readonly) — T19: «SET ROLE hk_readonly»: فقط خواندن.
 -- خروجی موفق با «ALL 25_masterdata TESTS PASSED» پایان می‌یابد؛ هر شکست «TEST FAILED [...]» می‌دهد
 -- و psql با کد ≠ ۰ خارج می‌شود. مسیر بردارها: -v id_vectors_file=... و -v fa_vectors_file=...
 -- =====================================================================
@@ -248,6 +248,10 @@ BEGIN
   PERFORM public.md_expect_error('INV-PTY-05 legal with first name',
     $q$INSERT INTO parties.party (tenant_id, code, person_type, name, first_name)
        VALUES ('25a00000-0000-7000-8000-000000000001','X13','legal','x','علی')$q$, '23514');
+  PERFORM public.md_expect_error('INV-PTY-05 birth certificate on foreign natural',
+    $q$INSERT INTO parties.party (tenant_id, code, person_type, name, birth_cert_issue_place) VALUES ('25a00000-0000-7000-8000-000000000001','X17','foreign_natural','x','تهران')$q$, '23514');
+  PERFORM public.md_expect_error('INV-PTY-05 birth certificate issued before birth',
+    $q$INSERT INTO parties.party (tenant_id, code, person_type, name, birth_date, birth_cert_issue_date) VALUES ('25a00000-0000-7000-8000-000000000001','X18','natural','x','1990-01-01','1989-12-31')$q$, '23514');
   PERFORM public.md_expect_error('INV-PTY-05 anonymous with id',
     $q$INSERT INTO parties.party (tenant_id, code, person_type, name, is_anonymous, national_id, national_id_status)
        VALUES ('25a00000-0000-7000-8000-000000000001','X14','natural','x',true,'0499370899','valid')$q$, '23514');
@@ -571,7 +575,7 @@ BEGIN
     (t, '25a00000-0000-7000-8000-00000000c136', '25a00000-0000-7000-8000-00000000c108', 'TSHIRT', true, NULL);
 END $$;
 
--- ---------- T12 (INV-CAT-01..05, 18..20): یکپارچگی کالا ----------
+-- ---------- T12 (INV-CAT-01..05, 07, 18..21): یکپارچگی کالا ----------
 DO $$
 DECLARE t uuid := '25a00000-0000-7000-8000-000000000001';
 BEGIN
@@ -925,6 +929,71 @@ BEGIN
   DELETE FROM catalog.bom WHERE id = '25a00000-0000-7000-8000-00000000c404';     -- پیش‌نویس حذف‌شدنی است
 END $$;
 
+-- ---------- T18 (INV-PTY-23..24, INV-CAT-22..23): سری کد، ویژگی‌های نگاشت حساب، ارث‌بری دسته ----------
+-- (پیش از T17 اجرا می‌شود تا شمارش جداسازی مستأجر جدول‌های سری را هم پوشش دهد)
+DO $$
+DECLARE t uuid := '25a00000-0000-7000-8000-000000000001'; c text; a jsonb;
+BEGIN
+  PERFORM set_config('app.tenant_id', t::text, true);
+  -- INV-PTY-23: سری کد اشخاص
+  c := parties.next_party_code();
+  PERFORM public.md_assert(c = '00001', 'INV-PTY-23 default series created on demand');
+  INSERT INTO parties.party (tenant_id, code, person_type, name) VALUES (t, '00002', 'natural', 'کد دستی');
+  PERFORM public.md_assert(parties.next_party_code() = '00003', 'INV-PTY-23 allocator skips manually used code');
+  INSERT INTO parties.code_series (tenant_id, role, prefix, pad_width) VALUES (t, 'customer', 'C', 4);
+  INSERT INTO parties.code_series (tenant_id, role, group_id, prefix, pad_width, next_value) VALUES
+    (t, 'customer', '25a00000-0000-7000-8000-00000000a003', 'W', 3, 998);
+  PERFORM public.md_assert(parties.next_party_code('customer') = 'C0001', 'INV-PTY-23 role series');
+  PERFORM public.md_assert(parties.next_party_code('customer', '25a00000-0000-7000-8000-00000000a003') = 'W998', 'INV-PTY-23 group series beats role series');
+  PERFORM public.md_assert(parties.next_party_code('customer', '25a00000-0000-7000-8000-00000000a003') = 'W999', 'INV-PTY-23 sequential');
+  PERFORM public.md_assert(parties.next_party_code('customer', '25a00000-0000-7000-8000-00000000a003') = 'W1000', 'INV-PTY-23 no truncation past pad width');
+  PERFORM public.md_assert(parties.next_party_code('supplier') = '00004', 'INV-PTY-23 fallback to default series');
+  PERFORM public.md_expect_error('INV-PTY-23 group series with other role',
+    $q$INSERT INTO parties.code_series (tenant_id, role, group_id, prefix) VALUES ('25a00000-0000-7000-8000-000000000001','supplier','25a00000-0000-7000-8000-00000000a003','S')$q$, '23503');
+  PERFORM public.md_expect_error('INV-PTY-23 group series without role',
+    $q$INSERT INTO parties.code_series (tenant_id, group_id, prefix) VALUES ('25a00000-0000-7000-8000-000000000001','25a00000-0000-7000-8000-00000000a003','S')$q$, '23514');
+  PERFORM public.md_expect_error('INV-PTY-23 second default series',
+    $q$INSERT INTO parties.code_series (tenant_id, prefix) VALUES ('25a00000-0000-7000-8000-000000000001','D')$q$, '23505');
+
+  -- INV-PTY-24: ویژگی‌های نگاشت حساب شخص
+  a := parties.posting_attributes('25a00000-0000-7000-8000-00000000a101', 'customer', '25a00000-0000-7000-8000-0000000000c1');
+  PERFORM public.md_assert(a = '{"customer_group":"WHOLESALE","party_person_type":"natural"}'::jsonb, 'INV-PTY-24 company-specific group');
+  a := parties.posting_attributes('25a00000-0000-7000-8000-00000000a101', 'customer', '25a00000-0000-7000-8000-0000000000c2');
+  PERFORM public.md_assert(a ->> 'customer_group' = 'RETAIL', 'INV-PTY-24 default role row group');
+  a := parties.posting_attributes('25a00000-0000-7000-8000-00000000a103', 'customer', NULL);
+  PERFORM public.md_assert(a ->> 'customer_group' = 'RETAIL', 'INV-PTY-24 default group of the role when no role row');
+  a := parties.posting_attributes('25a00000-0000-7000-8000-00000000a102', 'employee', NULL);
+  PERFORM public.md_assert(a = '{"party_person_type":"legal"}'::jsonb, 'INV-PTY-24 no group -> key omitted');
+  a := parties.posting_attributes('25a00000-0000-7000-8000-00000000a111', 'customer', NULL);
+  PERFORM public.md_assert(a ->> 'customer_group' = 'RETAIL' AND a ->> 'party_person_type' = 'natural', 'INV-PTY-24 merged party resolves to successor');
+  PERFORM public.md_expect_error('INV-PTY-24 invalid role',
+    $q$SELECT parties.posting_attributes('25a00000-0000-7000-8000-00000000a101','vip',NULL)$q$, 'HK_PARTY_ROLE_INVALID');
+  PERFORM public.md_assert((SELECT canonical_party_id = '25a00000-0000-7000-8000-00000000a113' AND code = 'P111'
+                              FROM parties.v_party_ledger_identity WHERE party_id = '25a00000-0000-7000-8000-00000000a111'),
+                           'INV-PTY-24 ledger identity view');
+
+  -- INV-CAT-22: ارث‌بری گروه ثبت از نزدیک‌ترین نیا و ویژگی‌های نگاشت کالا
+  PERFORM public.md_assert((SELECT posting_group_id FROM catalog.v_sku WHERE variant_id = '25a00000-0000-7000-8000-00000000c121')
+                           = '25a00000-0000-7000-8000-00000000c041', 'INV-CAT-22 posting group inherited from ancestor category');
+  PERFORM public.md_assert((SELECT path_codes = 'ROOT/SHOES' AND depth = 2 FROM catalog.v_category_effective
+                             WHERE category_id = '25a00000-0000-7000-8000-00000000c052'), 'INV-CAT-22 category path');
+  PERFORM public.md_assert(catalog.posting_attributes('25a00000-0000-7000-8000-00000000c121')
+                           = '{"item_posting_group":"GOODS","item_type":"stock","item_category":"SHOES"}'::jsonb, 'INV-CAT-22 item posting attributes');
+
+  -- INV-CAT-23: سری کد کالا
+  PERFORM public.md_assert(catalog.next_item_code() = '00001', 'INV-CAT-23 default series created on demand');
+  INSERT INTO catalog.code_series (tenant_id, category_id, prefix, pad_width) VALUES
+    (t, '25a00000-0000-7000-8000-00000000c052', 'SH', 3),
+    (t, '25a00000-0000-7000-8000-00000000c051', 'CABLE-', 1);
+  PERFORM public.md_assert(catalog.next_item_code('25a00000-0000-7000-8000-00000000c052') = 'SH001', 'INV-CAT-23 own category series');
+  PERFORM public.md_assert(catalog.next_item_code('25a00000-0000-7000-8000-00000000c053') = 'CABLE-2', 'INV-CAT-23 nearest ancestor series; skips used item/SKU code');
+  PERFORM public.md_assert(catalog.next_item_code('25a00000-0000-7000-8000-00000000c052') = 'SH002', 'INV-CAT-23 own series beats ancestor');
+  PERFORM public.md_expect_error('INV-CAT-23 unknown category',
+    $q$SELECT catalog.next_item_code('25b00000-0000-7000-8000-0000000000c1')$q$, 'HK_CATALOG_CATEGORY_NOT_FOUND');
+  PERFORM public.md_expect_error('INV-CAT-23 second series for one category',
+    $q$INSERT INTO catalog.code_series (tenant_id, category_id, prefix) VALUES ('25a00000-0000-7000-8000-000000000001','25a00000-0000-7000-8000-00000000c052','X')$q$, '23505');
+END $$;
+
 -- ---------- T17 (INV-MD-01..03): جداسازی مستأجر ----------
 DO $$
 DECLARE n int;
@@ -936,10 +1005,12 @@ BEGIN
     UNION ALL SELECT id FROM parties.party_merge UNION ALL SELECT id FROM parties.party_hold UNION ALL SELECT id FROM parties.payment_term
     UNION ALL SELECT id FROM catalog.item UNION ALL SELECT id FROM catalog.item_variant UNION ALL SELECT id FROM catalog.barcode
     UNION ALL SELECT id FROM catalog.price_list UNION ALL SELECT id FROM catalog.price_list_item UNION ALL SELECT id FROM catalog.bom
-    UNION ALL SELECT id FROM catalog.uom UNION ALL SELECT id FROM catalog.scale_barcode_pattern) x;
+    UNION ALL SELECT id FROM catalog.uom UNION ALL SELECT id FROM catalog.scale_barcode_pattern
+    UNION ALL SELECT id FROM parties.code_series UNION ALL SELECT id FROM catalog.code_series) x;
   PERFORM public.md_assert(n = 0, 'INV-MD-01 tenant B sees nothing of tenant A');
   PERFORM public.md_assert((SELECT count(*) FROM parties.v_party_canonical) = 0 AND (SELECT count(*) FROM catalog.v_sku) = 0
-                           AND (SELECT count(*) FROM catalog.v_barcode_lookup) = 0 AND (SELECT count(*) FROM parties.v_party_moadian_profile) = 0,
+                           AND (SELECT count(*) FROM catalog.v_barcode_lookup) = 0 AND (SELECT count(*) FROM parties.v_party_moadian_profile) = 0
+                           AND (SELECT count(*) FROM parties.v_party_ledger_identity) = 0 AND (SELECT count(*) FROM catalog.v_category_effective) = 0,
                            'INV-MD-03 views are security_invoker');
   PERFORM public.md_assert(NOT EXISTS (SELECT 1 FROM catalog.resolve_price('25a00000-0000-7000-8000-00000000c301','25a00000-0000-7000-8000-00000000c111','25a00000-0000-7000-8000-00000000c001',1,current_date)),
                            'INV-MD-01 price function respects RLS');
@@ -964,11 +1035,13 @@ DO $$
 BEGIN
   PERFORM public.md_expect_error('INV-MD-01 no tenant context: merge', $q$SELECT parties.merge_parties(uuidv7(), uuidv7(), 'بدون مستأجر', NULL)$q$, 'HK_TENANT_CONTEXT_MISSING');
   PERFORM public.md_expect_error('INV-MD-01 no tenant context: barcode allocation', $q$SELECT catalog.allocate_internal_barcode()$q$, 'HK_TENANT_CONTEXT_MISSING');
+  PERFORM public.md_expect_error('INV-MD-01 no tenant context: party code', $q$SELECT parties.next_party_code()$q$, 'HK_TENANT_CONTEXT_MISSING');
+  PERFORM public.md_expect_error('INV-MD-01 no tenant context: item code', $q$SELECT catalog.next_item_code()$q$, 'HK_TENANT_CONTEXT_MISSING');
   PERFORM public.md_assert((SELECT count(*) FROM parties.party) = 0, 'INV-MD-01 no tenant context sees nothing');
 END $$;
 
 -- =====================================================================
--- بخش ۳: نقش فقط‌خواندنی
+-- بخش ۳: نقش فقط‌خواندنی — T19 (INV-MD-04)
 -- =====================================================================
 RESET ROLE;
 SET ROLE hk_readonly;

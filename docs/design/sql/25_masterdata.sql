@@ -440,6 +440,8 @@ CREATE TABLE IF NOT EXISTS parties.party (
   gender                       text CHECK (gender IN ('male','female')),
   birth_date                   date CHECK (birth_date >= DATE '1900-01-01'),
   birth_cert_no                text CHECK (birth_cert_no ~ '^[0-9]{1,10}$'),
+  birth_cert_issue_place       text CHECK (birth_cert_issue_place = core.fa_normalize_text(birth_cert_issue_place) AND char_length(birth_cert_issue_place) BETWEEN 1 AND 100),
+  birth_cert_issue_date        date,      -- لیست بیمه (DSW_IDPLC و DSW_IDATE) به این دو نیاز دارد
   nationality                  char(2) REFERENCES ref.country(code),
   national_id                  text,      -- کد ملی (۱۰)، شناسهٔ ملی (۱۱)، شناسهٔ مشارکت مدنی (۱۱)، کد فراگیر اتباع (۱۲)
   national_id_status           text CHECK (national_id_status IN ('valid','format_only','override')),
@@ -469,8 +471,11 @@ CREATE TABLE IF NOT EXISTS parties.party (
   CONSTRAINT party_merge_cols CHECK ((status = 'merged') = (merged_into_id IS NOT NULL) AND (status = 'merged') = (merged_at IS NOT NULL)),
   CONSTRAINT party_merge_self CHECK (merged_into_id IS NULL OR merged_into_id <> id),
   CONSTRAINT party_natural_fields CHECK (person_type IN ('natural','foreign_natural')
-        OR num_nonnulls(first_name, last_name, father_name, gender, birth_date, birth_cert_no) = 0),
-  CONSTRAINT party_birth_cert_iranian CHECK (birth_cert_no IS NULL OR person_type = 'natural'),
+        OR num_nonnulls(first_name, last_name, father_name, gender, birth_date, birth_cert_no,
+                        birth_cert_issue_place, birth_cert_issue_date) = 0),
+  CONSTRAINT party_birth_cert_iranian CHECK (person_type = 'natural'
+        OR num_nonnulls(birth_cert_no, birth_cert_issue_place, birth_cert_issue_date) = 0),
+  CONSTRAINT party_birth_cert_dates CHECK (birth_cert_issue_date IS NULL OR birth_date IS NULL OR birth_cert_issue_date >= birth_date),
   CONSTRAINT party_legal_fields CHECK (person_type IN ('legal','civil_partnership','foreign_legal')
         OR num_nonnulls(registration_no, registration_date) = 0),
   CONSTRAINT party_anonymous CHECK (NOT is_anonymous
@@ -760,6 +765,28 @@ CREATE TABLE IF NOT EXISTS parties.party_taxpayer_inquiry (
 SELECT core.enable_tenant_rls('parties.party_taxpayer_inquiry');
 CREATE INDEX IF NOT EXISTS party_taxpayer_inquiry_last ON parties.party_taxpayer_inquiry (tenant_id, party_id, inquired_at DESC);
 
+-- سری کد نمایشی اشخاص (= کد تفصیلی). دادهٔ پایه است نه سند قانونی: سطح مستأجر، بدون الزام پیوستگی،
+-- کاربر می‌تواند کد را دستی بدهد. انتخاب سری: (نقش، گروه) > (نقش) > پیش‌فرض (NULL، NULL).
+CREATE TABLE IF NOT EXISTS parties.code_series (
+  tenant_id    uuid NOT NULL REFERENCES core.tenant(id),
+  id           uuid NOT NULL DEFAULT uuidv7(),
+  role         text CHECK (role IN ('customer','supplier','employee','shareholder','bank','sales_agent','other')),
+  group_id     uuid,
+  prefix       text NOT NULL DEFAULT '' CHECK (prefix ~ '^([A-Za-z0-9][A-Za-z0-9._/-]{0,11})?$'),
+  pad_width    smallint NOT NULL DEFAULT 5 CHECK (pad_width BETWEEN 1 AND 12),
+  next_value   bigint NOT NULL DEFAULT 1 CHECK (next_value BETWEEN 1 AND 999999999999),
+  is_active    boolean NOT NULL DEFAULT true,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  row_version  integer NOT NULL DEFAULT 1,
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  UNIQUE NULLS NOT DISTINCT (tenant_id, role, group_id),
+  FOREIGN KEY (tenant_id, group_id, role) REFERENCES parties.party_group(tenant_id, id, role),
+  CHECK (group_id IS NULL OR role IS NOT NULL)
+);
+SELECT core.enable_tenant_rls('parties.code_series');
+
 -- =====================================================================
 -- ۵. parties — تریگرها
 -- =====================================================================
@@ -949,7 +976,7 @@ DROP TRIGGER IF EXISTS trg_legacy_code_guard ON parties.party_legacy_code;
 CREATE TRIGGER trg_legacy_code_guard BEFORE UPDATE ON parties.party_legacy_code
   FOR EACH ROW EXECUTE FUNCTION parties.legacy_code_guard();
 
--- کد گروه شخص انتخابگر قواعد ثبت دفتر کل است (ledger.posting_rule.conditions با attr:party.<role>_group = code)
+-- کد گروه شخص انتخابگر قواعد ثبت دفتر کل است (ledger.posting_rule.conditions با attr:<role>_group = code؛ parties.posting_attributes)
 -- و با کد ارجاع می‌شود، نه FK؛ پس کد و نقش تغییرناپذیرند.
 CREATE OR REPLACE FUNCTION parties.party_group_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -976,7 +1003,7 @@ DO $$
 DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY['party_group','payment_term','party','party_role','party_contact','party_address',
-                           'party_bank_account','party_relation'] LOOP
+                           'party_bank_account','party_relation','code_series'] LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS trg_touch ON parties.%I', t);
     EXECUTE format('CREATE TRIGGER trg_touch BEFORE UPDATE ON parties.%I FOR EACH ROW EXECUTE FUNCTION core.touch_row()', t);
   END LOOP;
@@ -1185,6 +1212,73 @@ $$;
 CREATE OR REPLACE VIEW parties.v_party_canonical WITH (security_invoker = true) AS
   SELECT p.tenant_id, p.id AS party_id, coalesce(p.merged_into_id, p.id) AS canonical_party_id, p.status
     FROM parties.party p;
+
+-- قرارداد ledger (DimensionService.ensure_value): ورودی‌های مقدار بُعد «party» برای هر شخص.
+-- یک مقدار بُعد به ازای هر شخص (نه هر نقش)؛ کد = کد شخص؛ company_id = محدودیت دید شخص.
+CREATE OR REPLACE VIEW parties.v_party_ledger_identity WITH (security_invoker = true) AS
+  SELECT p.tenant_id, p.id AS party_id, p.code, p.name, p.company_id, p.status,
+         coalesce(p.merged_into_id, p.id) AS canonical_party_id
+    FROM parties.party p;
+
+-- ویژگی‌های شرط قاعدهٔ نگاشت حساب (ledger.posting_rule.conditions) برای یک (شخص، نقش، شرکت):
+-- {"<role>_group": کد گروه مؤثر, "party_person_type": نوع شخص}. شخص ادغام‌شده به جانشین ترجمه می‌شود.
+-- گروه مؤثر: گروه ردیف نقش شرکت‌محور > ردیف پیش‌فرض > گروه پیش‌فرض فعال همان نقش > هیچ (کلید حذف می‌شود).
+CREATE OR REPLACE FUNCTION parties.posting_attributes(p_party_id uuid, p_role text, p_company_id uuid) RETURNS jsonb
+LANGUAGE plpgsql STABLE AS $$
+DECLARE p parties.party; v_group_id uuid; v_group text;
+BEGIN
+  IF p_role IS NULL OR p_role NOT IN ('customer','supplier','employee','shareholder','bank','sales_agent','other') THEN
+    RAISE EXCEPTION 'HK_PARTY_ROLE_INVALID: %', p_role USING ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO p FROM parties.party x WHERE x.id = p_party_id;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  IF p.status = 'merged' THEN
+    SELECT * INTO p FROM parties.party x WHERE x.tenant_id = p.tenant_id AND x.id = p.merged_into_id;
+  END IF;
+  SELECT r.group_id INTO v_group_id FROM parties.role_settings(p.id, p_role, p_company_id) r;
+  IF v_group_id IS NOT NULL THEN
+    SELECT g.code INTO v_group FROM parties.party_group g WHERE g.tenant_id = p.tenant_id AND g.id = v_group_id;
+  ELSE
+    SELECT g.code INTO v_group FROM parties.party_group g
+     WHERE g.tenant_id = p.tenant_id AND g.role = p_role AND g.is_default AND g.is_active;
+  END IF;
+  RETURN jsonb_strip_nulls(jsonb_build_object(p_role || '_group', v_group, 'party_person_type', p.person_type));
+END $$;
+
+-- تخصیص کد نمایشی شخص از سری مناسب (قفل ردیف سری؛ کدهای دستی موجود رد می‌شوند)
+CREATE OR REPLACE FUNCTION parties.next_party_code(p_role text DEFAULT NULL, p_group_id uuid DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE v_tenant uuid := core.current_tenant_id(); s parties.code_series; v_next bigint; v_code text;
+BEGIN
+  IF v_tenant IS NULL THEN
+    RAISE EXCEPTION 'HK_TENANT_CONTEXT_MISSING: app.tenant_id is not set' USING ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO s FROM parties.code_series c
+   WHERE c.tenant_id = v_tenant AND c.is_active
+     AND ((c.role = p_role AND c.group_id = p_group_id) OR (c.role = p_role AND c.group_id IS NULL)
+          OR (c.role IS NULL AND c.group_id IS NULL))
+   ORDER BY (c.group_id IS NULL), (c.role IS NULL)
+   LIMIT 1
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    INSERT INTO parties.code_series (tenant_id, role, group_id) VALUES (v_tenant, NULL, NULL) ON CONFLICT DO NOTHING;
+    SELECT * INTO s FROM parties.code_series c WHERE c.tenant_id = v_tenant AND c.role IS NULL AND c.group_id IS NULL FOR UPDATE;
+    IF NOT s.is_active THEN
+      RAISE EXCEPTION 'HK_PARTY_CODE_SERIES_INACTIVE: no active code series' USING ERRCODE = 'P0001';
+    END IF;
+  END IF;
+  v_next := s.next_value;
+  LOOP
+    v_code := s.prefix || CASE WHEN length(v_next::text) >= s.pad_width THEN v_next::text ELSE lpad(v_next::text, s.pad_width, '0') END;
+    IF char_length(v_code) > 40 OR v_next > 999999999999 THEN
+      RAISE EXCEPTION 'HK_PARTY_CODE_SERIES_EXHAUSTED: series % is exhausted', s.id USING ERRCODE = 'P0001';
+    END IF;
+    v_next := v_next + 1;
+    EXIT WHEN NOT EXISTS (SELECT 1 FROM parties.party x WHERE x.tenant_id = v_tenant AND x.code = v_code);
+  END LOOP;
+  UPDATE parties.code_series SET next_value = v_next WHERE tenant_id = v_tenant AND id = s.id;
+  RETURN v_code;
+END $$;
 
 CREATE OR REPLACE VIEW parties.v_party_hold_state WITH (security_invoker = true) AS
   SELECT h.tenant_id, h.party_id,
@@ -1784,6 +1878,25 @@ CREATE TABLE IF NOT EXISTS catalog.item_legacy_code (
 SELECT core.enable_tenant_rls('catalog.item_legacy_code');
 CREATE INDEX IF NOT EXISTS item_legacy_code_search ON catalog.item_legacy_code (tenant_id, legacy_code);
 
+-- سری کد کالا (مثل «کد گروه + شماره» در هلو). category_id NULL = پیش‌فرض؛ نزدیک‌ترین نیای دارای سری برنده است.
+CREATE TABLE IF NOT EXISTS catalog.code_series (
+  tenant_id    uuid NOT NULL REFERENCES core.tenant(id),
+  id           uuid NOT NULL DEFAULT uuidv7(),
+  category_id  uuid,
+  prefix       text NOT NULL DEFAULT '' CHECK (prefix ~ '^([A-Za-z0-9][A-Za-z0-9._/-]{0,15})?$'),
+  pad_width    smallint NOT NULL DEFAULT 5 CHECK (pad_width BETWEEN 1 AND 12),
+  next_value   bigint NOT NULL DEFAULT 1 CHECK (next_value BETWEEN 1 AND 999999999999),
+  is_active    boolean NOT NULL DEFAULT true,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  row_version  integer NOT NULL DEFAULT 1,
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  UNIQUE NULLS NOT DISTINCT (tenant_id, category_id),
+  FOREIGN KEY (tenant_id, category_id) REFERENCES catalog.item_category(tenant_id, id) ON DELETE CASCADE
+);
+SELECT core.enable_tenant_rls('catalog.code_series');
+
 -- BOM سبک: kit (بستهٔ فروشی، انفجار هنگام فروش)، recipe (دستور پخت، مصرف هنگام فروش)،
 -- production (تولید داخلی کالای انباری مثل سیروپ). منطق مصرف در بخش انبار است.
 CREATE TABLE IF NOT EXISTS catalog.bom (
@@ -1866,7 +1979,7 @@ DROP TRIGGER IF EXISTS trg_category_guard ON catalog.item_category;
 CREATE TRIGGER trg_category_guard BEFORE INSERT OR UPDATE OF parent_id ON catalog.item_category
   FOR EACH ROW EXECUTE FUNCTION catalog.category_guard();
 
--- کد گروه ثبت کالا انتخابگر قواعد ثبت (attr:item.posting_group = code) است؛ تغییرناپذیر
+-- کد گروه ثبت کالا انتخابگر قواعد ثبت (attr:item_posting_group = code؛ catalog.posting_attributes) است؛ تغییرناپذیر
 CREATE OR REPLACE FUNCTION catalog.posting_group_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -2308,7 +2421,7 @@ DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY['uom','item_posting_group','attribute','attribute_value','attribute_set','brand','item_category',
                            'item','item_variant','item_uom','scale_barcode_pattern','price_list','price_list_item',
-                           'price_list_assignment','item_supplier','bom'] LOOP
+                           'price_list_assignment','item_supplier','bom','code_series'] LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS trg_touch ON catalog.%I', t);
     EXECUTE format('CREATE TRIGGER trg_touch BEFORE UPDATE ON catalog.%I FOR EACH ROW EXECUTE FUNCTION core.touch_row()', t);
   END LOOP;
@@ -2429,11 +2542,31 @@ BEGIN
   RETURN;
 END $$;
 
+-- دستهٔ مؤثر: مسیر درخت و پیش‌فرض‌های ارث‌برده از نزدیک‌ترین نیا (گروه ثبت، دستهٔ مالیاتی، واحد، قالب ویژگی).
+-- فقط posting_group در زمان اجرا ارث برده می‌شود؛ بقیه پیش‌پرکردن فرم کالای تازه‌اند (سرویس).
+CREATE OR REPLACE VIEW catalog.v_category_effective WITH (security_invoker = true) AS
+  WITH RECURSIVE t AS (
+    SELECT c.tenant_id, c.id, c.parent_id, c.code, 1 AS depth, ARRAY[c.id] AS path_ids, c.code AS path_codes, c.name AS path_names,
+           c.default_posting_group_id AS posting_group_id, c.default_tax_category_code AS tax_category_code,
+           c.default_uom_id AS uom_id, c.default_attribute_set_id AS attribute_set_id
+      FROM catalog.item_category c WHERE c.parent_id IS NULL
+    UNION ALL
+    SELECT c.tenant_id, c.id, c.parent_id, c.code, t.depth + 1, t.path_ids || c.id, t.path_codes || '/' || c.code,
+           t.path_names || ' / ' || c.name,
+           coalesce(c.default_posting_group_id, t.posting_group_id), coalesce(c.default_tax_category_code, t.tax_category_code),
+           coalesce(c.default_uom_id, t.uom_id), coalesce(c.default_attribute_set_id, t.attribute_set_id)
+      FROM catalog.item_category c JOIN t ON t.tenant_id = c.tenant_id AND t.id = c.parent_id
+     WHERE t.depth < 10)
+  SELECT tenant_id, id AS category_id, parent_id, code, depth, path_ids, path_codes, path_names,
+         posting_group_id AS effective_posting_group_id, tax_category_code AS effective_tax_category_code,
+         uom_id AS effective_uom_id, attribute_set_id AS effective_attribute_set_id
+    FROM t;
+
 CREATE OR REPLACE VIEW catalog.v_sku WITH (security_invoker = true) AS
   SELECT v.tenant_id, v.id AS variant_id, v.item_id, v.code AS sku_code, i.code AS item_code,
          CASE WHEN v.name_suffix IS NULL THEN i.name ELSE i.name || ' — ' || v.name_suffix END AS display_name,
          i.item_type, i.base_uom_id, i.category_id, i.brand_id,
-         coalesce(i.posting_group_id, c.default_posting_group_id) AS posting_group_id,
+         coalesce(i.posting_group_id, c.effective_posting_group_id) AS posting_group_id,
          i.track_serial, i.track_batch, i.track_expiry,
          coalesce(v.sstid, i.sstid) AS sstid, CASE WHEN v.sstid IS NOT NULL THEN v.sstid_kind ELSE i.sstid_kind END AS sstid_kind,
          i.tax_category_code, i.other_tax_category_code,
@@ -2442,7 +2575,60 @@ CREATE OR REPLACE VIEW catalog.v_sku WITH (security_invoker = true) AS
          v.is_default, v.axis1_value_id, v.axis2_value_id, v.axis3_value_id, v.plu_code, i.company_id
     FROM catalog.item_variant v
     JOIN catalog.item i ON i.tenant_id = v.tenant_id AND i.id = v.item_id
-    LEFT JOIN catalog.item_category c ON c.tenant_id = i.tenant_id AND c.id = i.category_id;
+    LEFT JOIN catalog.v_category_effective c ON c.tenant_id = i.tenant_id AND c.category_id = i.category_id;
+
+-- ویژگی‌های شرط قاعدهٔ نگاشت حساب برای یک SKU: item_posting_group (مؤثر)، item_type و item_category (کد دستهٔ مستقیم).
+CREATE OR REPLACE FUNCTION catalog.posting_attributes(p_variant_id uuid) RETURNS jsonb
+LANGUAGE sql STABLE AS $$
+  SELECT jsonb_strip_nulls(jsonb_build_object(
+           'item_posting_group', g.code,
+           'item_type', s.item_type,
+           'item_category', c.code))
+    FROM catalog.v_sku s
+    LEFT JOIN catalog.item_posting_group g ON g.tenant_id = s.tenant_id AND g.id = s.posting_group_id
+    LEFT JOIN catalog.item_category c ON c.tenant_id = s.tenant_id AND c.id = s.category_id
+   WHERE s.variant_id = p_variant_id
+$$;
+
+-- تخصیص کد کالا: سری نزدیک‌ترین نیای دارای سری فعال، وگرنه سری پیش‌فرض (ساخته می‌شود). کد باید در کالا و SKU آزاد باشد.
+CREATE OR REPLACE FUNCTION catalog.next_item_code(p_category_id uuid DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE v_tenant uuid := core.current_tenant_id(); s catalog.code_series; v_path uuid[]; v_next bigint; v_code text;
+BEGIN
+  IF v_tenant IS NULL THEN
+    RAISE EXCEPTION 'HK_TENANT_CONTEXT_MISSING: app.tenant_id is not set' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_category_id IS NOT NULL THEN
+    SELECT e.path_ids INTO v_path FROM catalog.v_category_effective e WHERE e.tenant_id = v_tenant AND e.category_id = p_category_id;
+    IF v_path IS NULL THEN
+      RAISE EXCEPTION 'HK_CATALOG_CATEGORY_NOT_FOUND: %', p_category_id USING ERRCODE = 'P0001';
+    END IF;
+    SELECT * INTO s FROM catalog.code_series c
+     WHERE c.tenant_id = v_tenant AND c.is_active AND c.category_id = ANY (v_path)
+     ORDER BY array_position(v_path, c.category_id) DESC
+     LIMIT 1
+     FOR UPDATE;
+  END IF;
+  IF s.id IS NULL THEN
+    INSERT INTO catalog.code_series (tenant_id, category_id) VALUES (v_tenant, NULL) ON CONFLICT DO NOTHING;
+    SELECT * INTO s FROM catalog.code_series c WHERE c.tenant_id = v_tenant AND c.category_id IS NULL FOR UPDATE;
+    IF NOT s.is_active THEN
+      RAISE EXCEPTION 'HK_CATALOG_CODE_SERIES_INACTIVE: no active code series' USING ERRCODE = 'P0001';
+    END IF;
+  END IF;
+  v_next := s.next_value;
+  LOOP
+    v_code := s.prefix || CASE WHEN length(v_next::text) >= s.pad_width THEN v_next::text ELSE lpad(v_next::text, s.pad_width, '0') END;
+    IF char_length(v_code) > 40 OR v_next > 999999999999 THEN
+      RAISE EXCEPTION 'HK_CATALOG_CODE_SERIES_EXHAUSTED: series % is exhausted', s.id USING ERRCODE = 'P0001';
+    END IF;
+    v_next := v_next + 1;
+    EXIT WHEN NOT EXISTS (SELECT 1 FROM catalog.item x WHERE x.tenant_id = v_tenant AND x.code = v_code)
+          AND NOT EXISTS (SELECT 1 FROM catalog.item_variant x WHERE x.tenant_id = v_tenant AND x.code = v_code);
+  END LOOP;
+  UPDATE catalog.code_series SET next_value = v_next WHERE tenant_id = v_tenant AND id = s.id;
+  RETURN v_code;
+END $$;
 
 CREATE OR REPLACE VIEW catalog.v_item_uom_effective WITH (security_invoker = true) AS
   SELECT iu.tenant_id, iu.item_id, iu.uom_id, iu.factor, iu.is_base, iu.allow_sales, iu.allow_purchase,
@@ -2470,6 +2656,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   parties.party_contact, parties.party_address, parties.party_bank_account, parties.party_relation,
   parties.party_legacy_code TO hk_app;
 GRANT SELECT, INSERT, UPDATE ON parties.party_hold TO hk_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON parties.code_series TO hk_app;
 GRANT SELECT, INSERT, DELETE ON parties.duplicate_dismissal TO hk_app;
 GRANT SELECT, INSERT ON parties.party_merge, parties.party_taxpayer_inquiry TO hk_app;
 GRANT SELECT ON ALL TABLES IN SCHEMA parties TO hk_readonly;
@@ -2481,8 +2668,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   catalog.price_list_item, catalog.price_list_assignment, catalog.item_supplier, catalog.item_image,
   catalog.item_legacy_code, catalog.bom, catalog.bom_line TO hk_app;
 GRANT SELECT, INSERT, UPDATE ON catalog.barcode_counter TO hk_app;
-GRANT SELECT ON parties.v_party_canonical, parties.v_party_hold_state, parties.v_party_moadian_profile,
-                catalog.v_sku, catalog.v_item_uom_effective, catalog.v_barcode_lookup TO hk_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON catalog.code_series TO hk_app;
+GRANT SELECT ON parties.v_party_canonical, parties.v_party_ledger_identity, parties.v_party_hold_state,
+                parties.v_party_moadian_profile, catalog.v_category_effective, catalog.v_sku,
+                catalog.v_item_uom_effective, catalog.v_barcode_lookup TO hk_app;
 GRANT SELECT ON ALL TABLES IN SCHEMA catalog TO hk_readonly;
 
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ref, parties, catalog TO hk_app, hk_readonly;

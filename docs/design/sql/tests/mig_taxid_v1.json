@@ -1,0 +1,102 @@
+{
+ "name": "mig_taxid",
+ "version": 1,
+ "note": "migration.taxid_is_valid (SQL) == kernel.validators.iran.valid_taxid (Python); RC_DCPS.SN V1.3 Verhoeff; strict canonical form, zfill never truncates; superset of the official/accepted vectors in moadian_taxid_vectors_v1.json (section 07)",
+ "vectors": [
+  {
+   "taxid": "DEF5GH0481F000000000C2",
+   "valid": true,
+   "note": "official RC_DCPS.SN V1.3 example 1"
+  },
+  {
+   "taxid": "DEF5GH0481F0000001FED8",
+   "valid": true,
+   "note": "official example 2"
+  },
+  {
+   "taxid": "DEF5GH0481F009956F7211",
+   "valid": true,
+   "note": "official example 3"
+  },
+  {
+   "taxid": "A1B2C30481FFFFFFFFFFF0",
+   "valid": true,
+   "note": "serial 0xFFFFFFFFFF = 13 decimal digits (zfill must not truncate)"
+  },
+  {
+   "taxid": "ZZZZZZFFFFF00000000010",
+   "valid": true,
+   "note": "day 0xFFFFF = 7 decimal digits"
+  },
+  {
+   "taxid": "12345604A2B00000000AF5",
+   "valid": true,
+   "note": "all-digit memory id"
+  },
+  {
+   "taxid": "A1121604C220002F095011",
+   "valid": true,
+   "note": "accepted production/sandbox taxid (shared with tests/moadian_taxid_vectors_v1.json)"
+  },
+  {
+   "taxid": "A111DW04E8300004349008",
+   "valid": true,
+   "note": "accepted production/sandbox taxid (shared)"
+  },
+  {
+   "taxid": "A2HP31050B0006A607FE39",
+   "valid": true,
+   "note": "accepted production/sandbox taxid (shared)"
+  },
+  {
+   "taxid": "DEF5GH0481000000F1FED8",
+   "valid": false,
+   "note": "day/serial boundary shifted (shared invalid vector)"
+  },
+  {
+   "taxid": "def5gh0481f000000000c2",
+   "valid": false,
+   "note": "validators are strict (canonical upper case); the migration normalizer upper-cases before validating"
+  },
+  {
+   "taxid": "DEF5GH0481F000000000C3",
+   "valid": false,
+   "note": "check digit mutated"
+  },
+  {
+   "taxid": "DEF5GH0481F0000001FED9",
+   "valid": false,
+   "note": "check digit mutated"
+  },
+  {
+   "taxid": "DEF5GH0481F000000000D2",
+   "valid": false,
+   "note": "serial mutated"
+  },
+  {
+   "taxid": "DEF5GH0481F00000000C2",
+   "valid": false,
+   "note": "21 characters"
+  },
+  {
+   "taxid": "DEF5GH0481G000000000C2",
+   "valid": false,
+   "note": "non-hex day"
+  },
+  {
+   "taxid": "DEF5G_0481F000000000C2",
+   "valid": false,
+   "note": "invalid memory character"
+  },
+  {
+   "taxid": "DEF5GH0481F000000000CX",
+   "valid": false,
+   "note": "non-digit check character"
+  },
+  {
+   "taxid": "",
+   "valid": false,
+   "note": "empty"
+  }
+ ]
+}
