@@ -766,8 +766,15 @@ END $T$;
 DO $T$
 BEGIN
   PERFORM public.as_ctx(public.k('A'), public.k('a1'));
-  INSERT INTO assistant.message (tenant_id, id, thread_id, user_id, run_id, seq, role, content, input_mode)
-  VALUES (public.k('A'), public.k('m1'), public.k('tA1'), public.k('a1'), public.k('rA1'), 99, 'user', 'تراز آزمایشی این ماه را نشان بده', 'suggestion');
+  PERFORM public.as_expect_error('T10 suggestion message needs its suggestion_code',
+    format($q$INSERT INTO assistant.message (tenant_id, thread_id, user_id, run_id, seq, role, content, input_mode) VALUES (%L, %L, %L, %L, 1, 'user', 'سود و زیان این ماه چقدر است؟', 'suggestion')$q$,
+           public.k('A'), public.k('tA1'), public.k('a1'), public.k('rA1')), '23514');
+  PERFORM public.as_expect_error('T10 suggestion_code only with input_mode=suggestion',
+    format($q$INSERT INTO assistant.message (tenant_id, thread_id, user_id, run_id, seq, role, content, suggestion_code) VALUES (%L, %L, %L, %L, 1, 'user', 'سود و زیان این ماه چقدر است؟', 'general.pnl_month')$q$,
+           public.k('A'), public.k('tA1'), public.k('a1'), public.k('rA1')), '23514');
+  INSERT INTO assistant.message (tenant_id, id, thread_id, user_id, run_id, seq, role, content, input_mode, suggestion_code)
+  VALUES (public.k('A'), public.k('m1'), public.k('tA1'), public.k('a1'), public.k('rA1'), 99, 'user', 'تراز آزمایشی این ماه را نشان بده', 'suggestion',
+          'retail_apparel.season_pnl');
   PERFORM public.as_assert((SELECT seq = 1 FROM assistant.message WHERE id = public.k('m1')), 'T10 seq assigned by the thread counter');
   PERFORM public.as_expect_error('T10 bidi override characters rejected',
     format($q$INSERT INTO assistant.message (tenant_id, thread_id, user_id, run_id, seq, role, content) VALUES (%L, %L, %L, %L, 1, 'user', %L)$q$,
@@ -1030,6 +1037,7 @@ BEGIN
   PERFORM public.as_ctx(public.k('A'), NULL);
   PERFORM public.as_assert((SELECT count(*) FROM assistant.run) >= 3, 'T17 readonly reads metering');
   PERFORM public.as_assert((SELECT count(*) FROM (SELECT id, role, seq FROM assistant.message) x) >= 0, 'T17 readonly reads message metadata');
+  PERFORM public.as_assert((SELECT count(*) FROM assistant.message WHERE suggestion_code IS NOT NULL) >= 0, 'T17 readonly reads suggestion usage');
   PERFORM public.as_expect_error('T17 readonly cannot read message content', $q$SELECT content FROM assistant.message$q$, '42501');
   PERFORM public.as_expect_error('T17 readonly cannot read tool results', $q$SELECT result FROM assistant.tool_call$q$, '42501');
   PERFORM public.as_expect_error('T17 readonly cannot read proposal payload', $q$SELECT payload FROM assistant.proposal$q$, '42501');

@@ -1683,7 +1683,7 @@ CREATE TABLE IF NOT EXISTS platform.cell_backup_status (
 CREATE TABLE IF NOT EXISTS platform.feature (
   key             text PRIMARY KEY CHECK (key ~ '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,3}$'),
   kind            text NOT NULL CHECK (kind IN ('flag','limit','meter')),
-  unit            text CHECK (unit IN ('count','per_month','gb','parts','calls','hours')),
+  unit            text CHECK (unit IN ('count','per_month','gb','parts','calls','hours','tokens','irr')),
   enforcement     text NOT NULL CHECK (enforcement IN ('data_plane','control_plane','both')),
   data_plane_key  text CHECK (data_plane_key ~ '^[a-z][a-z0-9_.]*$'),   -- کلید در entitlements حالت مطلوب
   description_fa  text NOT NULL,
@@ -2027,21 +2027,45 @@ CREATE TABLE IF NOT EXISTS platform.feature_flag_target (
   PRIMARY KEY (flag_key, target_kind, target_id)
 );
 
--- ارزیابی قطعی پرچم برای مستأجر: kill > هدف tenant > هدف plan > درصد (hash پایدار) > پیش‌فرض
-CREATE OR REPLACE FUNCTION platform.flag_on_for_tenant(p_flag text, p_tenant uuid, p_plan text) RETURNS boolean
+-- ارزیابی قطعی پرچم برای مستأجر: kill سراسری > (فقط ops_kill_switch: خاموشی هر هدف منطبق غالب است)
+--   > هدف tenant > هدف plan > هدف cell > درصد (hash پایدار) > پیش‌فرض
+DROP FUNCTION IF EXISTS platform.flag_on_for_tenant(text, uuid, text);
+CREATE OR REPLACE FUNCTION platform.flag_on_for_tenant(p_flag text, p_tenant uuid, p_plan text, p_cell text DEFAULT NULL) RETURNS boolean
 LANGUAGE sql STABLE AS $$
+  WITH t AS (
+    SELECT g.target_kind, g.is_on FROM platform.feature_flag_target g
+     WHERE g.flag_key = p_flag
+       AND ((g.target_kind = 'tenant' AND g.target_id = p_tenant::text)
+         OR (g.target_kind = 'plan' AND g.target_id = p_plan)
+         OR (g.target_kind = 'cell' AND g.target_id = p_cell)))
   SELECT CASE
     WHEN f.kill_switch OR f.status <> 'active' THEN false
-    WHEN EXISTS (SELECT 1 FROM platform.feature_flag_target t WHERE t.flag_key = f.key AND t.target_kind = 'tenant' AND t.target_id = p_tenant::text)
-      THEN (SELECT t.is_on FROM platform.feature_flag_target t WHERE t.flag_key = f.key AND t.target_kind = 'tenant' AND t.target_id = p_tenant::text)
-    WHEN p_plan IS NOT NULL AND EXISTS (SELECT 1 FROM platform.feature_flag_target t WHERE t.flag_key = f.key AND t.target_kind = 'plan' AND t.target_id = p_plan)
-      THEN (SELECT t.is_on FROM platform.feature_flag_target t WHERE t.flag_key = f.key AND t.target_kind = 'plan' AND t.target_id = p_plan)
+    WHEN f.kind = 'ops_kill_switch' AND EXISTS (SELECT 1 FROM t WHERE NOT t.is_on) THEN false
+    WHEN EXISTS (SELECT 1 FROM t WHERE t.target_kind = 'tenant') THEN (SELECT t.is_on FROM t WHERE t.target_kind = 'tenant')
+    WHEN EXISTS (SELECT 1 FROM t WHERE t.target_kind = 'plan')   THEN (SELECT t.is_on FROM t WHERE t.target_kind = 'plan')
+    WHEN EXISTS (SELECT 1 FROM t WHERE t.target_kind = 'cell')   THEN (SELECT t.is_on FROM t WHERE t.target_kind = 'cell')
     WHEN f.rollout_percent > 0
       THEN (('x' || substr(encode(sha256(convert_to(f.key || ':' || p_tenant::text, 'UTF8')), 'hex'), 1, 8))::bit(32)::bigint % 100) < f.rollout_percent
     ELSE f.default_on
   END
   FROM platform.feature_flag f WHERE f.key = p_flag
 $$;
+
+-- هر تغییر پرچم یا هدف آن بازسازی حالت مطلوب را صف می‌کند (cause = 'flag')؛ kill switch دستیار در hkcellstate/1 هم می‌رود
+CREATE OR REPLACE FUNCTION platform.feature_flag_apply() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_row jsonb := to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END);
+  v_key text := coalesce(v_row->>'flag_key', v_row->>'key');
+BEGIN
+  PERFORM platform.enqueue('control.flag.propagate', 'sync', jsonb_build_object('flag_key', v_key, 'cause', 'flag'),
+                           'flag:' || v_key || ':' || txid_current()::text);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_apply ON platform.feature_flag;
+CREATE TRIGGER trg_apply AFTER INSERT OR UPDATE ON platform.feature_flag FOR EACH ROW EXECUTE FUNCTION platform.feature_flag_apply();
+DROP TRIGGER IF EXISTS trg_apply ON platform.feature_flag_target;
+CREATE TRIGGER trg_apply AFTER INSERT OR UPDATE OR DELETE ON platform.feature_flag_target FOR EACH ROW EXECUTE FUNCTION platform.feature_flag_apply();
 
 -- تعرفهٔ خدمات مصرفی (پیامک خط پلتفرم، استعلام)
 CREATE TABLE IF NOT EXISTS platform.service_tariff (
@@ -2061,22 +2085,446 @@ LANGUAGE sql STABLE AS $$
    WHERE service_key = p_service AND valid_from <= p_at AND (valid_to IS NULL OR valid_to > p_at)
 $$;
 
--- ارائه‌دهندهٔ مدل دستیار (Q-F): تنها فراخوانی بیرونی مجاز؛ کلید فقط به‌صورت ارجاع OpenBao
+-- ---------- دستیار هوشمند (Q-F؛ قرارداد C-AS-07 بخش ۱۰ §۵-۱۹) ----------
+-- ارائه‌دهندهٔ مدل: تنها فراخوانی بیرونی مجاز محصول؛ کلید فقط به‌صورت ارجاع OpenBao.
+-- اثرانگشت مقصد داده = همان فرمول assistant.provider_fingerprint (بردار مشترک tests/assistant_fingerprint_v1.json).
+CREATE OR REPLACE FUNCTION platform.url_host(p_url text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT lower(substring(p_url FROM '^[A-Za-z][A-Za-z0-9+.-]*://([^/:?#@]+)'))
+$$;
+
+CREATE OR REPLACE FUNCTION platform.ai_provider_fingerprint(p_operator text, p_base_url text, p_data_location text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT encode(sha256(convert_to('hkllm1|' || lower(btrim(p_operator)) || '|' || coalesce(platform.url_host(p_base_url), '')
+                                  || '|' || p_data_location, 'UTF8')), 'hex')
+$$;
+
 CREATE TABLE IF NOT EXISTS platform.ai_provider (
-  id          uuid PRIMARY KEY DEFAULT uuidv7(),
-  name        text NOT NULL UNIQUE,
-  base_url    text NOT NULL CHECK (base_url ~ '^https://[A-Za-z0-9.-]+(:[0-9]{2,5})?(/[A-Za-z0-9._~/-]*)?$'),
-  model       text NOT NULL,
-  secret_ref  text CHECK (secret_ref ~ '^openbao://[A-Za-z0-9/_.-]+$'),
-  status      text NOT NULL DEFAULT 'disabled' CHECK (status IN ('active','disabled')),
-  is_default  boolean NOT NULL DEFAULT false,
-  created_at  timestamptz NOT NULL DEFAULT now(),
-  updated_at  timestamptz NOT NULL DEFAULT now(),
-  row_version integer NOT NULL DEFAULT 1,
-  CHECK (NOT is_default OR status = 'active')
+  id                      uuid PRIMARY KEY DEFAULT uuidv7(),
+  code                    text NOT NULL UNIQUE CHECK (code ~ '^[a-z][a-z0-9_.-]{1,60}$'),
+  version                 integer NOT NULL DEFAULT 1 CHECK (version >= 1),     -- +۱ با هر تغییر محتوا (تریگر)
+  name                    text NOT NULL CHECK (char_length(btrim(name)) >= 2),
+  operator                text NOT NULL CHECK (char_length(btrim(operator)) >= 2),   -- نام حقوقی اپراتور (در متن رضایت مستأجر)
+  data_location           text NOT NULL CHECK (data_location IN ('iran','cell_private','other')),
+  network                 text NOT NULL CHECK (network IN ('public','cell_private')),
+  -- بدون اعتبارنامه، query یا fragment در URL
+  base_url                text NOT NULL CHECK (base_url ~ '^https?://[A-Za-z0-9.-]+(:[0-9]{2,5})?(/[A-Za-z0-9._~/-]*)?$'),
+  model                   text NOT NULL CHECK (model ~ '^[A-Za-z0-9._:/@+-]{1,120}$'),
+  auth_header             text NOT NULL DEFAULT 'authorization_bearer' CHECK (auth_header IN ('authorization_bearer','x_api_key','none')),
+  secret_ref              text CHECK (secret_ref ~ '^openbao://[A-Za-z0-9/_.-]+$'),
+  connect_timeout_ms      integer NOT NULL DEFAULT 5000   CHECK (connect_timeout_ms BETWEEN 100 AND 60000),
+  first_token_timeout_ms  integer NOT NULL DEFAULT 30000  CHECK (first_token_timeout_ms BETWEEN 1000 AND 300000),
+  total_timeout_ms        integer NOT NULL DEFAULT 120000 CHECK (total_timeout_ms BETWEEN 1000 AND 600000),
+  max_output_tokens       integer NOT NULL DEFAULT 2048   CHECK (max_output_tokens BETWEEN 64 AND 32768),
+  max_context_tokens      integer NOT NULL DEFAULT 32768  CHECK (max_context_tokens BETWEEN 1024 AND 2000000),
+  capabilities            jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(capabilities) = 'object'),   -- از probe
+  rpm                     integer NOT NULL DEFAULT 60     CHECK (rpm BETWEEN 1 AND 100000),
+  tpm                     integer NOT NULL DEFAULT 100000 CHECK (tpm BETWEEN 1000 AND 100000000),
+  max_concurrency         integer NOT NULL DEFAULT 4      CHECK (max_concurrency BETWEEN 1 AND 1000),
+  fingerprint             text GENERATED ALWAYS AS (platform.ai_provider_fingerprint(operator, base_url, data_location)) STORED,
+  status                  text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','validated','active','disabled','retired')),
+  is_default              boolean NOT NULL DEFAULT false,
+  last_probe_at           timestamptz,
+  last_probe_ok           boolean,
+  last_probe_error        text,
+  last_eval_run_id        uuid,                                             -- FK پس از ساخت ai_eval_run
+  activation_approval_id  uuid REFERENCES platform.approval_request(id),
+  disabled_reason         text,
+  created_by              uuid REFERENCES platform.staff(id),
+  created_at              timestamptz NOT NULL DEFAULT now(),
+  updated_at              timestamptz NOT NULL DEFAULT now(),
+  row_version             integer NOT NULL DEFAULT 1,
+  -- http فقط برای سرور مدل داخل شبکهٔ سلول؛ شبکهٔ خصوصی سلول ⇔ محل داده «درون سلول»
+  CONSTRAINT ai_provider_http_private CHECK (base_url ~ '^https://' OR network = 'cell_private'),
+  CONSTRAINT ai_provider_private_location CHECK ((network = 'cell_private') = (data_location = 'cell_private')),
+  CONSTRAINT ai_provider_auth_secret CHECK ((auth_header = 'none') = (secret_ref IS NULL)),
+  CONSTRAINT ai_provider_default_active CHECK (NOT is_default OR status = 'active'),
+  CONSTRAINT ai_provider_validated_fields CHECK (status NOT IN ('validated','active','disabled')
+                                                 OR (last_probe_ok IS TRUE AND last_eval_run_id IS NOT NULL)),
+  CHECK ((last_probe_at IS NULL) = (last_probe_ok IS NULL)),
+  CHECK ((status = 'disabled') = (disabled_reason IS NOT NULL)),
+  CHECK (first_token_timeout_ms <= total_timeout_ms)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ai_provider_one_default ON platform.ai_provider ((true)) WHERE is_default;
 SELECT platform.add_touch('platform.ai_provider');
+
+-- اجرای ارزیابی (suite طلایی دستیار) روی یک نسخهٔ ارائه‌دهنده؛ فقط‌افزودنی
+CREATE TABLE IF NOT EXISTS platform.ai_eval_run (
+  id                 uuid PRIMARY KEY DEFAULT uuidv7(),
+  provider_id        uuid NOT NULL REFERENCES platform.ai_provider(id),
+  provider_version   integer NOT NULL CHECK (provider_version >= 1),
+  prompt_version     text NOT NULL CHECK (char_length(prompt_version) BETWEEN 1 AND 40),
+  toolset_sha256     bytea NOT NULL CHECK (octet_length(toolset_sha256) = 32),
+  suite              text NOT NULL CHECK (suite ~ '^[a-z][a-z0-9_.-]{1,60}$'),
+  suite_version      text NOT NULL CHECK (char_length(suite_version) BETWEEN 1 AND 40),
+  started_at         timestamptz NOT NULL,
+  finished_at        timestamptz NOT NULL,
+  cases              integer NOT NULL CHECK (cases > 0),
+  passed_cases       integer NOT NULL CHECK (passed_cases >= 0),
+  metrics            jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metrics) = 'object'),
+  threshold_version  text NOT NULL CHECK (char_length(threshold_version) BETWEEN 1 AND 40),
+  passed             boolean NOT NULL,
+  report_ref         text,
+  executed_by_kind   text NOT NULL CHECK (executed_by_kind IN ('staff','system')),
+  executed_by        uuid REFERENCES platform.staff(id),
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  CHECK (finished_at >= started_at),
+  CHECK (passed_cases <= cases),
+  CHECK (NOT passed OR passed_cases > 0),
+  CHECK ((executed_by_kind = 'staff') = (executed_by IS NOT NULL))
+);
+
+CREATE OR REPLACE FUNCTION platform.ai_eval_run_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.provider_version IS DISTINCT FROM (SELECT version FROM platform.ai_provider WHERE id = NEW.provider_id) THEN
+    PERFORM platform.fail('HK_PLT_AI_EVAL_MISMATCH', 'an eval run belongs to the current version of its provider');
+  END IF;
+  IF NEW.executed_by_kind = 'staff' AND NEW.executed_by IS DISTINCT FROM platform.current_staff_id() THEN
+    PERFORM platform.fail('HK_PLT_ACTOR_MISMATCH', 'executed_by must be the acting staff member');
+  END IF;
+  NEW.created_at := now();
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON platform.ai_eval_run;
+CREATE TRIGGER trg_guard BEFORE INSERT ON platform.ai_eval_run FOR EACH ROW EXECUTE FUNCTION platform.ai_eval_run_guard();
+SELECT platform.make_append_only('platform.ai_eval_run');
+
+ALTER TABLE platform.ai_provider DROP CONSTRAINT IF EXISTS ai_provider_last_eval_fk;
+ALTER TABLE platform.ai_provider ADD CONSTRAINT ai_provider_last_eval_fk FOREIGN KEY (last_eval_run_id) REFERENCES platform.ai_eval_run(id);
+
+-- چرخهٔ عمر: draft → validated (probe موفق + ارزیابی قبول‌شدهٔ همین نسخه) → active (تأیید دونفره) ⇄ disabled → retired.
+-- مقصد (اپراتور، URL، محل داده، شبکه، مدل، احراز، کلید) در active منجمد است؛ تغییرش در حالت‌های دیگر وضعیت را به draft
+-- برمی‌گرداند و probe/ارزیابی را پاک می‌کند. هر تغییر محتوا version را +۱ می‌کند (سند حالت مطلوب نسخهٔ پروفایل را دارد).
+CREATE OR REPLACE FUNCTION platform.ai_provider_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_dest_changed boolean;
+  v_ops_changed  boolean;
+  e platform.ai_eval_run%ROWTYPE;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM platform.fail('HK_PLT_IMMUTABLE', 'AI providers are retired, never deleted');
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status <> 'draft' OR NEW.is_default OR NEW.version <> 1 OR NEW.last_eval_run_id IS NOT NULL
+       OR NEW.last_probe_at IS NOT NULL OR NEW.activation_approval_id IS NOT NULL THEN
+      PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', 'AI providers start as unvalidated version-1 drafts');
+    END IF;
+    IF NEW.created_by IS DISTINCT FROM platform.current_staff_id() THEN
+      PERFORM platform.fail('HK_PLT_ACTOR_MISMATCH', 'created_by must be the acting staff member');
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF NEW.code <> OLD.code OR NEW.created_at <> OLD.created_at OR NEW.created_by IS DISTINCT FROM OLD.created_by THEN
+    PERFORM platform.fail('HK_PLT_IMMUTABLE_FIELD', 'provider identity is immutable');
+  END IF;
+  IF NEW.version <> OLD.version THEN
+    PERFORM platform.fail('HK_PLT_DERIVED_COLUMN', 'provider version follows content changes');
+  END IF;
+  IF OLD.status = 'retired' THEN
+    PERFORM platform.fail('HK_PLT_AI_PROVIDER_FROZEN', 'a retired provider is frozen');
+  END IF;
+  v_dest_changed := NEW.operator <> OLD.operator OR NEW.base_url <> OLD.base_url OR NEW.data_location <> OLD.data_location
+                 OR NEW.network <> OLD.network OR NEW.model <> OLD.model OR NEW.auth_header <> OLD.auth_header
+                 OR NEW.secret_ref IS DISTINCT FROM OLD.secret_ref;
+  v_ops_changed  := NEW.name <> OLD.name OR NEW.connect_timeout_ms <> OLD.connect_timeout_ms
+                 OR NEW.first_token_timeout_ms <> OLD.first_token_timeout_ms OR NEW.total_timeout_ms <> OLD.total_timeout_ms
+                 OR NEW.max_output_tokens <> OLD.max_output_tokens OR NEW.max_context_tokens <> OLD.max_context_tokens
+                 OR NEW.rpm <> OLD.rpm OR NEW.tpm <> OLD.tpm OR NEW.max_concurrency <> OLD.max_concurrency;
+  IF v_dest_changed THEN
+    IF OLD.status = 'active' THEN
+      PERFORM platform.fail('HK_PLT_AI_PROVIDER_FROZEN', 'the destination of an active provider is frozen; disable it first');
+    END IF;
+    IF NEW.status <> OLD.status THEN
+      PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', 'change the destination and the status in separate steps');
+    END IF;
+    NEW.status := 'draft'; NEW.disabled_reason := NULL; NEW.is_default := false;
+    NEW.last_probe_at := NULL; NEW.last_probe_ok := NULL; NEW.last_probe_error := NULL;
+    NEW.last_eval_run_id := NULL; NEW.capabilities := '{}'::jsonb;
+    NEW.version := OLD.version + 1;
+    RETURN NEW;                                -- بازگشت به draft خودش گذار است
+  END IF;
+  IF v_ops_changed THEN
+    NEW.version := OLD.version + 1;
+  END IF;
+  IF NEW.last_eval_run_id IS DISTINCT FROM OLD.last_eval_run_id AND NEW.last_eval_run_id IS NOT NULL THEN
+    SELECT * INTO e FROM platform.ai_eval_run WHERE id = NEW.last_eval_run_id;
+    IF e.provider_id <> NEW.id OR e.provider_version <> NEW.version THEN
+      PERFORM platform.fail('HK_PLT_AI_EVAL_MISMATCH', 'the eval run must belong to this provider version');
+    END IF;
+  END IF;
+  IF NEW.status = OLD.status THEN RETURN NEW; END IF;
+  IF OLD.status = 'draft' AND NEW.status = 'validated' THEN
+    SELECT * INTO e FROM platform.ai_eval_run WHERE id = NEW.last_eval_run_id;
+    IF NEW.last_probe_ok IS NOT TRUE OR e.id IS NULL OR NOT e.passed OR e.provider_version <> NEW.version
+       OR e.provider_id <> NEW.id THEN
+      PERFORM platform.fail('HK_PLT_AI_EVAL_REQUIRED', 'validation needs a successful probe and a passed eval of this version');
+    END IF;
+  ELSIF OLD.status = 'validated' AND NEW.status = 'draft' THEN
+    NULL;
+  ELSIF OLD.status IN ('validated','disabled') AND NEW.status = 'active' THEN
+    PERFORM platform.consume_approval(NEW.activation_approval_id, 'ai_provider.activate', 'ai_provider', NEW.id,
+                                      'ai_provider:' || NEW.id::text || ':v' || NEW.version::text);
+    NEW.disabled_reason := NULL;
+  ELSIF OLD.status = 'active' AND NEW.status = 'disabled' THEN
+    NULL;
+  ELSIF OLD.status IN ('draft','validated','disabled') AND NEW.status = 'retired' THEN
+    NULL;
+  ELSE
+    PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', format('AI provider %s -> %s', OLD.status, NEW.status));
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON platform.ai_provider;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON platform.ai_provider FOR EACH ROW EXECUTE FUNCTION platform.ai_provider_guard();
+
+-- هر تغییر ارائه‌دهندهٔ فعال یا پیش‌فرض در همان تراکنش بازسازی حالت مطلوب سلول‌ها را صف می‌کند
+CREATE OR REPLACE FUNCTION platform.ai_provider_apply() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.status = 'active' OR OLD.status = 'active' THEN
+    PERFORM platform.enqueue('control.cell_state.build', 'sync',
+                             jsonb_build_object('cause', 'ai_provider', 'provider_id', NEW.id, 'version', NEW.version),
+                             'ai_provider:' || NEW.id::text || ':' || NEW.row_version::text);
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_apply ON platform.ai_provider;
+CREATE TRIGGER trg_apply AFTER UPDATE ON platform.ai_provider FOR EACH ROW EXECUTE FUNCTION platform.ai_provider_apply();
+
+-- قیمت خرید توکن از ارائه‌دهنده (هزینهٔ تمام‌شده؛ نه قیمت فروش به مستأجر). قیمتِ رفته در حالت مطلوب = قیمت جاری
+CREATE TABLE IF NOT EXISTS platform.ai_provider_price (
+  provider_id      uuid NOT NULL REFERENCES platform.ai_provider(id),
+  valid_from       timestamptz NOT NULL,
+  valid_to         timestamptz,
+  unit             text NOT NULL DEFAULT 'IRR' CHECK (unit IN ('IRR','IRT','IRR_NEW')),
+  input_per_mtok   numeric(24,4) NOT NULL CHECK (input_per_mtok >= 0),
+  output_per_mtok  numeric(24,4) NOT NULL CHECK (output_per_mtok >= 0),
+  created_by       uuid REFERENCES platform.staff(id),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider_id, valid_from),
+  CHECK (valid_to IS NULL OR valid_to > valid_from),
+  CONSTRAINT ai_price_no_overlap EXCLUDE USING gist (provider_id WITH =, tstzrange(valid_from, valid_to) WITH &&)
+);
+
+-- قیمت تغییر نمی‌کند؛ فقط بستن آن از اکنون به بعد، یا حذف قیمتی که هنوز شروع نشده
+CREATE OR REPLACE FUNCTION platform.ai_price_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.valid_from <= now() THEN
+      PERFORM platform.fail('HK_PLT_IMMUTABLE', 'an effective AI price cannot be deleted');
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF (to_jsonb(NEW) - 'valid_to') <> (to_jsonb(OLD) - 'valid_to') THEN
+    PERFORM platform.fail('HK_PLT_IMMUTABLE_FIELD', 'AI prices change only by closing them');
+  END IF;
+  IF NEW.valid_to IS NULL OR NEW.valid_to < now() OR (OLD.valid_to IS NOT NULL AND NEW.valid_to > OLD.valid_to) THEN
+    PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', 'an AI price can only be closed from now on');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON platform.ai_provider_price;
+CREATE TRIGGER trg_guard BEFORE UPDATE OR DELETE ON platform.ai_provider_price FOR EACH ROW EXECUTE FUNCTION platform.ai_price_guard();
+
+CREATE OR REPLACE FUNCTION platform.ai_price_at(p_provider uuid, p_at timestamptz)
+RETURNS TABLE (unit text, input_per_mtok numeric, output_per_mtok numeric)
+LANGUAGE sql STABLE AS $$
+  SELECT p.unit, p.input_per_mtok, p.output_per_mtok FROM platform.ai_provider_price p
+   WHERE p.provider_id = p_provider AND p.valid_from <= p_at AND (p.valid_to IS NULL OR p.valid_to > p_at)
+$$;
+
+-- سیاست دستیار برای هر نسخهٔ پلن یا افزونه (همراه نسخهٔ محصول منجمد می‌شود)
+CREATE TABLE IF NOT EXISTS platform.ai_plan_policy (
+  product_version_id      uuid PRIMARY KEY REFERENCES platform.product_version(id),
+  features                text[] NOT NULL CHECK (cardinality(features) >= 1
+                            AND features <@ ARRAY['chat','proposals','migration_mapping','voice','ocr','insights']::text[]),
+  provider_id             uuid REFERENCES platform.ai_provider(id),        -- NULL = ارائه‌دهندهٔ پیش‌فرض
+  secondary_provider_ids  uuid[] NOT NULL DEFAULT '{}' CHECK (cardinality(secondary_provider_ids) <= 4),
+  tenant_monthly_tokens   bigint CHECK (tenant_monthly_tokens > 0),
+  tenant_monthly_cost     numeric(24,0) CHECK (tenant_monthly_cost > 0),
+  cost_unit               text NOT NULL DEFAULT 'IRR' CHECK (cost_unit IN ('IRR','IRT','IRR_NEW')),
+  user_monthly_tokens     bigint CHECK (user_monthly_tokens > 0),
+  max_concurrent_runs     smallint NOT NULL DEFAULT 3  CHECK (max_concurrent_runs BETWEEN 1 AND 100),
+  max_rounds              smallint NOT NULL DEFAULT 6  CHECK (max_rounds BETWEEN 1 AND 16),
+  max_tool_calls          smallint NOT NULL DEFAULT 12 CHECK (max_tool_calls BETWEEN 1 AND 32),
+  allow_tenant_provider   boolean NOT NULL DEFAULT false,
+  period_anchor           text NOT NULL DEFAULT 'jalali_month' CHECK (period_anchor IN ('jalali_month','billing_anchor')),
+  billing_anchor_day      smallint CHECK (billing_anchor_day BETWEEN 1 AND 28),
+  CHECK ((period_anchor = 'billing_anchor') = (billing_anchor_day IS NOT NULL)),
+  CHECK (user_monthly_tokens IS NULL OR tenant_monthly_tokens IS NULL OR user_monthly_tokens <= tenant_monthly_tokens),
+  CHECK (provider_id IS NULL OR NOT (provider_id = ANY (secondary_provider_ids)))
+);
+DROP TRIGGER IF EXISTS trg_frozen ON platform.ai_plan_policy;
+CREATE TRIGGER trg_frozen BEFORE INSERT OR UPDATE OR DELETE ON platform.ai_plan_policy FOR EACH ROW EXECUTE FUNCTION platform.product_child_guard();
+
+CREATE OR REPLACE FUNCTION platform.ai_plan_policy_shape() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_kind text;
+  v_missing int;
+BEGIN
+  SELECT p.kind INTO v_kind FROM platform.product_version pv JOIN platform.product p ON p.code = pv.product_code
+   WHERE pv.id = NEW.product_version_id;
+  IF v_kind NOT IN ('plan','addon') THEN
+    PERFORM platform.fail('HK_PLT_AI_POLICY_SHAPE', 'assistant policies belong to plans or addons');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM platform.product_entitlement e WHERE e.product_version_id = NEW.product_version_id
+                 AND e.feature_key = 'ai.assistant' AND e.enabled) THEN
+    PERFORM platform.fail('HK_PLT_AI_POLICY_SHAPE', 'the product version must grant the ai.assistant entitlement');
+  END IF;
+  SELECT count(*) INTO v_missing FROM unnest(NEW.secondary_provider_ids) s(id)
+   WHERE NOT EXISTS (SELECT 1 FROM platform.ai_provider p WHERE p.id = s.id AND p.status <> 'retired');
+  IF v_missing > 0 OR (SELECT count(DISTINCT x) FROM unnest(NEW.secondary_provider_ids) x) <> cardinality(NEW.secondary_provider_ids) THEN
+    PERFORM platform.fail('HK_PLT_AI_POLICY_SHAPE', 'secondary providers must be distinct, existing and not retired');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_shape ON platform.ai_plan_policy;
+CREATE TRIGGER trg_shape BEFORE INSERT OR UPDATE ON platform.ai_plan_policy FOR EACH ROW EXECUTE FUNCTION platform.ai_plan_policy_shape();
+
+-- استثنای دستیار برای یک مستأجر: خاموش‌کردن فوری است؛ روشن‌کردن یا افزایش سقف تأیید دونفره می‌خواهد
+CREATE TABLE IF NOT EXISTS platform.ai_tenant_override (
+  id                     uuid PRIMARY KEY DEFAULT uuidv7(),
+  tenant_id              uuid NOT NULL REFERENCES platform.tenant(id),
+  enabled                boolean,                                   -- false = قطع؛ NULL = بدون تغییر
+  kill_reason            text,
+  features               text[] CHECK (features <@ ARRAY['chat','proposals','migration_mapping','voice','ocr','insights']::text[]),
+  provider_id            uuid REFERENCES platform.ai_provider(id),
+  tenant_monthly_tokens  bigint CHECK (tenant_monthly_tokens > 0),
+  tenant_monthly_cost    numeric(24,0) CHECK (tenant_monthly_cost > 0),
+  user_monthly_tokens    bigint CHECK (user_monthly_tokens > 0),
+  max_concurrent_runs    smallint CHECK (max_concurrent_runs BETWEEN 1 AND 100),
+  allow_tenant_provider  boolean,
+  reason                 text NOT NULL CHECK (char_length(btrim(reason)) >= 10),
+  created_by             uuid NOT NULL REFERENCES platform.staff(id),
+  approval_id            uuid REFERENCES platform.approval_request(id),
+  valid_from             timestamptz NOT NULL DEFAULT now(),
+  expires_at             timestamptz,
+  revoked_at             timestamptz,
+  revoked_by             uuid REFERENCES platform.staff(id),
+  CONSTRAINT ai_override_kill_reason CHECK ((enabled IS FALSE) = (kill_reason IS NOT NULL)),
+  CONSTRAINT ai_override_not_empty CHECK (enabled IS NOT NULL OR features IS NOT NULL OR provider_id IS NOT NULL
+                                          OR tenant_monthly_tokens IS NOT NULL OR tenant_monthly_cost IS NOT NULL
+                                          OR user_monthly_tokens IS NOT NULL OR max_concurrent_runs IS NOT NULL
+                                          OR allow_tenant_provider IS NOT NULL),
+  CHECK ((revoked_at IS NULL) = (revoked_by IS NULL)),
+  CHECK (expires_at IS NULL OR expires_at > valid_from),
+  -- یک استثنای زنده برای هر مستأجر در هر لحظه (جایگزینی = لغو + ثبت تازه)
+  CONSTRAINT ai_override_one_live EXCLUDE USING gist (tenant_id WITH =, tstzrange(valid_from, expires_at) WITH &&)
+    WHERE (revoked_at IS NULL)
+);
+
+CREATE OR REPLACE FUNCTION platform.ai_tenant_override_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM platform.fail('HK_PLT_IMMUTABLE', 'AI overrides are revoked, never deleted');
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.created_by IS DISTINCT FROM platform.current_staff_id()
+       OR NOT platform.staff_has_permission(NEW.created_by, 'platform.ai.manage') THEN
+      PERFORM platform.fail('HK_PLT_PERMISSION', 'creator must be the acting staff member with platform.ai.manage');
+    END IF;
+    IF NEW.revoked_at IS NOT NULL THEN
+      PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', 'override cannot be created revoked');
+    END IF;
+    NEW.valid_from := now();
+    -- فقط «خاموش‌کردن خالص» بی‌تأیید است؛ هر چیز دیگری مصرف یا دسترسی را باز می‌کند
+    IF NOT (NEW.enabled IS FALSE AND NEW.features IS NULL AND NEW.provider_id IS NULL AND NEW.tenant_monthly_tokens IS NULL
+            AND NEW.tenant_monthly_cost IS NULL AND NEW.user_monthly_tokens IS NULL AND NEW.max_concurrent_runs IS NULL
+            AND NEW.allow_tenant_provider IS NULL) THEN
+      PERFORM platform.consume_approval(NEW.approval_id, 'ai.tenant_override', 'tenant', NEW.tenant_id,
+                                        'ai_tenant_override:' || NEW.id::text);
+    ELSIF NEW.approval_id IS NOT NULL THEN
+      PERFORM platform.fail('HK_PLT_APPROVAL_MISMATCH', 'a pure kill takes no approval');
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF (to_jsonb(NEW) - 'revoked_at' - 'revoked_by') <> (to_jsonb(OLD) - 'revoked_at' - 'revoked_by') OR OLD.revoked_at IS NOT NULL THEN
+    PERFORM platform.fail('HK_PLT_IMMUTABLE_FIELD', 'AI overrides change only by revocation');
+  END IF;
+  IF NEW.revoked_by IS DISTINCT FROM platform.current_staff_id() THEN
+    PERFORM platform.fail('HK_PLT_ACTOR_MISMATCH', 'revoked_by must be the acting staff member');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON platform.ai_tenant_override;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON platform.ai_tenant_override FOR EACH ROW EXECUTE FUNCTION platform.ai_tenant_override_guard();
+
+CREATE OR REPLACE FUNCTION platform.ai_tenant_override_apply() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM platform.enqueue('control.desired_state.build', 'sync',
+                           jsonb_build_object('tenant_id', NEW.tenant_id, 'cause', 'override', 'ai_override_id', NEW.id),
+                           'ai_override:' || NEW.id::text || ':' || CASE WHEN NEW.revoked_at IS NULL THEN 'set' ELSE 'revoked' END);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_apply ON platform.ai_tenant_override;
+CREATE TRIGGER trg_apply AFTER INSERT OR UPDATE ON platform.ai_tenant_override FOR EACH ROW EXECUTE FUNCTION platform.ai_tenant_override_apply();
+
+-- ---------- پیامک خط پلتفرم: حساب‌های سرویس‌دهنده و الگوها (پژوهش ۰۵ §۳-۶ و §۳-۷) ----------
+-- کلید الگو همان core.notification_template_def.sms_pattern_code صفحهٔ داده است (مثلاً hk-otp)؛ کد هر سرویس‌دهنده این‌جا نگاشت می‌شود
+CREATE TABLE IF NOT EXISTS platform.sms_provider_account (
+  id                     uuid PRIMARY KEY DEFAULT uuidv7(),
+  provider               text NOT NULL CHECK (provider IN ('kavenegar','melipayamak','smsir','ippanel','ghasedak','magfa','other')),
+  role                   text NOT NULL CHECK (role IN ('primary','fallback')),
+  priority               smallint NOT NULL DEFAULT 100,
+  sender_line            text NOT NULL CHECK (sender_line ~ '^\+?[0-9]{3,20}$'),
+  secret_ref             text NOT NULL CHECK (secret_ref ~ '^openbao://[A-Za-z0-9/_.-]+$'),
+  single_part_chars      smallint NOT NULL DEFAULT 70 CHECK (single_part_chars BETWEEN 60 AND 160),   -- UCS-2: ۷۰
+  multi_part_chars       smallint NOT NULL DEFAULT 67 CHECK (multi_part_chars BETWEEN 60 AND 153),    -- ۶۷ (یا ۶۶ با مرجع ۱۶ بیتی)
+  status                 text NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
+  reported_balance       numeric(24,0),
+  balance_reported_at    timestamptz,
+  low_balance_threshold  numeric(24,0) CHECK (low_balance_threshold >= 0),
+  created_at             timestamptz NOT NULL DEFAULT now(),
+  updated_at             timestamptz NOT NULL DEFAULT now(),
+  row_version            integer NOT NULL DEFAULT 1,
+  UNIQUE (provider, sender_line),
+  CHECK (multi_part_chars <= single_part_chars),
+  CHECK ((reported_balance IS NULL) = (balance_reported_at IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS sms_one_primary ON platform.sms_provider_account ((true)) WHERE role = 'primary' AND status = 'active';
+SELECT platform.add_touch('platform.sms_provider_account');
+
+CREATE TABLE IF NOT EXISTS platform.sms_template (
+  key         text PRIMARY KEY CHECK (key ~ '^hk-[a-z0-9-]{2,40}$'),
+  purpose     text NOT NULL CHECK (purpose IN ('otp','transactional','billing','marketing')),
+  body_fa     text NOT NULL CHECK (char_length(body_fa) BETWEEN 1 AND 1000),
+  variables   text[] NOT NULL DEFAULT '{}',
+  status      text NOT NULL DEFAULT 'active' CHECK (status IN ('active','retired')),
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- هر {متغیر} متن باید اعلام شده باشد و هر متغیر اعلام‌شده در متن بیاید (همان قاعدهٔ رندر core: فقط {var})
+CREATE OR REPLACE FUNCTION platform.sms_template_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_used text[];
+BEGIN
+  SELECT coalesce(array_agg(DISTINCT m[1]), '{}') INTO v_used FROM regexp_matches(NEW.body_fa, '\{([a-z][a-z0-9_]{0,30})\}', 'g') m;
+  IF NOT (v_used <@ NEW.variables AND NEW.variables <@ v_used) THEN
+    PERFORM platform.fail('HK_PLT_SMS_TEMPLATE_VARS', 'template variables must match the {placeholders} of the body');
+  END IF;
+  IF TG_OP = 'UPDATE' AND (NEW.key <> OLD.key OR NEW.purpose <> OLD.purpose) THEN
+    PERFORM platform.fail('HK_PLT_IMMUTABLE_FIELD', 'template key and purpose are immutable');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON platform.sms_template;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON platform.sms_template FOR EACH ROW EXECUTE FUNCTION platform.sms_template_guard();
+
+CREATE TABLE IF NOT EXISTS platform.sms_template_code (
+  template_key         text NOT NULL REFERENCES platform.sms_template(key),
+  provider_account_id  uuid NOT NULL REFERENCES platform.sms_provider_account(id),
+  provider_code        text NOT NULL CHECK (char_length(provider_code) BETWEEN 1 AND 64),   -- template / bodyId / TemplateId / pattern_code
+  approval_status      text NOT NULL DEFAULT 'pending' CHECK (approval_status IN ('pending','approved','rejected')),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (template_key, provider_account_id)
+);
 
 -- =====================================================================
 -- ۱۱. حساب صورتحساب، اشتراک، صورتحساب و سطر آن
@@ -2118,6 +2566,8 @@ CREATE TABLE IF NOT EXISTS platform.subscription (
   covered_through         date,                           -- مشتق: پایان آخرین دورهٔ فعال (فقط از تریگر دوره)
   cancel_at_period_end    boolean NOT NULL DEFAULT false,
   auto_renew_from_wallet  boolean NOT NULL DEFAULT false,
+  next_plan_version_id    uuid REFERENCES platform.product_version(id),  -- تنزل یا تغییر پلن از دورهٔ بعد (NULL = همان)
+  next_billing_period     text CHECK (next_billing_period IN ('P1M','P3M','P6M','P1Y','P2Y')),
   reseller_id             uuid REFERENCES platform.reseller(id),   -- انتساب (RLS نماینده و کمیسیون)
   started_at              timestamptz NOT NULL DEFAULT now(),
   cancelled_at            timestamptz,
@@ -2146,6 +2596,16 @@ BEGIN
       FROM platform.product_version pv JOIN platform.product p ON p.code = pv.product_code WHERE pv.id = NEW.plan_version_id;
     IF NOT coalesce(v_ok, false) THEN
       PERFORM platform.fail('HK_PLT_PLAN_NOT_AVAILABLE', 'subscription needs a published, currently available plan version');
+    END IF;
+  END IF;
+  -- پلن دورهٔ بعد: منتشرشده و در دسترس در آغاز دورهٔ بعد (یا امروز اگر هنوز پوششی نیست)
+  IF NEW.next_plan_version_id IS NOT NULL AND (TG_OP = 'INSERT' OR NEW.next_plan_version_id IS DISTINCT FROM OLD.next_plan_version_id) THEN
+    SELECT p.kind = 'plan' AND pv.status = 'published'
+           AND (pv.available_to IS NULL OR pv.available_to > coalesce(NEW.covered_through, current_date))
+      INTO v_ok
+      FROM platform.product_version pv JOIN platform.product p ON p.code = pv.product_code WHERE pv.id = NEW.next_plan_version_id;
+    IF NOT coalesce(v_ok, false) THEN
+      PERFORM platform.fail('HK_PLT_PLAN_NOT_AVAILABLE', 'next plan must be a published plan available at the next period');
     END IF;
   END IF;
   IF TG_OP = 'INSERT' THEN
@@ -5152,6 +5612,25 @@ SELECT i.id AS installation_id, i.tenant_id, i.app_version, l.id AS license_id, 
   JOIN platform.license l ON l.installation_id = i.id AND l.status = 'issued'
  WHERE i.status = 'active';
 
+-- الگوی فعال بدون کد تأییدشده نزد یک حساب فعال (داشبورد سلامت پیامک؛ خالی = failover آماده)
+CREATE OR REPLACE VIEW platform.v_sms_template_coverage WITH (security_invoker = true) AS
+SELECT t.key AS template_key, t.purpose, a.id AS provider_account_id, a.provider, a.role,
+       coalesce(c.approval_status, 'missing') AS approval_status
+  FROM platform.sms_template t
+ CROSS JOIN platform.sms_provider_account a
+  LEFT JOIN platform.sms_template_code c ON c.template_key = t.key AND c.provider_account_id = a.id
+ WHERE t.status = 'active' AND a.status = 'active' AND coalesce(c.approval_status, 'missing') <> 'approved';
+
+-- مصرف روزانهٔ دستیار هر مستأجر (داشبورد هزینه در برابر درآمد افزونه)
+CREATE OR REPLACE VIEW platform.v_ai_usage_daily WITH (security_invoker = true) AS
+SELECT u.day, u.tenant_id,
+       coalesce(sum(u.quantity) FILTER (WHERE u.metric = 'ai.tokens'), 0) AS tokens,
+       coalesce(sum(u.quantity) FILTER (WHERE u.metric = 'ai.cost'), 0)   AS cost_irr,
+       coalesce(sum(u.quantity) FILTER (WHERE u.metric = 'ai.runs'), 0)   AS runs
+  FROM platform.usage_daily u
+ WHERE u.metric IN ('ai.tokens','ai.cost','ai.runs')
+ GROUP BY u.day, u.tenant_id;
+
 -- =====================================================================
 -- ۲۴. نگهبان کنشگر ممیزی و مسیرهای نوشتن نقش‌های محدود
 -- =====================================================================
@@ -5295,7 +5774,9 @@ INSERT INTO platform.staff_permission (code, risk, description) VALUES
   ('platform.audit.read', 'normal', 'ممیزی پلتفرم'),
   ('platform.analytics.read', 'normal', 'تحلیل درآمد و مصرف'),
   ('platform.flag.manage', 'sensitive', 'پرچم ویژگی و kill switch'),
-  ('platform.ai.manage', 'sensitive', 'ارائه‌دهندهٔ مدل دستیار')
+  ('platform.ai.manage', 'sensitive', 'ارائه‌دهندهٔ مدل دستیار، سیاست و استثنای مستأجر'),
+  ('platform.ai.approve', 'critical', 'تأیید فعال‌سازی ارائه‌دهنده و استثنای بازکنندهٔ دستیار'),
+  ('platform.sms.manage', 'sensitive', 'حساب سرویس‌دهندهٔ پیامک و نگاشت الگو')
 ON CONFLICT (code) DO NOTHING;
 
 INSERT INTO platform.staff_role_permission (role_code, permission_code)
@@ -5351,7 +5832,9 @@ INSERT INTO platform.approval_action (code, subject_type, approver_permission, t
   ('license.revoke',             'license',               'platform.license.revoke.approve',            interval '24 hours', 'ابطال لایسنس'),
   ('impersonation.write',        'impersonation_request', 'platform.support.impersonate_write.approve', interval '30 minutes','ورود نوشتنی به‌جای کاربر'),
   ('announcement.sms_broadcast', 'announcement',          'platform.announcement.sms.approve',          interval '24 hours', 'پیامک انبوه'),
-  ('data_request.erasure',       'data_request',          'platform.data_request.approve',              interval '72 hours', 'حذف/بی‌نام‌سازی دادهٔ شخصی')
+  ('data_request.erasure',       'data_request',          'platform.data_request.approve',              interval '72 hours', 'حذف/بی‌نام‌سازی دادهٔ شخصی'),
+  ('ai_provider.activate',       'ai_provider',           'platform.ai.approve',                        interval '24 hours', 'فعال‌سازی ارائه‌دهندهٔ مدل دستیار'),
+  ('ai.tenant_override',         'tenant',                'platform.ai.approve',                        interval '24 hours', 'روشن‌کردن یا افزایش سقف دستیار برای مستأجر')
 ON CONFLICT (code) DO NOTHING;
 
 INSERT INTO platform.tenant_lifecycle_transition (from_status, to_status, actor_kinds, approval_action) VALUES
@@ -5420,7 +5903,16 @@ INSERT INTO platform.feature (key, kind, unit, enforcement, data_plane_key, desc
   ('meter.sms_parts',            'meter', 'parts',     'both',          'credit.sms_parts',     'بخش پیامک خط پلتفرم', '2026.11.0'),
   ('meter.inquiry_calls',        'meter', 'calls',     'both',          'credit.inquiry_calls', 'استعلام پولی', '2026.11.0'),
   ('meter.invoices_issued',      'meter', 'count',     'control_plane', NULL,                   'فاکتور صادره (مصرف)', '2026.11.0'),
-  ('meter.moadian_sent',         'meter', 'count',     'control_plane', NULL,                   'ارسال به مؤدیان', '2026.11.0')
+  ('meter.moadian_sent',         'meter', 'count',     'control_plane', NULL,                   'ارسال به مؤدیان', '2026.11.0'),
+  -- دستیار (C-AS-07): از رویداد assistant.run.metered؛ idempotent بر (tenant_id, event_id)
+  ('ai.tokens',                  'meter', 'tokens',    'both',          'ai.tokens',            'توکن مصرفی دستیار', '2026.11.0'),
+  ('ai.cost',                    'meter', 'irr',       'control_plane', NULL,                   'هزینهٔ تمام‌شدهٔ دستیار (ریال صحیح)', '2026.11.0'),
+  ('ai.runs',                    'meter', 'count',     'control_plane', NULL,                   'اجرای دستیار', '2026.11.0')
+ON CONFLICT (key) DO NOTHING;
+
+-- پرچم سراسری دستیار (ops_kill_switch؛ اهداف cell/plan/tenant). جدول feature_flag کاتالوگ کدی نیست؛ این فقط بذر اولیه است
+INSERT INTO platform.feature_flag (key, description, kind, default_on, rollout_percent, kill_switch)
+VALUES ('ff.ai.assistant', 'کلید قطع سراسری دستیار هوشمند (Q-F)', 'ops_kill_switch', true, 0, false)
 ON CONFLICT (key) DO NOTHING;
 
 -- =====================================================================
@@ -5447,20 +5939,21 @@ GRANT INSERT, UPDATE ON
   platform.impersonation_request, platform.announcement, platform.installation, platform.license, platform.license_activation,
   platform.rules_package, platform.rules_distribution, platform.industry_pack, platform.migration_dictionary_release,
   platform.migration_profile_release, platform.dependency_status, platform.data_request, platform.usage_daily,
-  platform.migration_dictionary_candidate
+  platform.migration_dictionary_candidate, platform.ai_tenant_override, platform.sms_provider_account, platform.sms_template,
+  platform.sms_template_code
 TO hk_platform_app;
 GRANT INSERT, UPDATE, DELETE ON
   platform.job, platform.idempotency_key, platform.reseller_territory, platform.commission_rule,
   platform.product_version, platform.price, platform.price_component, platform.product_entitlement,
   platform.feature_flag_target, platform.invoice, platform.invoice_line, platform.rules_value, platform.rules_golden_test,
-  platform.industry_pack_version
+  platform.industry_pack_version, platform.ai_provider_price, platform.ai_plan_policy
 TO hk_platform_app;
 GRANT INSERT ON
   platform.audit_log, platform.audit_checkpoint, platform.tenant_lifecycle_event, platform.routing_snapshot,
   platform.desired_state, platform.cell_state, platform.wallet_entry, platform.invoice_settlement, platform.payment_event,
   platform.credit_reservation, platform.trial_claim, platform.coupon_redemption, platform.commission_entry,
   platform.reseller_quota_entry, platform.license_revocation, platform.license_crl, platform.license_usage_report,
-  platform.rules_review, platform.rules_golden_ci_run, platform.ticket_message
+  platform.rules_review, platform.rules_golden_ci_run, platform.ticket_message, platform.ai_eval_run
 TO hk_platform_app;
 GRANT UPDATE ON platform.uplink_batch TO hk_platform_app;
 

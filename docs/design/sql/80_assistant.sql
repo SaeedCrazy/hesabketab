@@ -157,11 +157,11 @@ CREATE TABLE IF NOT EXISTS assistant.tool_permission (
   CHECK (requirement <> 'materialize' OR permission_code ~ '\.(create|send)$')
 );
 
--- پیشنهادهای آغاز گفت‌وگو (عمومی یا برای بستهٔ صنفی). FK به rules.industry_pack در §۱۲ سند.
+-- پیشنهادهای آغاز گفت‌وگو؛ فقط عمومی (مستقل از صنف). پیشنهادهای هر بستهٔ صنفی در بخش «assistant» مانیفست
+-- hkpack/1 همان بسته‌اند و در زمان پرسش ادغام می‌شوند (D-AS-25 سند)؛ پس این کاتالوگ FK به rules ندارد.
 CREATE TABLE IF NOT EXISTS assistant.prompt_suggestion (
   id              uuid PRIMARY KEY DEFAULT uuidv7(),
   code            text NOT NULL UNIQUE CHECK (code ~ '^[a-z][a-z0-9_.]{2,80}$'),
-  pack_code       text CHECK (pack_code ~ '^[a-z][a-z0-9_]{1,40}$'),
   page_context    text NOT NULL DEFAULT 'dock' CHECK (page_context ~ '^[a-z][a-z0-9_.]{1,60}$'),
   locale          text NOT NULL DEFAULT 'fa-IR' CHECK (locale IN ('fa-IR','en-US')),
   text            text NOT NULL CHECK (char_length(text) BETWEEN 4 AND 200),
@@ -989,6 +989,7 @@ CREATE TABLE IF NOT EXISTS assistant.message (
   role        text NOT NULL CHECK (role IN ('user','assistant')),
   content     text NOT NULL CHECK (char_length(content) BETWEEN 1 AND 8000 AND content = core.fa_normalize_text(content)),
   input_mode  text NOT NULL DEFAULT 'text' CHECK (input_mode IN ('text','suggestion','voice')),
+  suggestion_code text CHECK (suggestion_code ~ '^[a-z][a-z0-9_.]{2,102}$'),   -- عمومی یا «<pack>.<code>» صنفی؛ بدون FK (D-AS-25)
   finish      text CHECK (finish IN ('complete','interrupted','refused','error','cancelled','budget')),
   blocks      jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(blocks) = 'array' AND jsonb_array_length(blocks) <= 16),
   grounding   jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(grounding) = 'object'),
@@ -1003,6 +1004,7 @@ CREATE TABLE IF NOT EXISTS assistant.message (
   CHECK ((role = 'assistant') = (finish IS NOT NULL)),
   CHECK (role = 'assistant' OR char_length(content) <= 2000),
   CHECK (role = 'user' OR input_mode = 'text'),
+  CHECK ((input_mode = 'suggestion') = (suggestion_code IS NOT NULL)),
   CHECK (role = 'assistant' OR (blocks = '[]'::jsonb AND grounding = '{}'::jsonb))
 );
 SELECT core.enable_tenant_rls('assistant.message');
@@ -1513,17 +1515,17 @@ INSERT INTO assistant.tool_permission (tool_code, permission_code, requirement) 
   ('parties.propose_party',             'parties.party.create',     'materialize')
 ON CONFLICT DO NOTHING;
 
-INSERT INTO assistant.prompt_suggestion (code, pack_code, page_context, text, required_tools, sort_order) VALUES
-  ('general.sales_today',    NULL, 'dock', 'فروش امروز چطور بود؟',                       '{sales.summary}',              10),
-  ('general.top_items_week', NULL, 'dock', 'پرفروش‌ترین کالاهای این هفته کدام‌اند؟',      '{sales.top_items}',            20),
-  ('general.cash_position',  NULL, 'dock', 'الان چقدر پول نقد و در بانک داریم؟',           '{treasury.cash_position}',     30),
-  ('general.receivables',    NULL, 'dock', 'چه کسانی بیشترین بدهی را به ما دارند؟',        '{treasury.receivables_aging}', 40),
-  ('general.cheques_week',   NULL, 'dock', 'چک‌های سررسید این هفته را نشان بده',           '{treasury.cheques_due}',       50),
-  ('general.low_stock',      NULL, 'dock', 'چه کالاهایی رو به اتمام است؟',                '{inventory.low_stock}',        60),
-  ('general.pnl_month',      NULL, 'dock', 'سود و زیان این ماه چقدر است؟',                '{ledger.profit_and_loss}',     70),
-  ('general.vat_position',   NULL, 'dock', 'وضعیت مالیات بر ارزش افزوده این فصل چیست؟',   '{tax.vat_position}',           80),
-  ('cheques.due_page',       NULL, 'treasury.cheques', 'کدام چک‌ها در هفتهٔ آینده سررسید می‌شوند؟', '{treasury.cheques_due}', 10),
-  ('purchase.reorder',       NULL, 'inventory.stock', 'برای کالاهای رو به اتمام پیش‌نویس سفارش خرید پیشنهاد بده', '{inventory.low_stock,purchase.propose_order}', 10)
+INSERT INTO assistant.prompt_suggestion (code, page_context, text, required_tools, sort_order) VALUES
+  ('general.sales_today',    'dock', 'فروش امروز چطور بود؟',                       '{sales.summary}',              10),
+  ('general.top_items_week', 'dock', 'پرفروش‌ترین کالاهای این هفته کدام‌اند؟',      '{sales.top_items}',            20),
+  ('general.cash_position',  'dock', 'الان چقدر پول نقد و در بانک داریم؟',           '{treasury.cash_position}',     30),
+  ('general.receivables',    'dock', 'چه کسانی بیشترین بدهی را به ما دارند؟',        '{treasury.receivables_aging}', 40),
+  ('general.cheques_week',   'dock', 'چک‌های سررسید این هفته را نشان بده',           '{treasury.cheques_due}',       50),
+  ('general.low_stock',      'dock', 'چه کالاهایی رو به اتمام است؟',                '{inventory.low_stock}',        60),
+  ('general.pnl_month',      'dock', 'سود و زیان این ماه چقدر است؟',                '{ledger.profit_and_loss}',     70),
+  ('general.vat_position',   'dock', 'وضعیت مالیات بر ارزش افزوده این فصل چیست؟',   '{tax.vat_position}',           80),
+  ('cheques.due_page',       'treasury.cheques', 'کدام چک‌ها در هفتهٔ آینده سررسید می‌شوند؟', '{treasury.cheques_due}', 10),
+  ('purchase.reorder',       'inventory.stock', 'برای کالاهای رو به اتمام پیش‌نویس سفارش خرید پیشنهاد بده', '{inventory.low_stock,purchase.propose_order}', 10)
 ON CONFLICT (code) DO NOTHING;
 
 -- ---------- کاتالوگ‌های هسته (هر ماژول کاتالوگ خودش را اضافه می‌کند) ----------
@@ -1617,7 +1619,7 @@ GRANT SELECT (tenant_id, id, status, purposes, data_classes, provider_fingerprin
   ON assistant.consent TO hk_readonly;
 GRANT SELECT (tenant_id, id, user_id, company_id, status, page_context, message_count, last_activity_at, created_at, updated_at, row_version)
   ON assistant.thread TO hk_readonly;
-GRANT SELECT (tenant_id, id, thread_id, user_id, run_id, seq, role, input_mode, finish, created_at) ON assistant.message TO hk_readonly;
+GRANT SELECT (tenant_id, id, thread_id, user_id, run_id, seq, role, input_mode, suggestion_code, finish, created_at) ON assistant.message TO hk_readonly;
 GRANT SELECT (tenant_id, id, run_id, llm_call_id, thread_id, user_id, seq, tool_code, tool_version, status, args_sha256, result_bytes,
               result_rows, truncated, pseudonymized, permissions_checked, denied_permission, error_code, latency_ms, created_at)
   ON assistant.tool_call TO hk_readonly;

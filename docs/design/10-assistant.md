@@ -20,7 +20,7 @@
 6. **استقلال کامل حسابداری.** هیچ ماژولی `assistant` را import نمی‌کند. کل مجموعهٔ آزمون با دستیار خاموش و با ارائه‌دهندهٔ قطع باید سبز بماند (INV-AST-23).
 7. **تنها فراخوانی بیرونی مجاز.** فراخوانی مدل از `OutboundHttpClient` و allowlist سلول می‌گذرد. نشانی ارائه‌دهنده را صاحب پلتفرم تعیین می‌کند، یا در On-prem مدیر خود مشتری.
 
-اندازه: ۱۷ جدول (۶ کاتالوگ سراسری و ۱۱ جدول مستأجری)، ۳ ویو `security_invoker`، ۲۸ تابع، ۳۲ تریگر، ۳۱ policy، و ۳۲ ناوردا (INV-AST-01..32). آزمون پایگاه داده ۲۲ گروه و حدود ۲۷۰ assert دارد. آزمون جهش روی همهٔ ۱۰۳ محل `raise_hk` اجرا شد: بی‌اثر کردن هر کدام آزمون را شکست می‌دهد (۱۰۳ از ۱۰۳، §۹-۱).
+اندازه: ۱۷ جدول (۶ کاتالوگ سراسری و ۱۱ جدول مستأجری)، ۳ ویو `security_invoker`، ۲۸ تابع، ۳۲ تریگر، ۳۱ policy، و ۳۳ ناوردا (INV-AST-01..33). آزمون پایگاه داده ۲۲ گروه و ۲۷۶ assert دارد. آزمون جهش روی همهٔ ۱۰۳ محل `raise_hk` اجرا شد: بی‌اثر کردن هر کدام آزمون را شکست می‌دهد (۱۰۳ از ۱۰۳، §۹-۱).
 
 ---
 
@@ -156,7 +156,7 @@
 - **تصمیم:**
   - **فراخوانی مدل:** هر ابزار، از جمله ابزارهای پیشنهاد، در `UnitOfWork(mode=TxMode.READ)` یا `REPORT` با `app.actor_via='assistant'` اجرا می‌شود. ابزار پیشنهاد فقط `validate` یا dry-run ماژول مقصد را صدا می‌زند.
   - ثبت `tool_call`، `proposal` و ممیزی در یک UoW نوشتنی جدا انجام می‌شود که `actor_via='direct'` دارد و کنشگرش همان کاربر است. این تراکنش فقط در اسکیمای `assistant` و `core.audit_log` می‌نویسد.
-  - **تحقق:** فقط از `POST /assistant/proposals/{id}/materialize` و فقط با نشست همان کاربرِ پرسنده. UoW این درخواست `actor_via='assistant_confirm'` دارد و principal آن نیابتی با سقف مجوزهای `materialize` همان ابزار است. ماژول مقصد پیش‌نویس را با `created_via='assistant'` می‌سازد (ledger) یا `origin='assistant'` (treasury و purchase). همان تراکنش پیشنهاد را `materialized` می‌کند (اتمی).
+  - **تحقق:** فقط از `POST /assistant/proposals/{id}/materialize` و فقط با نشست همان کاربرِ پرسنده. UoW این درخواست `actor_via='assistant_confirm'` دارد و principal آن نیابتی با سقف مجوزهای `materialize` همان ابزار است. ماژول مقصد پیش‌نویس را با `created_via='assistant'` می‌سازد (ledger) یا `origin='assistant'` (treasury؛ و purchase پس از C-AS-12). همان تراکنش پیشنهاد را `materialized` می‌کند (اتمی).
   - **ثبت یا ارسال:** فقط در صفحهٔ ماژول مقصد و با UoW عادی (`direct`) انجام می‌شود. ماژول‌ها principal نیابتی را در مسیرهای ثبت رد می‌کنند (۰۳ §۵-۱۸، ۰۵ §۵-۱۷، ۰۶ INV-SEC-05).
   - **دفاع پایگاه داده‌ای پیشنهادی (C-AS-02):** `core.forbid_actor_via()` روی جدول‌های ثبت هر ماژول، مثل `ledger.journal_line`، درج را در تراکنش `assistant` یا `assistant_confirm` رد می‌کند. سازوکار در T21 روی `ledger.journal_line` واقعی نشان داده شده است.
 - **دلیل:** حتی اگر مدل کاملاً فریب بخورد (prompt injection در نام کالا)، بیشترین اثر ممکن یک «کارت پیشنهاد» در گفت‌وگوی خود کاربر است. هیچ پیش‌نویسی ساخته نمی‌شود، هیچ شماره‌ای مصرف نمی‌شود و هیچ پیامکی نمی‌رود.
@@ -314,11 +314,12 @@
 
   تغییرها:
   - برچسب «مهر و ثبت» به «ساخت پیش‌نویس» یا «ارسال پیامک» تغییر می‌کند و مهر «ثبت شد» حذف می‌شود.
-  - تاریخچه در سرور است.
+  - **تاریخچه در سرور است.** `stores/agent.js` در ONE CAFE ده پیام آخر را از مرورگر همراه هر پرسش می‌فرستاد (`slice(-10)`). این‌جا کلاینت فقط متن پرسش تازه را می‌فرستد و سرور همان ده پیام آخر رشته را از پایگاه داده می‌سازد (INV-AST-26).
   - stream واقعی متن جای TypeText ساختگی را می‌گیرد.
   - ARIA (`role="log"`، `aria-live="polite"`)، تلهٔ فوکوس و کنتراست AA.
   - دستیار در حالت آفلاین (`navigator.onLine=false` یا نبود heartbeat سرور) و وقتی `status.available=false` پنهان است.
-  - **ورودی صوتی Web Speech API مرورگر ممنوع است**، چون Chrome صدا را به سرورهای Google می‌فرستد و این فراخوانی خارجی است. v2 از STT خودمیزبان استفاده می‌کند (D-AS-23).
+  - **صدا در v1 نیست.** `AgentDock.vue` در ONE CAFE ضبط میکروفون با رونویسی سمت سرور، و کلید «پاسخ صوتی» با انتخاب صدا (`marin`، `cedar`، `nova`، `coral`؛ نام صداهای یک سرویس TTS بیرونی) داشت. نسخهٔ دمو به `speechSynthesis` مرورگر برمی‌گشت. در v1 هر دو حذف می‌شوند. در v2 ضبط فقط به STT خودمیزبان می‌رود و خواندن پاسخ فقط با صدای فارسی محلی مرورگر (`localService=true`) انجام می‌شود (D-AS-23).
+  - **ورودی صوتی Web Speech API مرورگر (`SpeechRecognition`) ممنوع است**، چون Chrome صدا را به سرورهای Google می‌فرستد و این فراخوانی خارجی است.
 - **مرجع:** بخش ۰۱ §۵-۲۳-۱۱ (کنار گذاشتن AgentDock «مگر Q-F»)
 
 ### D-AS-22 — On-prem: خاموش به‌طور پیش‌فرض؛ ارائه‌دهندهٔ خود مشتری؛ رلهٔ پلتفرم در v2
@@ -348,6 +349,21 @@
   خروجی `capabilities` است: `tools`، `parallel_tool_calls`، `stream_usage`، `max_context_tokens` و `persian_ok`. فعال‌سازی ارائه‌دهندهٔ مستأجر بدون probe موفق ممکن نیست (CHECK). در پروفایل پلتفرم، پنل مالک همین را می‌خواهد.
   - اگر `stream_usage=false` باشد، مصرف با تخمین نویسه‌ای (`ceil(chars/2.6)` برای فارسی و `chars/4` برای ASCII) و `usage_estimated=true` ثبت می‌شود.
   - مدل بدون `tools` در v1 پذیرفته نمی‌شود. پروتکل جایگزین JSON در v2 است.
+
+### D-AS-25 — پیشنهادهای آغاز: عمومی در کاتالوگ دستیار، صنفی در مانیفست بستهٔ صنفی
+- **تصمیم:**
+  - پیشنهادهای عمومی (مستقل از صنف) در کاتالوگ سراسری `assistant.prompt_suggestion` هستند و با migration همین ماژول منتشر می‌شوند. تریگر `prompt_suggestion_guard` وجود ابزارها را و CHECK نرمال بودن متن را اجبار می‌کند.
+  - پیشنهادهای هر بستهٔ صنفی بخشی از **مانیفست همان بسته** هستند: بخش اختیاری `assistant` با کلید `suggestions` در `hkpack/1` (C-AS-19). این بخش «فقط‌خواندنی» است: هیچ ردیف مستأجری نمی‌سازد، `plan()` آن تغییری برنمی‌گرداند و فقط اعتبارسنج دارد (§۵-۱۷).
+  - `SuggestionQuery.for_user(...)` در زمان درخواست دو منبع را ادغام می‌کند: ردیف‌های عمومی، و بخش `assistant` مانیفستِ نسخهٔ نصب‌شدهٔ هر بستهٔ فعال شرکت (`rules.PackQuery.active_packs` و `manifest_section`). نتیجه در حافظهٔ فرایند بر کلید `(pack, version)` cache می‌شود.
+  - فیلتر هر دو منبع یکی است (INV-AST-33): `page_context` برابر صفحهٔ جاری یا `dock`؛ همهٔ `required_tools` در `avail.tools` همین کاربر؛ متن پس از `sanitize` و `fa-norm-v1` بدون تغییر (وگرنه حذف و ثبت هشدار). حداکثر ۶ پیشنهاد برمی‌گردد: اول پیشنهادهای صنفی، سپس عمومی، و در هر گروه به ترتیب `sort_order`.
+- **دلیل:**
+  - بخش ۰۵ بسته را «فقط داده»، نسخه‌دار، امضاشده و بازبینی‌شده تعریف کرده است و صنف‌های تازه (Q-A) به‌شکل بسته می‌آیند. پیشنهاد صنفی محتوای همان بسته است و باید با همان نسخه و امضا منتشر شود، نه با migration دستیار.
+  - `rules.industry_pack` در زمان اجرا با انتشار پنل مالک پر می‌شود (بخش ۰۷). FK از کاتالوگی که با migration می‌آید به آن، ترتیب انتشار را می‌شکند: روی سلول تازه، ردیف بسته هنوز وجود ندارد.
+- **ردشده:**
+  - ستون `pack_code` در `assistant.prompt_suggestion` با FK به `rules.industry_pack` (طرح پیشین همین بخش؛ به دلیل بالا کنار رفت).
+  - applier مستأجری که پیشنهادها را در جدول مستأجری کپی کند: داده برای هر مستأجر تکرار می‌شود، و سازوکار «مصنوع ویرایش‌شده» بی‌فایده است چون کاربر پیشنهاد را ویرایش نمی‌کند.
+  - ساختن پیشنهاد با مدل: پیش از هر پرسش هزینه دارد و داده می‌فرستد.
+- **مرجع:** بخش ۰۵ D-C24 و §۵-۱۱ (قالب `hkpack/1` و `rules.PackQuery.manifest`)؛ بخش ۰۷ §۴-۲ و §۴-۳ (`rules.industry_pack`، `rules.tenant_pack`)
 
 ---
 
@@ -401,7 +417,7 @@ erDiagram
 | `proposal_kind` | نوع پیشنهاد، ماژول مقصد، شیوهٔ تحقق، `ttl` (۱ ساعت تا ۳۰ روز) و فاز |
 | `tool` | ابزار: کد `<module>.<name>`، نسخه، نوع (`query`، `proposal`، `utility`)، `service_ref` (مسیر پایتون)، رده‌های اجباری و اختیاری داده، نوع پیشنهاد، `max_result_bytes` (۲۵۶ تا ۶۵۵۳۶)، `max_rows` (۰ تا ۱۰۰)، فاز. CHECKها: پیشنهاد ⇔ `proposal_kind`؛ ابزار کمکی بی‌رده و در ماژول `assistant`؛ پیشوند کد = ماژول. تریگر `tool_guard`: ردهٔ ناشناخته یا ممنوع، هم‌پوشانی اجباری و اختیاری، ماژول مقصد پیشنهاد، تغییرناپذیری نوع و ماژول، کاهش نسخه |
 | `tool_permission` | مجوز ابزار با `requirement` (`read`، `read_optional`، `materialize`). CHECK فعل (`.read`؛ `materialize` فقط `.create` یا `.send`). تریگر `tool_permission_guard`: مجوز critical ممنوع، ابزار کمکی بی‌مجوز، materialize فقط برای پیشنهاد. **بدون FK** به `core.permission`، چون مجوز ماژول‌های دیگر با همگام‌سازی کاتالوگ می‌آید. `catalog_lint()` نبودش را گزارش می‌کند و در زمان اجرا مجوزِ غایب یعنی ابزار در دسترس نیست |
-| `prompt_suggestion` | پیشنهاد آغاز: کد، بستهٔ صنفی (NULL = عمومی؛ FK در §۱۲)، `page_context` (مثل `dock`، `treasury.cheques`)، متن نرمال (CHECK)، ابزارهای لازم (تریگر: باید موجود باشند)، ترتیب. هر پیشنهاد فقط وقتی نشان داده می‌شود که همهٔ ابزارهایش برای کاربر در دسترس باشند |
+| `prompt_suggestion` | پیشنهاد آغاز **عمومی** (مستقل از صنف): کد، `page_context` (مثل `dock`، `treasury.cheques`)، زبان، متن نرمال (CHECK)، ابزارهای لازم (۱ تا ۴؛ تریگر: باید موجود باشند)، ترتیب، `active`. پیشنهادهای صنفی در این جدول نیستند و از مانیفست بسته می‌آیند (D-AS-25). هر پیشنهاد فقط وقتی نشان داده می‌شود که همهٔ ابزارهایش برای کاربر در دسترس باشند (INV-AST-33). `catalog_lint` پیشنهادی را که ابزار منسوخ دارد گزارش می‌کند |
 
 ابزارهای v1 (۱۹ ابزار؛ جزئیات خروجی در §۵-۶):
 
@@ -438,7 +454,7 @@ erDiagram
 | `thread` | تغییرپذیر؛ محتوا | رشتهٔ گفت‌وگو: صاحب، شرکت، عنوان نرمال، وضعیت (`active`، `archived`)، `page_context`، `message_count`، `last_activity_at`. تریگر: صاحب، شرکت و زمان ایجاد ثابت‌اند. شمارنده فقط از تریگر پیام و فقط یکی‌یکی بالا می‌رود. `row_version` فقط با تغییر عنوان یا وضعیت بالا می‌رود، پس پیام تازه If-Match تغییر عنوان را بی‌اعتبار نمی‌کند. policy «فقط صاحب» |
 | `run` | ماشین حالت؛ سنجش | اجرا: کاربر، شرکت، هدف، وضعیت (`running`، `completed`، `failed`، `cancelled`، `blocked`)، رضایت، منبع و پروفایل ارائه‌دهنده و اثرانگشت، مدل، نسخهٔ سیاست، نسخه و hash پرامپت، hash فهرست ابزارهای ارائه‌شده (`toolset_sha256`)، دو ردیف مصرف، lease، درخواست لغو، خطا. تریگر `run_guard` (§۵-۹) همهٔ پیش‌شرط‌های درج را اجبار می‌کند: سیاست، ویژگی، نسخه، رضایت، مقصد، منبع ارائه‌دهنده، ردیف‌های مصرف امروز، سقف هم‌زمانی و نبودِ ورود به‌جای کاربر. ایندکس «یک اجرای در جریان برای هر کاربر». حذف فقط ۴۰۰ روز پس از پایان |
 | `llm_call` | ماشین حالت؛ سنجش | دور: `round_no` (۱ تا ۱۶؛ سقف سیاست در تریگر)، رزرو توکن، مصرف واقعی، `usage_estimated`، snapshot قیمت، `reserved_cost` و `charged_cost` تولیدی، `finish_reason`، `http_status`، خطا و تأخیرها. تریگر `llm_call_guard`: اجرای در جریان و لغونشده، هم‌خوانی با اجرا، کلید قطع و رضایت در لحظهٔ هر دور، بودجه زیر قفل؛ گذارها (رهاسازی فقط پس از lease با برداشت کامل رزرو)؛ تغییرناپذیری رزرو و قیمت |
-| `message` | فقط‌افزودنی؛ محتوا | پیام کاربر (حداکثر ۲۰۰۰ نویسه) یا دستیار (حداکثر ۸۰۰۰، با `finish`، `blocks` و `grounding`). متن نرمال (CHECK: نویسهٔ bidi و zero-width ممنوع). `seq` از شمارندهٔ رشته (تریگر). یکتا: `(thread, seq)` و `(run, role)`، یعنی هر اجرا یک پرسش و یک پاسخ دارد. اجرا باید در جریان و مال همان رشته باشد |
+| `message` | فقط‌افزودنی؛ محتوا | پیام کاربر (حداکثر ۲۰۰۰ نویسه) یا دستیار (حداکثر ۸۰۰۰، با `finish`، `blocks` و `grounding`). متن نرمال (CHECK: نویسهٔ bidi و zero-width ممنوع). `input_mode` (`text`، `suggestion`، `voice`) و `suggestion_code` (کد پیشنهاد عمومی یا صنفی، بدون FK؛ CHECK: فقط و حتماً وقتی `input_mode='suggestion'`) برای سنجش استفاده از پیشنهادها. `seq` از شمارندهٔ رشته (تریگر). یکتا: `(thread, seq)` و `(run, role)`، یعنی هر اجرا یک پرسش و یک پاسخ دارد. اجرا باید در جریان و مال همان رشته باشد |
 | `tool_call` | فقط‌افزودنی؛ محتوا | فراخوانی ابزار: `seq` (سقف سیاست)، شناسهٔ فراخوانی ارائه‌دهنده، ابزار و نسخهٔ کاتالوگ، وضعیت (`ok`، `denied`، `invalid_args`، `not_available`، `error`، `timeout`)، `args` (حداکثر ۸ KiB) با `args_sha256` تولیدی، `result` با `result_bytes` تولیدی، ردیف‌ها، `truncated`، تعداد نام مستعار، `permissions_checked`، `denied_permission`، تأخیر. تریگر: اجرای در جریان، پاسخ مدلِ کامل با `finish_reason='tool_calls'` از همان اجرا، ابزار موجود و غیرمنسوخ، مجوزها ⊆ سقف خواندنی همان ابزار، سقف بایت و ردیف |
 | `proposal` | ماشین حالت؛ محتوا | پیشنهاد (D-AS-09): `tool_call` یکتا، نوع، شرکت، عنوان، `payload` (حداکثر ۳۲ KiB) با `payload_sha256` تولیدی، `validation`، `valid`، وضعیت، `expires_at` (از `ttl` نوع، تریگر)، تصمیم، هدف. تریگر `proposal_guard` (§۵-۸) |
 | `feedback` | تغییرپذیر؛ محتوا | امتیاز ۱ یا ‎-۱، دلیل (فقط برای منفی، CHECK) و نظر نرمال حداکثر ۵۰۰ نویسه. فقط روی پیام دستیار، و یکی برای هر پیام و کاربر |
@@ -1069,7 +1085,79 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
   - `ProposalCard` با پیش‌نمایش سطرها، نشان اعتبارسنجی، دکمهٔ «ساخت پیش‌نویس» یا «ارسال پیامک» یا «باز کردن فرم»، دکمهٔ «رد» و زمان انقضا.
   - `LinkBlock` با پیوند «مشاهدهٔ گزارش کامل».
   - همه از `packages/ui` و `formatAmount` استفاده می‌کنند و هیچ حساب `number` روی مبلغ ندارند (INV-FE-02).
-- **پیشنهادهای آغاز:** `GET /assistant/suggestions?page=<route.meta.assistantContext>` بر اساس صفحهٔ جاری و بسته‌های صنفی فعال پاسخ می‌دهد و فقط پیشنهادهایی را برمی‌گرداند که همهٔ ابزارهایشان در دسترس‌اند.
+- **پیشنهادهای آغاز:** `GET /assistant/suggestions?page=<route.meta.assistantContext>` بر اساس صفحهٔ جاری و بسته‌های صنفی فعال پاسخ می‌دهد و فقط پیشنهادهایی را برمی‌گرداند که همهٔ ابزارهایشان در دسترس‌اند (D-AS-25). جزئیات در ادامه.
+
+**پیشنهادهای آغاز بستهٔ صنفی (D-AS-25):**
+
+```python
+class PackSuggestion(BaseModel, extra="forbid", strict=True, frozen=True):
+    code: str = Field(pattern=r"^[a-z][a-z0-9_]{1,40}\.[a-z0-9_]{2,60}$")   # پیشوند = کد همان بسته
+    page_context: str = Field("dock", pattern=r"^[a-z][a-z0-9_.]{1,60}$")
+    locale: Literal["fa-IR", "en-US"] = "fa-IR"
+    text: str = Field(min_length=4, max_length=200)          # باید = fa_normalize_text(sanitize(text))
+    required_tools: tuple[str, ...] = Field(min_length=1, max_length=4)
+    sort_order: int = Field(100, ge=0, le=32767)
+
+class AssistantPackSection(BaseModel, extra="forbid", strict=True, frozen=True):   # بخش «assistant» در hkpack/1
+    suggestions: tuple[PackSuggestion, ...] = Field(default=(), max_length=12)
+
+class AssistantPackSectionValidator:            # ثبت در PackSectionRegistry بخش ۰۵؛ Applier ندارد
+    section: ClassVar[str] = "assistant"
+    def validate(self, manifest: PackManifest, section: AssistantPackSection) -> list[PackIssue]:
+        """کد با «<manifest.pack>.» شروع شود؛ کدها در بسته یکتا باشند؛ متن = fa_normalize_text(sanitize(متن))؛
+        هر ابزار در ToolRegistry نسخهٔ min_app_version بسته موجود و غیرمنسوخ باشد. هر مورد ناقض ⇒ PackIssue(error)
+        و انتشار بسته رد می‌شود. در دسترس بودن ابزار برای کاربر را این‌جا نمی‌سنجد؛ آن کار SuggestionQuery است."""
+
+@dataclass(frozen=True, slots=True)
+class SuggestionOut:
+    code: str; pack: str | None; page_context: str; text: str; tools: tuple[str, ...]
+
+class SuggestionQuery:
+    async def for_user(self, uow: UnitOfWork, ctx: RequestContext, avail: Availability,
+                       company_id: UUID, page: str, limit: int = 6) -> list[SuggestionOut]: ...
+```
+
+الگوریتم `for_user`:
+```
+packs   ← rules.PackQuery.active_packs(tenant, company_id)          # tenant_pack.status='active' (سطح شرکت یا مستأجر)
+pack_sg ← ⋃ AssistantPackSection(rules.PackQuery.manifest_section(p.code, p.installed_version, "assistant")).suggestions
+          (cache درون‌فرایندی بر (pack, version)؛ مانیفست امضاشده و تغییرناپذیر است)
+general ← SELECT … FROM assistant.prompt_suggestion WHERE active AND locale = ctx.locale
+offered ← {t.code for t in avail.tools}
+keep(s) ⇔ s.page_context ∈ {page, "dock"} ∧ set(s.required_tools) ⊆ offered ∧ s.text == fa_normalize_text(sanitize(s.text))
+return (sorted(filter(keep, pack_sg), by sort_order) ++ sorted(filter(keep, general), by sort_order))[:limit]
+```
+پیشنهادی که شرط متن را نگذراند حذف و با `assistant.suggestion.rejected` (سطح warning) لاگ می‌شود. با کلیک کاربر، متن پیشنهاد به‌شکل پیام کاربر با `input_mode='suggestion'` و `suggestion_code` فرستاده می‌شود. پس مسیر و کنترل‌ها همان مسیر پرسش عادی است.
+
+محتوای بخش `assistant` چهار بستهٔ v1. بستهٔ `general` بخش `assistant` ندارد، چون پیشنهادهای عمومی برای همه نمایش داده می‌شوند:
+
+| بسته | کد | صفحه | متن | ابزارها |
+|---|---|---|---|---|
+| `cafe` | `cafe.sales_vs_yesterday` | `dock` | فروش امروز را با دیروز مقایسه کن | `sales.summary`، `assistant.calculate` |
+| `cafe` | `cafe.top_menu_items` | `dock` | پرفروش‌ترین آیتم‌های منو در این هفته کدام‌اند؟ | `sales.top_items` |
+| `cafe` | `cafe.raw_low` | `dock` | کدام مواد اولیه رو به اتمام است؟ | `inventory.low_stock` |
+| `cafe` | `cafe.reorder_raw` | `inventory.stock` | برای مواد اولیهٔ رو به اتمام پیش‌نویس سفارش خرید پیشنهاد بده | `inventory.low_stock`، `purchase.propose_order` |
+| `cafe` | `cafe.payroll_month` | `dock` | هزینهٔ حقوق این ماه چقدر شد؟ | `payroll.cost_summary` |
+| `retail_apparel` | `retail_apparel.top_models_month` | `dock` | پرفروش‌ترین مدل‌های این ماه کدام‌اند؟ | `sales.top_items` |
+| `retail_apparel` | `retail_apparel.low_variants` | `dock` | کدام سایزها و رنگ‌ها رو به اتمام است؟ | `inventory.low_stock` |
+| `retail_apparel` | `retail_apparel.supplier_cheques` | `treasury.cheques` | چک‌های پرداختی به تأمین‌کننده‌ها در این ماه کدام‌اند؟ | `treasury.cheques_due` |
+| `retail_apparel` | `retail_apparel.season_pnl` | `dock` | سود و زیان این فصل چقدر است؟ | `ledger.profit_and_loss` |
+| `retail_electrical` | `retail_electrical.dealer_debts` | `dock` | بدهی همکاران و خریداران عمده چقدر است؟ | `treasury.receivables_aging` |
+| `retail_electrical` | `retail_electrical.cheques_in_week` | `treasury.cheques` | چک‌های دریافتی سررسید این هفته کدام‌اند؟ | `treasury.cheques_due` |
+| `retail_electrical` | `retail_electrical.below_reorder` | `dock` | کدام کالاها زیر نقطهٔ سفارش‌اند؟ | `inventory.low_stock` |
+| `retail_electrical` | `retail_electrical.reorder` | `inventory.stock` | برای کالاهای زیر نقطهٔ سفارش پیش‌نویس سفارش خرید پیشنهاد بده | `inventory.low_stock`، `purchase.propose_order` |
+| `retail_electrical` | `retail_electrical.overdue_reminder` | `treasury.receivables` | برای بدهکاران سررسیدگذشته پیامک یادآوری آماده کن | `treasury.receivables_aging`، `treasury.propose_payment_reminder` |
+
+نمونهٔ بخش در مانیفست:
+
+```json
+"assistant": {"suggestions": [
+  {"code": "cafe.top_menu_items", "page_context": "dock", "text": "پرفروش‌ترین آیتم‌های منو در این هفته کدام‌اند؟",
+   "required_tools": ["sales.top_items"], "sort_order": 20}
+]}
+```
+
+بستهٔ صنفی آینده (مثلاً تولیدی یا داروخانه) پیشنهادهایش را در همین بخش می‌آورد. اگر ابزار تازه‌ای لازم داشته باشد، آن ابزار با کد و migration کاتالوگ در نسخهٔ برنامه می‌آید و `min_app_version` بسته به همان نسخه اشاره می‌کند.
 - **دسترس‌پذیری:**
   - گزارش پیام‌ها `role="log"` و `aria-live="polite"` دارد.
   - کارت پیشنهاد `role="group"` و `aria-labelledby` دارد.
@@ -1147,7 +1235,7 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 | روش | مسیر | کار | مجوز | Idempotency |
 |---|---|---|---|---|
 | GET | `/status` | دسترس‌پذیری برای کاربر جاری: `available`، `reason`، `features`، نام اپراتور و محل داده، `tokens_remaining`، `limits` | ورود (بدون مجوز ⇒ `available=false`) | — |
-| GET | `/suggestions?page=&company_id=` | پیشنهادهای آغاز قابل‌استفاده | `assistant.chat.use` | — |
+| GET | `/suggestions?page=&company_id=` | پیشنهادهای آغاز قابل‌استفاده، صنفی و عمومی (`code`، `pack`، `text`، `tools`؛ §۵-۱۷) | `assistant.chat.use` | — |
 | GET | `/tools` | ابزارهایی که دستیار برای این کاربر در دسترس دارد، با توضیح فارسی و رده‌های داده (شفافیت) | `assistant.chat.use` | — |
 | GET | `/threads` | رشته‌های خود کاربر (cursor؛ `status`) | `assistant.chat.use` | — |
 | POST | `/threads` | ساخت رشته `{company_id, title?, page_context?}` | `assistant.chat.use` (دامنهٔ شرکت) | پشتیبانی‌شده |
@@ -1212,6 +1300,7 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 | **INV-AST-30** | دستیار در حالت آفلاین پنهان است و در bundle صندوق (هر دو build) و پنل مالک وجود ندارد | `useConnectivity`؛ تقسیم bundle | `frontend/e2e/specs/web/assistant-offline.spec.ts`؛ job `build-fe` (`scan-bundles --forbid packages/assistant apps/pos apps/admin`) |
 | **INV-AST-31** | متن پیام نهایی ذخیره‌شده با متن stream‌شده (پس از بازگرداندن نام‌ها) برابر است. با قطع اتصال، پاسخ نهایی ذخیره و قابل خواندن است | هماهنگ‌کننده؛ `streaming.py` | `integration/assistant/test_stream.py::test_final_equals_concatenated_deltas`، `::test_disconnect_still_persists` |
 | **INV-AST-32** | برای هر کاربر حداکثر یک اجرای در جریان، و برای هر مستأجر حداکثر `max_concurrent_runs` | ایندکس یکتای جزئی؛ `run_guard` (قفل سیاست) | DB: T06؛ `property/test_concurrency.py::test_parallel_starts_respect_caps` |
+| **INV-AST-33** | پیشنهاد آغاز (عمومی یا صنفی) فقط وقتی نمایش داده می‌شود که همهٔ ابزارهایش اکنون به همین کاربر ارائه‌پذیر باشند و، اگر صنفی است، بسته‌اش برای شرکت فعال باشد. متن آن نرمال است و ابزارهایش در کاتالوگ وجود دارند. پیام ناشی از پیشنهاد کد آن را دارد و پیام عادی ندارد | `SuggestionQuery.for_user`؛ `AssistantPackSectionValidator` (انتشار بسته)؛ `prompt_suggestion_guard` و CHECK متن (عمومی)؛ CHECK `message` (`input_mode` ⇔ `suggestion_code`) | DB: T10، T18؛ `unit/assistant/test_suggestions.py::test_shown_only_if_tools_offered_and_pack_active`؛ `unit/assistant/test_pack_section.py::test_v1_pack_sections_valid`، `::test_unknown_tool_rejected`، `::test_code_prefix_must_be_pack` |
 
 ---
 
@@ -1269,7 +1358,7 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 | T07 | دور و بودجه |
 | T08 | فراخوانی ابزار |
 | T09 | پیشنهاد و تأیید انسانی |
-| T10 | پیام و پایان اجرا |
+| T10 | پیام (+ `input_mode` ⇔ `suggestion_code`) و پایان اجرا |
 | T11 | بازخورد |
 | T12 | ارائه‌دهندهٔ مستأجر و رضایت مقصد تازه |
 | T13 | لغو رضایت وسط اجرا |
@@ -1284,7 +1373,7 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 | T21 | نگهبان پیشنهادی هسته روی `ledger.journal_line` در تراکنش برگشتی |
 | T22 | بردار اثرانگشت مشترک |
 
-- **آزمون جهش:** همهٔ ۱۰۳ محل `core.raise_hk` در `80_assistant.sql` یکی‌یکی با تابع بی‌اثر جایگزین شدند. هر ۱۰۳ جهش آزمون را شکستند. اسکریپت: `tools/db/mutate_raises.sh 80_assistant`، همان شیوهٔ C-L19 بخش ۰۳.
+- **آزمون جهش:** هر یک از ۱۰۳ محل `PERFORM core.raise_hk(` در `80_assistant.sql` جداگانه با `PERFORM concat(` (بی‌اثر) جایگزین شد، جهش روی پایگاه دادهٔ تازه (`00→10→20→25` + فایل جهش‌یافته) اعمال شد و آزمون اجرا شد. هر ۱۰۳ جهش آزمون را شکستند و بازمانده‌ای نیست (اجرای دوباره پس از آخرین تغییر SQL و آزمون). در CI همان job شبانهٔ `tools/db/mutate_raise_sites.py` بخش ۰۳ (C-L19) این فایل را هم پوشش می‌دهد. CHECKها و ایندکس‌های یکتا با assert مستقیم خودشان آزموده شده‌اند.
 - **روی پایگاه دادهٔ یکپارچه:** فایل‌های `00…60` + `80` اعمال و همین آزمون سبز شد. `catalog_lint` فقط ۱۱ مورد `permission_not_in_core_catalog` نشان می‌دهد که منتظر همگام‌سازی کاتالوگ‌اند (`parties.*`، `catalog.*`، C-AS-08، C-AS-09، C-AS-10).
 
 ### ۹-۲. واحد (`backend/tests/unit/assistant`، `unit/integrations`)
@@ -1311,6 +1400,13 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 - `test_fingerprint.py` (بردار مشترک) و `test_cost.py` (برابری با ستون تولیدی روی بردارها).
 - `test_prompt.py`: پرامپت نسخه‌دار، hash پایدار، بلوک زمینه بدون شناسه.
 - `test_gate.py`: ترتیب دلیل‌ها در ماتریس کامل ۱۴ حالت.
+- `test_suggestions.py::test_shown_only_if_tools_offered_and_pack_active`:
+  - پیشنهاد صنفی بستهٔ غیرفعال یا نصب‌نشده نمایش داده نمی‌شود.
+  - پیشنهادی که یکی از ابزارهایش برای کاربر ارائه‌پذیر نیست (مجوز، ردهٔ داده، `disabled_tools`) حذف می‌شود.
+  - ترتیب: صنفی پیش از عمومی، سقف ۶.
+- `test_pack_section.py`:
+  - `::test_v1_pack_sections_valid`: بخش `assistant` چهار بستهٔ v1 (جدول §۵-۱۷) با رجیستری ابزار همین نسخه اعتبارسنجی می‌شود.
+  - `::test_unknown_tool_rejected`، `::test_code_prefix_must_be_pack`، `::test_unnormalized_text_rejected`.
 
 ### ۹-۳. ویژگی‌محور (Hypothesis)
 
@@ -1427,7 +1523,8 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 | پیشنهاد پیامک یادآوری | ● (پس از C-AS-09) | | | |
 | بودجه، نرخ، سنجش و uplink | ● | | | |
 | نگهداری، حذف، صدور و حذف دادهٔ شخصی | ● | | | |
-| `AssistantDock` با پیشنهادهای صفحه و بسته؛ پنهان در آفلاین | ● | | | |
+| `AssistantDock` با پیشنهادهای صفحه؛ پنهان در آفلاین | ● | | | |
+| پیشنهادهای آغاز عمومی و صنفی (بخش `assistant` مانیفست چهار بستهٔ v1؛ D-AS-25) | ● | | | |
 | مجموعهٔ طلایی و خصمانه در CI؛ ارزیابی زنده | ● | | | |
 | ارائه‌دهندهٔ مستأجر On-prem (LAN) | ● | | | |
 | پورت پیشنهاد نگاشت مهاجرت (`migration_mapping`) | ● | | | |
@@ -1461,7 +1558,7 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 
 | پرسش | اثر بر این بخش | اگر «بله» یا گسترده | اگر «نه» یا محدود |
 |---|---|---|---|
-| **Q-A** صنف‌ها (پاسخ: چهار صنف در v1، بقیه بستهٔ صنفی) | پیشنهادهای آغاز برای هر بسته (`prompt_suggestion.pack_code`)؛ ابزار تازه برای ماژول تازه | ماژول تازه ابزارهایش را با `ToolSpec` و migration کاتالوگ می‌افزاید (مثلاً `manufacturing.wip_summary`). هسته بی‌تغییر می‌ماند | همین. بسته‌های v1 فقط پیشنهاد آغاز دارند |
+| **Q-A** صنف‌ها (پاسخ: چهار صنف در v1، بقیه بستهٔ صنفی) | پیشنهادهای آغاز هر بسته در بخش `assistant` مانیفست همان بسته (D-AS-25)؛ ابزار تازه برای ماژول تازه | بستهٔ تازه پیشنهادهایش را در مانیفست خودش می‌آورد. ماژول تازه ابزارهایش را با `ToolSpec` و migration کاتالوگ می‌افزاید (مثلاً `manufacturing.wip_summary`). هستهٔ دستیار بی‌تغییر می‌ماند | همین. بسته‌های v1 فقط پیشنهاد آغاز دارند (جدول §۵-۱۷) |
 | **Q-B** سرور On-prem (پاسخ: لینوکس در v1) | ارائه‌دهندهٔ مستأجر و `hkctl egress` | Windows بعدی: کد دستیار پایتون خالص است و سرور مدل جداست | — |
 | **Q-C** کلید مؤدیان (پاسخ: انتخاب مشتری) | هیچ. دستیار به `tax.key.*` و `tax.invoice.send` دسترسی ندارد، چون مجوز critical یا غیرخواندنی است | — | — |
 | **Q-D** حقوق (پاسخ: قانون کار + ساعتی و پاره‌وقت) | فقط ابزار تجمیعی `payroll.cost_summary` (ردهٔ `payroll_aggregate`). دادهٔ فردی کارمند ممنوع است | نوع قرارداد فقط بُعد تجمیع است | — |
@@ -1481,16 +1578,25 @@ event: error           data: {"code":"assistant.budget.exhausted","title":"…",
 
 ## ۱۲. کلیدهای خارجی بین‌ماژولی
 
-`assistant` بالاترین ماژول است. همهٔ FKهای آن به `core` مستقیم در `80_assistant.sql` هستند: عضویت، شرکت و مستأجر. تنها FK به ماژولی بیرون از فایل‌های پیش‌نیاز این بخش، کاتالوگ بستهٔ صنفی در `rules` است (بخش ۰۷). این FK هم‌جهت DAG است (L8 → L1) و روی پایگاه دادهٔ یکپارچهٔ `00…60 + 80` بدون خطا اعمال شد:
+**هیچ FK تازه‌ای برای `99_cross_fk.sql` لازم نیست.** `assistant` بالاترین ماژول است و همهٔ FKهای آن به `core` (مستأجر، شرکت، عضویت) مستقیم در `80_assistant.sql` ساخته می‌شوند، چون `10_core.sql` پیش‌نیاز این فایل است.
 
 ```sql
--- 99_cross_fk.sql (یکپارچه‌ساز)
-ALTER TABLE assistant.prompt_suggestion
-  ADD CONSTRAINT prompt_suggestion_pack_fk
-  FOREIGN KEY (pack_code) REFERENCES rules.industry_pack (code);
+-- 99_cross_fk.sql (یکپارچه‌ساز): برای بخش ۱۰ ردیفی ندارد.
+-- FKهای assistant → core در 80_assistant.sql مستقیم‌اند؛ نمونه:
+--   FOREIGN KEY (tenant_id, user_id)     REFERENCES core.tenant_membership (tenant_id, user_id)
+--   FOREIGN KEY (tenant_id, company_id)  REFERENCES core.company (tenant_id, id)
 ```
 
-FKی از ماژول‌های دیگر به `assistant` وجود ندارد و **نباید** وجود داشته باشد، چون خلاف جهت DAG است. پیش‌نویس‌های ساخته‌شده از پیشنهاد فقط ستون منشأ دارند (`ledger.journal_draft.created_via='assistant'`، `treasury.money_document.origin='assistant'`، `purchase.order.origin='assistant'`). اگر ماژولی بخواهد شناسهٔ پیشنهاد را نگه دارد، ستون `assistant_proposal_id uuid` بدون FK است. ارجاع معکوس (`proposal.target_type/target_id`) هم چندریختی و بدون FK است.
+ارجاع‌هایی که عمداً FK **ندارند**:
+
+| ستون | مقصد منطقی | دلیل |
+|---|---|---|
+| `tool_permission.permission_code` | `core.permission(code)` | مجوز ماژول‌های دیگر با همگام‌سازی کاتالوگ می‌آید. `catalog_lint` نبودش را گزارش می‌کند و مجوزِ غایب در زمان اجرا یعنی ابزار در دسترس نیست (§۴-۲) |
+| `message.suggestion_code` | `prompt_suggestion.code` یا کد بخش `assistant` مانیفست بسته | پیشنهاد صنفی ردیف جدولی ندارد (D-AS-25) و نسخهٔ بسته ممکن است عوض شود. ستون فقط برای سنجش است |
+| `proposal.target_type` / `target_id` / `target_ref` | پیش‌نویس در ماژول مقصد | چندریختی است (چند ماژول مقصد) و با یک FK بیان‌پذیر نیست. هدف در همان تراکنشِ تحقق، از پاسخ سرویس مقصد نوشته می‌شود (§۵-۸) |
+| (طرح پیشین) `prompt_suggestion.pack_code` → `rules.industry_pack(code)` | — | حذف شد: کاتالوگ migration‌محور نباید به کاتالوگی که در زمان اجرا منتشر می‌شود FK داشته باشد (D-AS-25) |
+
+FKی از ماژول‌های دیگر به `assistant` وجود ندارد و **نباید** وجود داشته باشد، چون خلاف جهت DAG است. پیش‌نویس‌های ساخته‌شده از پیشنهاد فقط ستون منشأ دارند: `ledger.journal_draft.created_via='assistant'` و `treasury.money_document.origin='assistant'` (هر دو موجود)، و `purchase."order".origin='assistant'` (ستون هنوز نیست؛ C-AS-12). اگر ماژولی بخواهد شناسهٔ پیشنهاد را نگه دارد، ستون `assistant_proposal_id uuid` بدون FK است.
 
 ---
 
@@ -1506,10 +1612,11 @@ FKی از ماژول‌های دیگر به `assistant` وجود ندارد و *
 | **C-AS-06** | بخش ۰۱ (§۱۱ ردیف Q-F و §۱۰) | فرض‌های پیش از پاسخ Q-F | ۰۱ «فقط مدل خودمیزبان روی نود GPU» و «ابزارهای دستیار همان API» را فرض کرده بود. پاسخ صاحب محصول API قابل تنظیم است و این بخش ابزار را به‌جای HTTP از سرویس پرس‌وجوی درون‌فرایند می‌گیرد (D-AS-01). متن ۰۱ به‌روز شود |
 | **C-AS-07** | بخش ۰۹ | قرارداد صفحهٔ کنترل | گسترش `platform.ai_provider` و افزودن `ai_provider_price`، `ai_plan_policy`، `ai_tenant_override`، `ai_eval_run`، meterهای `ai.tokens`، `ai.cost` و `ai.runs`، بلوک `assistant` در `hkstate/1` و `CellAssistantPolicy` (§۵-۱۹). CHECK فعلی `base_url ~ '^https://'` با سرور مدل داخل سلول (`network='cell_private'`) نمی‌خواند و باید `http` را فقط برای `cell_private` بپذیرد |
 | **C-AS-08** | بخش ۰۷ | هزینهٔ حقوق تجمیعی | مجوز `payroll.report.read` (sensitive) و `PayrollQuery.cost_summary(company, period, group_by∈{month, workshop, cost_center})` بدون هیچ دادهٔ فردی. اکنون فقط `payroll.employee.read` و `payroll.payslip.read` (critical) هست که برای دستیار مجاز نیستند |
-| **C-AS-09** | بخش ۰۶ | پیامک یادآوری بدهی | `PartyReminderService.preview(party_id, template, vars)` (فقط خواندن) و `send(...)` (الگوی تأییدشدهٔ پیامک؛ رضایت ثبت‌شدهٔ شخص طبق ۰۶ §۵-... «یادآور سررسید به صادرکننده با رضایت») و مجوز `treasury.reminder.send` |
+| **C-AS-09** | بخش ۰۶ | پیامک یادآوری بدهی | `PartyReminderService.preview(party_id, template, vars)` (فقط خواندن) و `send(...)` (الگوی تأییدشدهٔ پیامک؛ فقط برای شخصی که رضایت دریافت یادآور دارد، طبق ۰۶ §۵-۶ بند «یادآورها»: «یادآور سررسید به صادرکننده با رضایت ثبت‌شدهٔ شخص») و مجوز `treasury.reminder.send` (sensitive، نه critical). ابزار `treasury.propose_payment_reminder` و پیشنهاد صنفی `retail_electrical.overdue_reminder` تا آن زمان در دسترس نیستند (مجوز غایب ⇒ ابزار غایب) |
 | **C-AS-10** | بخش ۰۴ / یکپارچه‌ساز | کاتالوگ مجوز | `parties.party.read`، `parties.party.create` و `catalog.item.read` در `25_masterdata.sql` در `core.permission` درج نشده‌اند (فقط در `ModuleSpec`). `catalog_lint` روی پایگاه دادهٔ یکپارچه آن‌ها را گزارش می‌کند. یا 25 درج کند، یا migration همگام‌سازی کاتالوگ در CI پیش از `catalog_lint` اجرا شود |
 | **C-AS-11** | بخش‌های ۰۳، ۰۵، ۰۶ | نام یکسان رد principal دستیار | سه نام هست: `ledger.journal.assistant_cannot_post`، `assistant.write_forbidden` و وابستگی `forbid_ai_principal`. پیشنهاد: یک وابستگی kernel به نام `forbid_assistant_actor` و یک کد API، یعنی `assistant.write_forbidden` (403). کد ledger به‌عنوان نام مستعار در کاتالوگ فقط‌افزودنی بماند |
-| **C-AS-12** | بخش ۰۵ | سفارش خرید | `PurchaseOrderService.validate(cmd)` (dry-run بی‌نوشتن) و `create_draft(cmd)` با `origin='assistant'` از principal |
+| **C-AS-12** | بخش ۰۵ | سفارش خرید | ۱) `PurchaseOrderService.validate(cmd)` (dry-run بی‌نوشتن) و `create_draft(cmd)` که `origin='assistant'` را از principal نیابتی می‌گیرد؛ ۲) جدول `purchase."order"` در `30_commerce.sql` ستون منشأ ندارد. پیشنهاد: `origin text NOT NULL DEFAULT 'manual' CHECK (origin IN ('manual','api','assistant','migration','reorder'))` و CHECK «`origin='assistant'` ⇒ `status='draft'` در درج»، هم‌شکل `treasury.money_document.origin` و `ledger.journal_draft.created_via`. بدون آن، UI نشان «پیشنهاد دستیار» را روی سفارش نمی‌تواند نشان دهد و سنجش نرخ پذیرش (v1.1) ناقص است |
+| **C-AS-19** | بخش ۰۵ (سازوکار بسته) و ۰۷ (`rules`) | پیشنهادهای آغاز صنفی (D-AS-25) | ۱) قالب `hkpack/1` بخش اختیاری `assistant` را بپذیرد (اکنون کلید ناشناخته رد می‌شود). شِمای آن `AssistantPackSection` در §۵-۱۷ است و اعتبارسنجش را ماژول `assistant` در `PackSectionRegistry` ثبت می‌کند. این بخش Applier مستأجری ندارد و در ترتیب ثابت اعمال (§۵-۱۱ بخش ۰۵) نمی‌آید؛ ۲) `rules.PackQuery` دو متد فقط‌خواندنی داشته باشد: `active_packs(tenant_id, company_id) -> list[(code, installed_version)]` (از `rules.tenant_pack` با `status='active'`، سطح شرکت یا مستأجر) و `manifest_section(pack, version, section) -> dict | None`؛ ۳) چهار بستهٔ v1 بخش `assistant` جدول §۵-۱۷ را در مانیفست داشته باشند |
 | **C-AS-13** | قرارداد مشترک | «تنها فراخوانی بیرونی» | روشن شود که شامل سرور مدل داخل سلول و ارائه‌دهندهٔ مستأجر On-prem هم هست و همه از `OutboundHttpClient` با allowlist اپراتور می‌گذرند. پیشنهاد متن: «هر استفاده از LLM فقط از دروازهٔ ماژول `assistant` (رضایت، بودجه، ممیزی)» |
 | **C-AS-14** | بخش ۰۸ | پیشنهاد نگاشت مهاجرت | `MappingSuggestionService` کلاینت مدل خودش را نسازد و از `contracts.ports.llm.LlmCompletionPort.complete(purpose='migration_mapping', ...)` استفاده کند. پیش‌شرط‌ها: رضایت `migration.consent` نوع `ai_mapping_suggestions` + رضایت مستأجر با هدف `migration_mapping` و ردهٔ `migration_schema` |
 | **C-AS-15** | بخش ۰۲ | الگوی UoW | هماهنگ‌کنندهٔ دستیار در یک درخواست HTTP چند UoW کوتاه پشت سر هم باز می‌کند (§۵-۷). این با «هر درخواست یک تراکنش» (۰۱ D-05) فرق دارد. درخواست: استثنای صریح «مسیرهای stream دستیار» در قرارداد |

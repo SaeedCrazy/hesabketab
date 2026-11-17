@@ -11,12 +11,14 @@
 -- ساختار (یک نشست psql با superuser؛ نقش با SET ROLE عوض می‌شود):
 --   بخش ۱ (fixture، نقش postgres): اسکیمای کمکی plt_t (شناسه‌ها، توابع کمکی SECURITY INVOKER)، جغرافیا، کارکنان،
 --          انتساب نقش راه‌اندازی، نشست با MFA تازه، سطح و نماینده، سلول‌ها، مستأجر خانه، کاتالوگ کلید قواعد.
---   بخش ۲ (SET ROLE hk_platform_app؛ نه مالک، NOBYPASSRLS): T01..T24. هر DO block کنشگر را با
+--   بخش ۲ (SET ROLE hk_platform_app؛ نه مالک، NOBYPASSRLS): T01..T25، T29 (دستیار، C-AS-07)، T30 (پیامک)، T31 (پلن دورهٔ بعد) و T33 (پوشش جهش: پیام دقیق هر نگهبان). هر DO block کنشگر را با
 --          set_config('app.staff_id'/'app.staff_session_id', ..., true) تنظیم می‌کند (plt_t.as_staff).
---   بخش ۳ (SET ROLE hk_platform_ingest): بخش‌های uplink در T17، T18، T22، T23 و T26.
---   بخش ۴ (SET ROLE hk_partner_app): T25 جداسازی نماینده‌ها با RLS (app.reseller_id) — همتای «جداسازی بین‌مستأجری».
+--   بخش ۳ (SET ROLE hk_platform_ingest): بخش‌های uplink در T09، T18، T19، T22، T24 و T26.
+--   بخش ۴ (SET ROLE hk_partner_app): T26 جداسازی نماینده‌ها با RLS (app.reseller_id) — همتای «جداسازی بین‌مستأجری».
 --   بخش ۵ (SET ROLE hk_platform_readonly): T27 ستون‌های راز.
 --   بخش ۶ (postgres): T28 lint امنیتی، تغییرناپذیری حتی برای مالک، تشخیص دستکاری زنجیرهٔ ممیزی، بی‌فاصلگی شماره‌ها.
+--          T32: حذف ممنوع حتی برای مالک، و شاخه‌های دفاع در عمق (فقط با دور زدن آگاهانه؛ همه در تراکنش rollback‌شده).
+-- آزمون جهش (سند §۹-۱): هر PERFORM platform.fail با NULL جایگزین شد؛ ۳۷۰ از ۳۷۰ با همین فایل کشته می‌شوند.
 -- هر ادعای منفی الگوی دقیق پیام خطا (کد HK_PLT_* یا نام قید) را بررسی می‌کند (plt_t.fails).
 -- خروجی موفق با «ALL 70_platform TESTS PASSED» پایان می‌یابد؛ هر شکست «TEST FAILED [...]» می‌دهد و psql با کد ≠ ۰ خارج می‌شود.
 -- =====================================================================
@@ -2119,6 +2121,625 @@ BEGIN
   UPDATE platform.data_request SET status = 'completed', result_sha256 = plt_t.h('erasure-report') WHERE id = plt_t.u('DR1');
 END $$;
 
+-- T29 دستیار (C-AS-07 بخش ۱۰): ارائه‌دهنده، ارزیابی، قیمت، سیاست پلن، استثنای مستأجر، پرچم قطع
+DO $$
+DECLARE
+  v_p uuid; v_p2 uuid; v_eval uuid; v_eval_bad uuid; v_ap uuid; v_pvs uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  -- اثرانگشت مقصد: بردار مشترک با assistant.provider_fingerprint (tests/assistant_fingerprint_v1.json)
+  PERFORM plt_t.ok('T29 fingerprint vector 1', platform.ai_provider_fingerprint('Iranian AI Co', 'https://API.Example.ir/v1', 'iran')
+                                                = '4a43acd40cff6f3730caef30f6d857ecf139d4ed89d983b1c2e435f9ebb2f8f2');
+  PERFORM plt_t.ok('T29 fingerprint vector 2', platform.ai_provider_fingerprint('  Our LAN vLLM ', 'http://10.0.0.5:8000/v1', 'lan')
+                                                = '78d64de18c546ad3ac0e81d061d818428e6861248a39ebb766c73ccf8c1b2e8e');
+  PERFORM plt_t.ok('T29 fingerprint vector 3', platform.ai_provider_fingerprint('شرکت هوش ایران', 'https://llm.hooshiran.ir:8443/openai/v1', 'iran')
+                                                = 'da5ba91c78fbaf85dc3aad3834ae740cb300f798034ed343b00cd8a200eb868a');
+  PERFORM plt_t.fails('T29 http only inside the cell network',
+    format($q$INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, secret_ref, created_by)
+              VALUES ('bad-http', 'bad provider', 'Op Co', 'iran', 'public', 'http://api.example.ir/v1', 'm1', 'openbao://kv/ai/x', %L)$q$, plt_t.u('A')),
+    '%ai_provider_http_private%');
+  PERFORM plt_t.fails('T29 cell-private network means cell-private data',
+    format($q$INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, auth_header, created_by)
+              VALUES ('bad-net', 'bad provider', 'Op Co', 'iran', 'cell_private', 'http://10.0.0.5:8000/v1', 'm1', 'none', %L)$q$, plt_t.u('A')),
+    '%ai_provider_private_location%');
+  PERFORM plt_t.fails('T29 auth none carries no secret',
+    format($q$INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, auth_header, secret_ref, created_by)
+              VALUES ('bad-auth', 'bad provider', 'Op Co', 'iran', 'public', 'https://api.example.ir/v1', 'm1', 'none', 'openbao://kv/ai/x', %L)$q$, plt_t.u('A')),
+    '%ai_provider_auth_secret%');
+  PERFORM plt_t.fails('T29 no credentials in URL',
+    format($q$INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, secret_ref, created_by)
+              VALUES ('bad-url', 'bad provider', 'Op Co', 'iran', 'public', 'https://u:p@api.example.ir/v1', 'm1', 'openbao://kv/ai/x', %L)$q$, plt_t.u('A')),
+    '%ai_provider_base_url_check%');
+  PERFORM plt_t.fails('T29 created by acting staff',
+    format($q$INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, secret_ref, created_by)
+              VALUES ('bad-actor', 'bad provider', 'Op Co', 'iran', 'public', 'https://api.example.ir/v1', 'm1', 'openbao://kv/ai/x', %L)$q$, plt_t.u('O')),
+    'HK_PLT_ACTOR_MISMATCH%');
+  PERFORM plt_t.fails('T29 providers start as drafts',
+    format($q$INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, secret_ref, created_by, status)
+              VALUES ('bad-status', 'bad provider', 'Op Co', 'iran', 'public', 'https://api.example.ir/v1', 'm1', 'openbao://kv/ai/x', %L, 'active')$q$, plt_t.u('A')),
+    'HK_PLT_INVALID_TRANSITION%');
+  INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, secret_ref, created_by)
+  VALUES ('ir-llm', 'سرویس مدل ایرانی', 'Iranian AI Co', 'iran', 'public', 'https://API.Example.ir/v1', 'qwen-72b',
+          'openbao://kv/ai/ir-llm', plt_t.u('A'))
+  RETURNING id INTO v_p;
+  INSERT INTO platform.ai_provider (code, name, operator, data_location, network, base_url, model, auth_header, created_by)
+  VALUES ('lan-vllm', 'مدل خودمیزبان سلول', 'Hesabketab Ops', 'cell_private', 'cell_private', 'http://10.0.0.5:8000/v1', 'llama-70b',
+          'none', plt_t.u('A'))
+  RETURNING id INTO v_p2;
+  PERFORM plt_t.ok('T29 generated fingerprint = shared formula',
+    (SELECT fingerprint = '4a43acd40cff6f3730caef30f6d857ecf139d4ed89d983b1c2e435f9ebb2f8f2' FROM platform.ai_provider WHERE id = v_p));
+  PERFORM plt_t.fails('T29 validation needs probe and eval',
+    format($q$UPDATE platform.ai_provider SET status = 'validated' WHERE id = %L$q$, v_p), 'HK_PLT_AI_EVAL_REQUIRED%');
+  UPDATE platform.ai_provider SET last_probe_at = now(), last_probe_ok = true, capabilities = '{"tools": true, "json_mode": true}' WHERE id = v_p;
+  PERFORM plt_t.fails('T29 eval belongs to the current version',
+    format($q$INSERT INTO platform.ai_eval_run (provider_id, provider_version, prompt_version, toolset_sha256, suite, suite_version,
+                started_at, finished_at, cases, passed_cases, threshold_version, passed, executed_by_kind, executed_by)
+              VALUES (%L, 2, '2026.11.0', plt_t.h('tools'), 'assistant.golden', '1', now() - interval '5 minutes', now(), 40, 39, 't1', true, 'staff', %L)$q$,
+           v_p, plt_t.u('A')), 'HK_PLT_AI_EVAL_MISMATCH%');
+  INSERT INTO platform.ai_eval_run (provider_id, provider_version, prompt_version, toolset_sha256, suite, suite_version,
+                                    started_at, finished_at, cases, passed_cases, threshold_version, passed, executed_by_kind, executed_by)
+  VALUES (v_p, 1, '2026.11.0', plt_t.h('tools'), 'assistant.golden', '1', now() - interval '9 minutes', now() - interval '6 minutes',
+          40, 30, 't1', false, 'staff', plt_t.u('A'))
+  RETURNING id INTO v_eval_bad;
+  UPDATE platform.ai_provider SET last_eval_run_id = v_eval_bad WHERE id = v_p;
+  PERFORM plt_t.fails('T29 failed eval does not validate',
+    format($q$UPDATE platform.ai_provider SET status = 'validated' WHERE id = %L$q$, v_p), 'HK_PLT_AI_EVAL_REQUIRED%');
+  INSERT INTO platform.ai_eval_run (provider_id, provider_version, prompt_version, toolset_sha256, suite, suite_version,
+                                    started_at, finished_at, cases, passed_cases, threshold_version, passed, executed_by_kind, executed_by)
+  VALUES (v_p, 1, '2026.11.0', plt_t.h('tools'), 'assistant.golden', '1', now() - interval '5 minutes', now(),
+          40, 39, 't1', true, 'staff', plt_t.u('A'))
+  RETURNING id INTO v_eval;
+  UPDATE platform.ai_provider SET last_eval_run_id = v_eval, status = 'validated' WHERE id = v_p;
+  PERFORM plt_t.fails('T29 eval runs append-only', format($q$UPDATE platform.ai_eval_run SET passed = true WHERE id = %L$q$, v_eval_bad), '%permission denied%');
+  PERFORM plt_t.fails('T29 activation needs four-eyes',
+    format($q$UPDATE platform.ai_provider SET status = 'active' WHERE id = %L$q$, v_p), 'HK_PLT_APPROVAL_REQUIRED%');
+  UPDATE platform.ai_provider SET status = 'active',
+         activation_approval_id = plt_t.approve('ai_provider.activate', 'ai_provider', v_p, plt_t.u('A'), plt_t.u('O'))
+   WHERE id = v_p;
+  UPDATE platform.ai_provider SET is_default = true WHERE id = v_p;
+  PERFORM plt_t.ok('T29 activation queues a cell-state build',
+    EXISTS (SELECT 1 FROM platform.job WHERE kind = 'control.cell_state.build' AND payload->>'provider_id' = v_p::text));
+  PERFORM plt_t.fails('T29 active destination frozen',
+    format($q$UPDATE platform.ai_provider SET base_url = 'https://other.example.ir/v1' WHERE id = %L$q$, v_p), 'HK_PLT_AI_PROVIDER_FROZEN%');
+  PERFORM plt_t.fails('T29 version is derived',
+    format($q$UPDATE platform.ai_provider SET version = 7 WHERE id = %L$q$, v_p), 'HK_PLT_DERIVED_COLUMN%');
+  UPDATE platform.ai_provider SET rpm = 120 WHERE id = v_p;
+  PERFORM plt_t.ok('T29 limit change bumps version and stays active',
+    (SELECT version = 2 AND status = 'active' FROM platform.ai_provider WHERE id = v_p));
+  PERFORM plt_t.fails('T29 the default provider stays active',
+    format($q$UPDATE platform.ai_provider SET status = 'disabled', disabled_reason = 'provider outage' WHERE id = %L$q$, v_p),
+    '%ai_provider_default_active%');
+  UPDATE platform.ai_provider SET status = 'disabled', disabled_reason = 'provider outage', is_default = false WHERE id = v_p;
+  UPDATE platform.ai_provider SET base_url = 'https://llm2.example.ir/v1' WHERE id = v_p;
+  PERFORM plt_t.ok('T29 destination change resets validation',
+    (SELECT status = 'draft' AND version = 3 AND last_eval_run_id IS NULL AND last_probe_ok IS NULL AND disabled_reason IS NULL
+            AND fingerprint = platform.ai_provider_fingerprint(operator, base_url, data_location)
+       FROM platform.ai_provider WHERE id = v_p));
+  PERFORM plt_t.fails('T29 draft cannot jump to active',
+    format($q$UPDATE platform.ai_provider SET status = 'active' WHERE id = %L$q$, v_p), 'HK_PLT_INVALID_TRANSITION%');
+  PERFORM plt_t.fails('T29 providers never deleted', format($q$DELETE FROM platform.ai_provider WHERE id = %L$q$, v_p2), '%permission denied%');
+  UPDATE platform.ai_provider SET status = 'retired' WHERE id = v_p2;
+  PERFORM plt_t.fails('T29 retired provider frozen',
+    format($q$UPDATE platform.ai_provider SET name = 'renamed provider' WHERE id = %L$q$, v_p2), 'HK_PLT_AI_PROVIDER_FROZEN%');
+  -- قیمت خرید توکن
+  INSERT INTO platform.ai_provider_price (provider_id, valid_from, input_per_mtok, output_per_mtok, created_by)
+  VALUES (v_p, now() - interval '1 day', 1500000, 4500000, plt_t.u('A'));
+  PERFORM plt_t.fails('T29 prices do not overlap',
+    format($q$INSERT INTO platform.ai_provider_price (provider_id, valid_from, input_per_mtok, output_per_mtok) VALUES (%L, now(), 1, 1)$q$, v_p),
+    '%ai_price_no_overlap%');
+  PERFORM plt_t.fails('T29 price content immutable',
+    format($q$UPDATE platform.ai_provider_price SET input_per_mtok = 1 WHERE provider_id = %L$q$, v_p), 'HK_PLT_IMMUTABLE_FIELD%');
+  PERFORM plt_t.fails('T29 effective price not deletable',
+    format($q$DELETE FROM platform.ai_provider_price WHERE provider_id = %L$q$, v_p), 'HK_PLT_IMMUTABLE%');
+  PERFORM plt_t.ok('T29 price at now', (SELECT input_per_mtok = 1500000 FROM platform.ai_price_at(v_p, now())));
+  UPDATE platform.ai_provider_price SET valid_to = now() + interval '1 hour' WHERE provider_id = v_p;
+  INSERT INTO platform.ai_provider_price (provider_id, valid_from, input_per_mtok, output_per_mtok, created_by)
+  VALUES (v_p, now() + interval '1 hour', 1800000, 5000000, plt_t.u('A'));
+  PERFORM plt_t.ok('T29 next price after close', (SELECT input_per_mtok = 1800000 FROM platform.ai_price_at(v_p, now() + interval '2 hours')));
+  -- سیاست پلن (نسخهٔ پیش‌نویس PV5)
+  PERFORM plt_t.fails('T29 policy needs the ai.assistant entitlement',
+    format($q$INSERT INTO platform.ai_plan_policy (product_version_id, features) VALUES (%L, '{chat}')$q$, plt_t.u('PV5')),
+    'HK_PLT_AI_POLICY_SHAPE%');
+  INSERT INTO platform.product_entitlement (product_version_id, feature_key, enabled) VALUES (plt_t.u('PV5'), 'ai.assistant', true);
+  PERFORM plt_t.fails('T29 policy features from the catalog',
+    format($q$INSERT INTO platform.ai_plan_policy (product_version_id, features) VALUES (%L, '{chat,telepathy}')$q$, plt_t.u('PV5')),
+    '%ai_plan_policy_features_check%');
+  PERFORM plt_t.fails('T29 secondary providers exist',
+    format($q$INSERT INTO platform.ai_plan_policy (product_version_id, features, secondary_provider_ids) VALUES (%L, '{chat}', ARRAY[uuidv7()])$q$, plt_t.u('PV5')),
+    'HK_PLT_AI_POLICY_SHAPE%');
+  PERFORM plt_t.fails('T29 user quota within tenant quota',
+    format($q$INSERT INTO platform.ai_plan_policy (product_version_id, features, tenant_monthly_tokens, user_monthly_tokens) VALUES (%L, '{chat}', 1000, 2000)$q$, plt_t.u('PV5')),
+    '%ai_plan_policy_check%');
+  INSERT INTO platform.ai_plan_policy (product_version_id, features, provider_id, tenant_monthly_tokens, user_monthly_tokens, tenant_monthly_cost)
+  VALUES (plt_t.u('PV5'), '{chat,proposals}', v_p, 2000000, 500000, 30000000);
+  PERFORM plt_t.fails('T29 policy of a published version is frozen',
+    format($q$INSERT INTO platform.ai_plan_policy (product_version_id, features) VALUES (%L, '{chat}')$q$, plt_t.u('PV1')), 'HK_PLT_PRODUCT_FROZEN%');
+  INSERT INTO platform.product_version (product_code, version, available_from, created_by)
+  VALUES ('assisted_migration', 2, current_date, plt_t.u('A')) RETURNING id INTO v_pvs;
+  PERFORM plt_t.fails('T29 policies belong to plans or addons',
+    format($q$INSERT INTO platform.ai_plan_policy (product_version_id, features) VALUES (%L, '{chat}')$q$, v_pvs), 'HK_PLT_AI_POLICY_SHAPE: assistant policies belong to plans or addons%');
+  -- استثنای مستأجر: خاموش‌کردن خالص بی‌تأیید؛ روشن‌کردن یا افزایش سقف با تأیید دونفره
+  INSERT INTO platform.ai_tenant_override (tenant_id, enabled, kill_reason, reason, created_by)
+  VALUES (plt_t.u('TA'), false, 'abuse investigation', 'kill during an abuse investigation', plt_t.u('A'));
+  PERFORM plt_t.ok('T29 kill queues a desired-state build',
+    EXISTS (SELECT 1 FROM platform.job WHERE kind = 'control.desired_state.build' AND payload->>'cause' = 'override'
+            AND payload->>'tenant_id' = plt_t.u('TA')::text AND payload ? 'ai_override_id'));
+  PERFORM plt_t.fails('T29 one live override per tenant',
+    format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, kill_reason, reason, created_by)
+              VALUES (%L, false, 'second kill', 'a second overlapping kill', %L)$q$, plt_t.u('TA'), plt_t.u('A')), '%ai_override_one_live%');
+  PERFORM plt_t.fails('T29 kill needs a reason',
+    format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, reason, created_by)
+              VALUES (%L, false, 'kill without a kill reason', %L)$q$, plt_t.u('TB'), plt_t.u('A')), '%ai_override_kill_reason%');
+  PERFORM plt_t.fails('T29 override content immutable',
+    format($q$UPDATE platform.ai_tenant_override SET reason = 'changed reason text' WHERE tenant_id = %L$q$, plt_t.u('TA')), 'HK_PLT_IMMUTABLE_FIELD%');
+  UPDATE platform.ai_tenant_override SET revoked_at = now(), revoked_by = plt_t.u('A') WHERE tenant_id = plt_t.u('TA') AND revoked_at IS NULL;
+  PERFORM plt_t.fails('T29 enabling needs four-eyes',
+    format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, tenant_monthly_tokens, reason, created_by)
+              VALUES (%L, true, 5000000, 'pilot customer needs more tokens', %L)$q$, plt_t.u('TA'), plt_t.u('A')), 'HK_PLT_APPROVAL_REQUIRED%');
+  v_ap := plt_t.approve('ai.tenant_override', 'tenant', plt_t.u('TA'), plt_t.u('A'), plt_t.u('O'));
+  PERFORM plt_t.fails('T29 a pure kill takes no approval',
+    format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, kill_reason, reason, created_by, approval_id)
+              VALUES (%L, false, 'kill', 'kill with a stray approval', %L, %L)$q$, plt_t.u('TA'), plt_t.u('A'), v_ap), 'HK_PLT_APPROVAL_MISMATCH%');
+  INSERT INTO platform.ai_tenant_override (tenant_id, enabled, tenant_monthly_tokens, reason, created_by, approval_id, expires_at)
+  VALUES (plt_t.u('TA'), true, 5000000, 'pilot customer needs more tokens', plt_t.u('A'), v_ap, now() + interval '30 days');
+  PERFORM plt_t.ok('T29 approval consumed by the override',
+    (SELECT status = 'consumed' FROM platform.approval_request WHERE id = v_ap));
+  PERFORM plt_t.as_staff(plt_t.u('SL'));
+  PERFORM plt_t.fails('T29 override creator needs platform.ai.manage',
+    format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, kill_reason, reason, created_by)
+              VALUES (%L, false, 'kill', 'sales tries to kill the assistant', %L)$q$, plt_t.u('TB'), plt_t.u('SL')), 'HK_PLT_PERMISSION%');
+  PERFORM plt_t.fails('T29 overrides never deleted', $q$DELETE FROM platform.ai_tenant_override$q$, '%permission denied%');
+  -- کلید قطع سراسری ff.ai.assistant (ops_kill_switch): خاموشی هر هدف منطبق غالب است
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.ok('T29 assistant kill switch seeded on', platform.flag_on_for_tenant('ff.ai.assistant', plt_t.u('TA'), 'pro', 'cell-01'));
+  INSERT INTO platform.feature_flag_target (flag_key, target_kind, target_id, is_on) VALUES
+    ('ff.ai.assistant', 'cell', 'cell-01', false), ('ff.ai.assistant', 'tenant', plt_t.u('TA')::text, true);
+  PERFORM plt_t.ok('T29 ops kill: an off target wins over an on target',
+    NOT platform.flag_on_for_tenant('ff.ai.assistant', plt_t.u('TA'), 'pro', 'cell-01'));
+  PERFORM plt_t.ok('T29 ops kill: other cells unaffected', platform.flag_on_for_tenant('ff.ai.assistant', plt_t.u('TB'), 'pro', 'cell-02'));
+  PERFORM plt_t.ok('T29 flag change queues propagation',
+    EXISTS (SELECT 1 FROM platform.job WHERE kind = 'control.flag.propagate' AND payload->>'flag_key' = 'ff.ai.assistant'));
+  INSERT INTO platform.feature_flag_target (flag_key, target_kind, target_id, is_on) VALUES ('ff.fast_sync', 'cell', 'cell-02', false);
+  PERFORM plt_t.ok('T29 release flag: cell target beats rollout', NOT platform.flag_on_for_tenant('ff.fast_sync', plt_t.u('TB'), NULL, 'cell-02'));
+  INSERT INTO platform.feature_flag_target (flag_key, target_kind, target_id, is_on) VALUES ('ff.fast_sync', 'tenant', plt_t.u('TB')::text, true);
+  PERFORM plt_t.ok('T29 release flag: tenant target beats cell target', platform.flag_on_for_tenant('ff.fast_sync', plt_t.u('TB'), NULL, 'cell-02'));
+  PERFORM plt_t.ok('T29 assistant meters in the catalog',
+    (SELECT count(*) = 3 FROM platform.feature WHERE key IN ('ai.tokens','ai.cost','ai.runs') AND kind = 'meter'));
+END $$;
+
+-- T30 پیامک خط پلتفرم: حساب سرویس‌دهنده، الگو، نگاشت کد
+DO $$
+DECLARE
+  v_a1 uuid; v_a2 uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  INSERT INTO platform.sms_provider_account (provider, role, sender_line, secret_ref)
+  VALUES ('kavenegar', 'primary', '10004346', 'openbao://kv/sms/kavenegar') RETURNING id INTO v_a1;
+  INSERT INTO platform.sms_provider_account (provider, role, sender_line, secret_ref, single_part_chars, multi_part_chars)
+  VALUES ('smsir', 'fallback', '30007732', 'openbao://kv/sms/smsir', 70, 66) RETURNING id INTO v_a2;
+  PERFORM plt_t.fails('T30 one active primary account',
+    $q$INSERT INTO platform.sms_provider_account (provider, role, sender_line, secret_ref) VALUES ('melipayamak', 'primary', '50001', 'openbao://kv/sms/mp')$q$,
+    '%sms_one_primary%');
+  PERFORM plt_t.fails('T30 multipart part not longer than single',
+    $q$INSERT INTO platform.sms_provider_account (provider, role, sender_line, secret_ref, single_part_chars, multi_part_chars)
+       VALUES ('ippanel', 'fallback', '30001', 'openbao://kv/sms/ip', 70, 71)$q$,
+    '%sms_provider_account_check%');
+  PERFORM plt_t.fails('T30 body placeholder must be declared',
+    $q$INSERT INTO platform.sms_template (key, purpose, body_fa, variables) VALUES ('hk-otp', 'otp', 'کد ورود شما: {code}', '{}')$q$,
+    'HK_PLT_SMS_TEMPLATE_VARS%');
+  PERFORM plt_t.fails('T30 declared variable must appear in the body',
+    $q$INSERT INTO platform.sms_template (key, purpose, body_fa, variables) VALUES ('hk-otp', 'otp', 'کد ورود شما', '{code}')$q$,
+    'HK_PLT_SMS_TEMPLATE_VARS%');
+  INSERT INTO platform.sms_template (key, purpose, body_fa, variables) VALUES
+    ('hk-otp', 'otp', 'کد ورود شما: {code}', '{code}'),
+    ('hk-renewal', 'billing', 'اشتراک {tenant} تا {days} روز دیگر تمام می‌شود', '{tenant,days}');
+  INSERT INTO platform.sms_template_code (template_key, provider_account_id, provider_code, approval_status) VALUES
+    ('hk-otp', v_a1, 'otp-login', 'approved'), ('hk-otp', v_a2, '100200', 'pending');
+  PERFORM plt_t.ok('T30 coverage lists pending and missing codes', (SELECT count(*) = 3 FROM platform.v_sms_template_coverage));
+  PERFORM plt_t.fails('T30 template purpose immutable',
+    $q$UPDATE platform.sms_template SET purpose = 'marketing' WHERE key = 'hk-otp'$q$, 'HK_PLT_IMMUTABLE_FIELD%');
+END $$;
+
+-- T31 تغییر پلن از دورهٔ بعد (تنزل یا تغییر دوره؛ ارتقای فوری با صورتحساب تناسبی در سرویس)
+DO $$
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  PERFORM plt_t.fails('T31 next plan must be a published plan',
+    format($q$UPDATE platform.subscription SET next_plan_version_id = %L WHERE tenant_id = %L AND status <> 'cancelled'$q$, plt_t.u('PV5'), plt_t.u('TA')),
+    'HK_PLT_PLAN_NOT_AVAILABLE%');
+  PERFORM plt_t.fails('T31 next plan cannot be an addon',
+    format($q$UPDATE platform.subscription SET next_plan_version_id = %L WHERE tenant_id = %L AND status <> 'cancelled'$q$, plt_t.u('PV2'), plt_t.u('TA')),
+    'HK_PLT_PLAN_NOT_AVAILABLE%');
+  UPDATE platform.subscription SET next_plan_version_id = plt_t.u('PV1'), next_billing_period = 'P1Y'
+   WHERE tenant_id = plt_t.u('TA') AND status <> 'cancelled';
+  PERFORM plt_t.fails('T31 next billing period from the catalog',
+    format($q$UPDATE platform.subscription SET next_billing_period = 'P5Y' WHERE tenant_id = %L AND status <> 'cancelled'$q$, plt_t.u('TA')),
+    '%subscription_next_billing_period_check%');
+END $$;
+
+-- =====================================================================
+-- T33 پوشش جهش (هر شاخهٔ نگهبان با پیام دقیق؛ آزمون جهش §۹-۱ سند)
+-- =====================================================================
+RESET ROLE;
+INSERT INTO platform.rules_param_catalog (key, value_type, unit, package_code, qualifier_kind, introduced_in, deprecated_in)
+VALUES ('tax.vat.legacy_rate', 'percent', 'percent', 'ir.tax', 'none', '2026.11.0', '2026.11.0') ON CONFLICT DO NOTHING;
+SET ROLE hk_platform_app;
+
+-- T33a کارکنان، تأیید، نقش، idempotency، چرخهٔ عمر، جای‌گذاری، rollout
+DO $$
+DECLARE
+  v_sess uuid; v_ap uuid; v_asg uuid; v_t uuid := uuidv7(); v_t2 uuid := uuidv7(); v_w uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  INSERT INTO platform.staff_session (staff_id, token_hash, amr, mfa_at, expires_at)
+  VALUES (plt_t.u('R'), plt_t.h('t33-session'), '{otp}', now(), now() + interval '1 hour') RETURNING id INTO v_sess;
+  PERFORM plt_t.fails('T33 session identity immutable',
+    format($q$UPDATE platform.staff_session SET amr = '{hwk}' WHERE id = %L$q$, v_sess), 'HK_PLT_IMMUTABLE_FIELD: session identity columns are immutable%');
+  UPDATE platform.staff_session SET revoked_at = now(), revoke_reason = 't33 revoke' WHERE id = v_sess;
+  PERFORM plt_t.fails('T33 revoked session revocation is final',
+    format($q$UPDATE platform.staff_session SET revoked_at = now() + interval '1 second' WHERE id = %L$q$, v_sess), 'HK_PLT_SESSION_REVOKED: revoked session cannot be changed%');
+  PERFORM plt_t.fails('T33 revoked session takes no step-up',
+    format($q$UPDATE platform.staff_session SET mfa_at = now() - interval '1 minute' WHERE id = %L$q$, v_sess), 'HK_PLT_SESSION_REVOKED: revoked session cannot be changed%');
+
+  PERFORM plt_t.fails('T33 approvals start pending',
+    format($q$INSERT INTO platform.approval_request (action, subject_type, subject_id, requested_by, reason, status) VALUES ('invoice.void', 'invoice', %L, %L, 'start approved directly', 'approved')$q$, uuidv7(), plt_t.u('A')),
+    'HK_PLT_APPROVAL_STATE: approval requests start as pending%');
+  v_ap := plt_t.approve('invoice.void', 'invoice', uuidv7(), plt_t.u('A'), plt_t.u('O'));
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.fails('T33 decision fields change only with a transition',
+    format($q$UPDATE platform.approval_request SET decided_at = now() - interval '1 hour' WHERE id = %L$q$, v_ap), 'HK_PLT_IMMUTABLE_FIELD: decision fields change only with a transition%');
+
+  SELECT id INTO v_w FROM platform.wallet WHERE tenant_id = plt_t.u('TA');
+  PERFORM plt_t.fails('T33 missing approval names the action',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'adjustment', 1, 0, 't33-adj-null')$q$, v_w),
+    'HK_PLT_APPROVAL_REQUIRED: action wallet.manual_adjustment requires an approved four-eyes request%');
+  PERFORM plt_t.fails('T33 unknown approval',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id) VALUES (%L, 0, 'adjustment', 1, 0, 't33-adj-unknown', %L)$q$, v_w, uuidv7()),
+    'HK_PLT_APPROVAL_REQUIRED: approval request not found%');
+  INSERT INTO platform.approval_request (action, subject_type, subject_id, requested_by, reason)
+  VALUES ('wallet.manual_adjustment', 'wallet', v_w, plt_t.u('A'), 'pending adjustment request') RETURNING id INTO v_ap;
+  PERFORM plt_t.fails('T33 pending approval cannot be consumed',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id) VALUES (%L, 0, 'adjustment', 1, 0, 't33-adj-pending', %L)$q$, v_w, v_ap),
+    'HK_PLT_APPROVAL_NOT_APPROVED: approval status is pending%');
+  UPDATE platform.approval_request SET status = 'cancelled' WHERE id = v_ap;
+
+  PERFORM plt_t.fails('T33 assignment cannot be created revoked',
+    format($q$INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by, revoked_at, revoked_by, revoke_reason) VALUES (%L, 'sales', %L, now(), %L, 'created revoked')$q$, plt_t.u('S'), plt_t.u('A'), plt_t.u('A')),
+    'HK_PLT_INVALID_TRANSITION: assignment cannot be created revoked%');
+  INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by, valid_to)
+  VALUES (plt_t.u('S'), 'sales', plt_t.u('A'), now() + interval '10 days') RETURNING id INTO v_asg;
+  PERFORM plt_t.fails('T33 assignment can only be shortened',
+    format($q$UPDATE platform.staff_role_assignment SET valid_to = NULL WHERE id = %L$q$, v_asg), 'HK_PLT_INVALID_TRANSITION: assignment can only be shortened%');
+  PERFORM plt_t.fails('T33 revoked_by is the acting staff member',
+    format($q$UPDATE platform.staff_role_assignment SET revoked_at = now(), revoked_by = %L, revoke_reason = 'not me at all' WHERE id = %L$q$, plt_t.u('O'), v_asg),
+    'HK_PLT_ACTOR_MISMATCH: revoked_by must be the acting staff member%');
+  UPDATE platform.staff_role_assignment SET revoked_at = now(), revoked_by = plt_t.u('A'), revoke_reason = 't33 cleanup' WHERE id = v_asg;
+
+  INSERT INTO platform.idempotency_key (principal_kind, principal_id, key, method, path, request_sha256, expires_at)
+  VALUES ('staff', plt_t.u('A'), 't33-idem-key-0001', 'POST', '/x', plt_t.h('req'), now() + interval '1 day');
+  PERFORM plt_t.fails('T33 idempotency identity immutable',
+    $q$UPDATE platform.idempotency_key SET request_sha256 = plt_t.h('other') WHERE key = 't33-idem-key-0001'$q$, 'HK_PLT_IMMUTABLE_FIELD: idempotency identity is immutable%');
+  UPDATE platform.idempotency_key SET response_status = 201, response_body = '{}' WHERE key = 't33-idem-key-0001';
+
+  PERFORM plt_t.fails('T33 effective commission rule not deletable',
+    $q$DELETE FROM platform.commission_rule WHERE valid_from <= current_date$q$, 'HK_PLT_IMMUTABLE: an effective commission rule cannot be deleted%');
+  PERFORM plt_t.fails('T33 legal hold cannot be created released',
+    format($q$INSERT INTO platform.tenant_legal_hold (tenant_id, case_ref, reason, placed_by, released_at, released_by, release_approval_id)
+              VALUES (%L, 'C-33', 'created already released', %L, now(), %L, (SELECT id FROM platform.approval_request LIMIT 1))$q$, plt_t.u('TA'), plt_t.u('A'), plt_t.u('A')),
+    'HK_PLT_INVALID_TRANSITION: hold cannot be created released%');
+  PERFORM plt_t.fails('T33 house flag not changeable by app',
+    format($q$UPDATE platform.tenant SET is_house = false WHERE id = %L$q$, plt_t.u('TH')), 'HK_PLT_IMMUTABLE_FIELD: house tenant flag is set by migration only%');
+
+  INSERT INTO platform.tenant (id, slug, display_name, deployment) VALUES (v_t, 't33-a', 'مستأجر آزمون ۳۳', 'saas_shared');
+  INSERT INTO platform.tenant_placement (tenant_id, slug, cell_id, mode) VALUES (v_t, 't33-a', 'cell-01', 'pooled');
+  PERFORM plt_t.fails('T33 placement pending -> frozen',
+    format($q$UPDATE platform.tenant_placement SET state = 'frozen' WHERE tenant_id = %L$q$, v_t), 'HK_PLT_INVALID_TRANSITION: placement pending -> frozen%');
+  INSERT INTO platform.cell (id, kind, provider, region, status, dsn_ref, control_pubkey, control_kid)
+  VALUES ('cell-drain', 'pooled', 'prov-a', 'thr', 'draining', 'openbao://kv/cells/cell-drain/dsn', decode(repeat('13', 32), 'hex'), 'cell-drain-k1');
+  INSERT INTO platform.tenant (id, slug, display_name, deployment) VALUES (v_t2, 't33-b', 'مستأجر آزمون ۳۳ب', 'saas_shared');
+  PERFORM plt_t.fails('T33 draining cell accepts no tenant',
+    format($q$INSERT INTO platform.tenant_placement (tenant_id, slug, cell_id, mode) VALUES (%L, 't33-b', 'cell-drain', 'pooled')$q$, v_t2),
+    'HK_PLT_CELL_NOT_ACCEPTING: cell cell-drain is draining%');
+
+  PERFORM plt_t.fails('T33 rollout starts pending',
+    $q$INSERT INTO platform.cell_rollout (release_version, cell_id, ring, state) VALUES ('2026.12.0', 'cell-ded', 1, 'expanding')$q$,
+    'HK_PLT_INVALID_TRANSITION: rollout starts pending%');
+  PERFORM plt_t.fails('T33 rollout identity immutable',
+    $q$UPDATE platform.cell_rollout SET ring = 1 WHERE release_version = '2026.12.0' AND cell_id = 'cell-01'$q$, 'HK_PLT_IMMUTABLE_FIELD: rollout identity is immutable%');
+END $$;
+
+-- T33b کاتالوگ، جایگزین، دستیار
+DO $$
+DECLARE
+  v_pv uuid; v_p1 uuid; v_p2 uuid; v_c uuid; v_prov uuid; v_eval uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('SL'));
+  PERFORM plt_t.fails('T33 availability end only when retiring',
+    format($q$UPDATE platform.product_version SET available_to = current_date + 100 WHERE id = %L$q$, plt_t.u('PV1')), 'HK_PLT_PRODUCT_FROZEN: availability end is set when retiring%');
+  PERFORM plt_t.fails('T33 publication fields only when publishing',
+    format($q$UPDATE platform.product_version SET published_at = now() - interval '1 day' WHERE id = %L$q$, plt_t.u('PV1')), 'HK_PLT_IMMUTABLE_FIELD: publication fields change only when publishing%');
+  INSERT INTO platform.product_version (product_code, version, available_from, created_by) VALUES ('pro', 3, current_date, plt_t.u('SL')) RETURNING id INTO v_pv;
+  PERFORM plt_t.fails('T33 review needs a price (exact)',
+    format($q$UPDATE platform.product_version SET status = 'in_review' WHERE id = %L$q$, v_pv), 'HK_PLT_PRODUCT_SHAPE: a product version needs at least one price%');
+  INSERT INTO platform.price (product_version_id, billing_period) VALUES (v_pv, 'P1M') RETURNING id INTO v_p1;
+  PERFORM plt_t.fails('T33 every price needs a component (exact)',
+    format($q$UPDATE platform.product_version SET status = 'in_review' WHERE id = %L$q$, v_pv), 'HK_PLT_PRODUCT_SHAPE: every price needs at least one component%');
+  INSERT INTO platform.price_component (price_id, line_no, kind, unit_amount) VALUES (v_p1, 1, 'flat', 1000) RETURNING id INTO v_c;
+  PERFORM plt_t.fails('T33 plans need entitlements (exact)',
+    format($q$UPDATE platform.product_version SET status = 'in_review' WHERE id = %L$q$, v_pv), 'HK_PLT_PRODUCT_SHAPE: plans and licenses need entitlements%');
+  INSERT INTO platform.price (product_version_id, billing_period) VALUES (v_pv, 'P1Y') RETURNING id INTO v_p2;
+  PERFORM plt_t.fails('T33 component cannot move between prices',
+    format($q$UPDATE platform.price_component SET price_id = %L WHERE id = %L$q$, v_p2, v_c), 'HK_PLT_IMMUTABLE_FIELD: component cannot move between prices%');
+  PERFORM plt_t.fails('T33 price cannot move between versions',
+    format($q$UPDATE platform.price SET product_version_id = %L WHERE id = %L$q$, plt_t.u('PV5'), v_p2), 'HK_PLT_IMMUTABLE_FIELD: child rows cannot move between product versions%');
+  PERFORM plt_t.fails('T33 tiers must be a non-empty array',
+    format($q$INSERT INTO platform.price_component (price_id, line_no, kind, metric_key, tiers) VALUES (%L, 2, 'tiered', 'limit.users', '[]')$q$, v_p1),
+    'HK_PLT_PRICE_SHAPE: tiers must be a non-empty array%');
+  PERFORM plt_t.fails('T33 limit entitlement sets limit only',
+    format($q$INSERT INTO platform.product_entitlement (product_version_id, feature_key, enabled, limit_value) VALUES (%L, 'limit.users', true, 5)$q$, v_pv),
+    'HK_PLT_ENTITLEMENT_SHAPE: limit/meter entitlements set limit_value only%');
+  DELETE FROM platform.price_component WHERE price_id IN (v_p1, v_p2);
+  DELETE FROM platform.price WHERE product_version_id = v_pv;
+  DELETE FROM platform.product_version WHERE id = v_pv;
+  PERFORM plt_t.fails('T33 entitlement override cannot be created revoked',
+    format($q$INSERT INTO platform.tenant_entitlement_override (tenant_id, feature_key, mode, limit_value, valid_to, reason, granted_by, revoked_at, revoked_by)
+              VALUES (%L, 'limit.branches', 'add', 1, now() + interval '5 days', 'created revoked override', %L, now(), %L)$q$, plt_t.u('TB'), plt_t.u('SL'), plt_t.u('SL')),
+    'HK_PLT_INVALID_TRANSITION: override cannot be created revoked%');
+
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  SELECT id INTO v_prov FROM platform.ai_provider WHERE code = 'ir-llm';
+  PERFORM plt_t.fails('T33 AI provider identity immutable',
+    format($q$UPDATE platform.ai_provider SET code = 'ir-llm-2' WHERE id = %L$q$, v_prov), 'HK_PLT_IMMUTABLE_FIELD: provider identity is immutable%');
+  PERFORM plt_t.fails('T33 destination and status change in separate steps',
+    format($q$UPDATE platform.ai_provider SET base_url = 'https://x3.example.ir/v1', status = 'retired' WHERE id = %L$q$, v_prov),
+    'HK_PLT_INVALID_TRANSITION: change the destination and the status in separate steps%');
+  SELECT id INTO v_eval FROM platform.ai_eval_run WHERE provider_id = v_prov AND provider_version = 1 AND passed;
+  PERFORM plt_t.fails('T33 eval of an older version cannot be attached',
+    format($q$UPDATE platform.ai_provider SET last_eval_run_id = %L WHERE id = %L$q$, v_eval, v_prov), 'HK_PLT_AI_EVAL_MISMATCH: the eval run must belong to this provider version%');
+  PERFORM plt_t.fails('T33 eval executed_by is the actor',
+    format($q$INSERT INTO platform.ai_eval_run (provider_id, provider_version, prompt_version, toolset_sha256, suite, suite_version,
+                started_at, finished_at, cases, passed_cases, threshold_version, passed, executed_by_kind, executed_by)
+              VALUES (%L, (SELECT version FROM platform.ai_provider WHERE id = %L), '2026.11.0', plt_t.h('tools'), 'assistant.golden', '1', now() - interval '1 minute', now(), 10, 10, 't1', true, 'staff', %L)$q$,
+           v_prov, v_prov, plt_t.u('O')),
+    'HK_PLT_ACTOR_MISMATCH: executed_by must be the acting staff member%');
+  PERFORM plt_t.fails('T33 AI price closed only from now on',
+    format($q$UPDATE platform.ai_provider_price SET valid_to = now() - interval '1 day' WHERE provider_id = %L AND valid_from < now()$q$, v_prov),
+    'HK_PLT_INVALID_TRANSITION: an AI price can only be closed from now on%');
+  PERFORM plt_t.fails('T33 AI override cannot be created revoked',
+    format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, kill_reason, reason, created_by, revoked_at, revoked_by)
+              VALUES (%L, false, 'kill', 'created revoked override', %L, now(), %L)$q$, plt_t.u('TB'), plt_t.u('A'), plt_t.u('A')),
+    'HK_PLT_INVALID_TRANSITION: override cannot be created revoked%');
+  PERFORM plt_t.fails('T33 AI override revoked_by is the actor',
+    format($q$UPDATE platform.ai_tenant_override SET revoked_at = now(), revoked_by = %L WHERE tenant_id = %L AND revoked_at IS NULL$q$, plt_t.u('O'), plt_t.u('TA')),
+    'HK_PLT_ACTOR_MISMATCH: revoked_by must be the acting staff member%');
+END $$;
+
+-- T33c اشتراک، دوره، صورتحساب، پرداخت، بازپرداخت، نماینده، سفارش، اطلاعیه
+DO $$
+DECLARE
+  v_t uuid := uuidv7(); v_ba uuid; v_sub uuid; v_sub_a uuid; v_inv uuid; v_inv2 uuid; v_line uuid; v_term uuid; v_cn uuid;
+  v_orig_line record; v_w uuid; v_ann uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  SELECT id INTO v_sub_a FROM platform.subscription WHERE tenant_id = plt_t.u('TA') AND status <> 'cancelled';
+  INSERT INTO platform.tenant (id, slug, display_name, deployment) VALUES (v_t, 't33-c', 'مستأجر آزمون ۳۳ج', 'saas_shared');
+  INSERT INTO platform.billing_account (owner_kind, tenant_id, buyer_type, legal_name, billing_mobile)
+  VALUES ('tenant', v_t, 'unregistered', 'خریدار آزمون', '09124444444') RETURNING id INTO v_ba;
+  PERFORM plt_t.fails('T33 subscription starts without coverage',
+    format($q$INSERT INTO platform.subscription (tenant_id, billing_account_id, plan_version_id, billing_period, status, covered_through) VALUES (%L, %L, %L, 'P1M', 'active', current_date)$q$, v_t, v_ba, plt_t.u('PV1')),
+    'HK_PLT_INVALID_TRANSITION: subscription starts trialing/active without coverage%');
+  PERFORM plt_t.fails('T33 subscription active -> trialing',
+    format($q$UPDATE platform.subscription SET status = 'trialing' WHERE id = %L$q$, v_sub_a), 'HK_PLT_INVALID_TRANSITION: subscription active -> trialing%');
+  INSERT INTO platform.subscription (tenant_id, billing_account_id, plan_version_id, billing_period, trial_ends_on)
+  VALUES (v_t, v_ba, plt_t.u('PV1'), 'P1M', current_date + 7) RETURNING id INTO v_sub;
+  UPDATE platform.subscription SET status = 'cancelled', cancelled_at = now(), cancel_reason = 't33' WHERE id = v_sub;
+  PERFORM plt_t.fails('T33 cancelled subscription is final',
+    format($q$UPDATE platform.subscription SET cancel_reason = 'changed' WHERE id = %L$q$, v_sub), 'HK_PLT_INVALID_TRANSITION: cancelled subscription is final%');
+  PERFORM plt_t.fails('T33 cancelled subscription takes no terms',
+    format($q$INSERT INTO platform.subscription_term (subscription_id, kind, period_start, period_end, approval_id) VALUES (%L, 'comp', current_date, current_date + 5, (SELECT id FROM platform.approval_request LIMIT 1))$q$, v_sub),
+    'HK_PLT_INVALID_TRANSITION: cancelled subscription takes no terms%');
+  PERFORM plt_t.fails('T33 items use published versions',
+    format($q$INSERT INTO platform.subscription_item (subscription_id, product_version_id, metric_key, quantity, valid_from) VALUES (%L, %L, 'limit.users', 1, current_date)$q$, v_sub_a, plt_t.u('PV5')),
+    'HK_PLT_PLAN_NOT_AVAILABLE: items use published product versions%');
+
+  -- دو پیش‌نویس: سطر بین صورتحساب‌ها جابه‌جا نمی‌شود
+  INSERT INTO platform.invoice (billing_account_id, tenant_id) VALUES (plt_t.u('BA_A'), plt_t.u('TA')) RETURNING id INTO v_inv;
+  INSERT INTO platform.invoice (billing_account_id, tenant_id) VALUES (plt_t.u('BA_A'), plt_t.u('TA')) RETURNING id INTO v_inv2;
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_inv, 1, 'service', 'خدمت صفر', 1, 0, 0, 10, 0, 0) RETURNING id INTO v_line;
+  PERFORM plt_t.fails('T33 line cannot move between invoices',
+    format($q$UPDATE platform.invoice_line SET invoice_id = %L WHERE id = %L$q$, v_inv2, v_line), 'HK_PLT_IMMUTABLE_FIELD: line cannot move between invoices%');
+  DELETE FROM platform.invoice WHERE id = v_inv2;
+  -- صورتحساب صفر ← پرداخت‌شده ← دورهٔ فعال پرداخت‌شده؛ ابطال آن بدون یادداشت اعتباری ممنوع
+  UPDATE platform.invoice SET status = 'issued', period_key = 'jy:1405' WHERE id = v_inv;
+  INSERT INTO platform.subscription_term (subscription_id, kind, period_start, period_end, invoice_id)
+  VALUES (v_sub_a, 'paid', current_date + 400, current_date + 430, v_inv) RETURNING id INTO v_term;
+  PERFORM plt_t.ok('T33 zero-invoice term active', (SELECT status = 'active' FROM platform.subscription_term WHERE id = v_term));
+  PERFORM plt_t.fails('T33 active paid term voided only after a credit note',
+    format($q$UPDATE platform.subscription_term SET status = 'void' WHERE id = %L$q$, v_term), 'HK_PLT_TERM_VOID: an active paid term is voided only after a credit note%');
+  PERFORM plt_t.fails('T33 term content immutable',
+    format($q$UPDATE platform.subscription_term SET period_end = period_end + 1 WHERE id = %L$q$, v_term), 'HK_PLT_IMMUTABLE_FIELD: term content is immutable%');
+  PERFORM plt_t.fails('T33 term active -> pending',
+    format($q$UPDATE platform.subscription_term SET status = 'pending' WHERE id = %L$q$, v_term), 'HK_PLT_INVALID_TRANSITION: term active -> pending%');
+  -- یادداشت اعتباری صفر
+  SELECT l.* INTO v_orig_line FROM platform.invoice_line l JOIN platform.invoice i ON i.id = l.invoice_id
+   WHERE i.kind = 'invoice' AND i.status IN ('issued','paid') AND i.billing_account_id = plt_t.u('BA_A') AND l.total > 0 LIMIT 1;
+  INSERT INTO platform.invoice (kind, billing_account_id, tenant_id, original_invoice_id)
+  VALUES ('credit_note', plt_t.u('BA_A'), plt_t.u('TA'), v_orig_line.invoice_id) RETURNING id INTO v_cn;
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_cn, 1, 'adjustment', v_orig_line.id, 'برگشت صفر', 1, 0, 0, v_orig_line.vat_rate_pct, 0, 0);
+  PERFORM plt_t.fails('T33 credit note total must be positive',
+    format($q$UPDATE platform.invoice SET status = 'issued', period_key = 'jy:1405' WHERE id = %L$q$, v_cn), 'HK_PLT_INVOICE_TOTALS: credit note total must be positive%');
+  DELETE FROM platform.invoice_line WHERE invoice_id = v_cn;
+  DELETE FROM platform.invoice WHERE id = v_cn;
+  PERFORM plt_t.fails('T33 house sync identity immutable',
+    format($q$UPDATE platform.house_sync SET doc_id = %L WHERE doc_id = %L$q$, uuidv7(), v_inv), 'HK_PLT_IMMUTABLE_FIELD: house sync identity is immutable%');
+  SELECT id INTO v_w FROM platform.wallet WHERE tenant_id = plt_t.u('TA');
+  PERFORM plt_t.fails('T33 wallet owner immutable',
+    format($q$UPDATE platform.wallet SET tenant_id = %L WHERE id = %L$q$, v_t, v_w), 'HK_PLT_IMMUTABLE_FIELD: wallet owner is immutable%');
+
+  -- پرداخت
+  PERFORM plt_t.fails('T33 payments start as created',
+    format($q$INSERT INTO platform.payment (payer_kind, billing_account_id, tenant_id, purpose, wallet_id, method, gateway_account_id, provider, order_id, amount, api_amount, api_amount_unit, expires_at, state)
+              VALUES ('tenant', %L, %L, 'wallet_topup', %L, 'gateway', %L, 'zarinpal', 'T33-ORDER-1', 1000, 1000, 'IRR', now() + interval '20 minutes', 'verified')$q$,
+           plt_t.u('BA_A'), plt_t.u('TA'), v_w, plt_t.u('GW1')),
+    'HK_PLT_INVALID_TRANSITION: payments start as created%');
+  PERFORM plt_t.fails('T33 billing account belongs to payer',
+    format($q$INSERT INTO platform.payment (payer_kind, billing_account_id, tenant_id, purpose, wallet_id, method, gateway_account_id, provider, order_id, amount, api_amount, api_amount_unit, expires_at)
+              VALUES ('tenant', %L, %L, 'wallet_topup', %L, 'gateway', %L, 'zarinpal', 'T33-ORDER-2', 1000, 1000, 'IRR', now() + interval '20 minutes')$q$,
+           plt_t.u('BA_A'), plt_t.u('TB'), v_w, plt_t.u('GW1')),
+    'HK_PLT_BILLING_ACCOUNT_MISMATCH: billing account does not belong to payer%');
+  PERFORM plt_t.fails('T33 top-up wallet belongs to payer',
+    format($q$INSERT INTO platform.payment (payer_kind, billing_account_id, tenant_id, purpose, wallet_id, method, gateway_account_id, provider, order_id, amount, api_amount, api_amount_unit, expires_at)
+              VALUES ('tenant', %L, %L, 'wallet_topup', (SELECT id FROM platform.wallet WHERE reseller_id = %L), 'gateway', %L, 'zarinpal', 'T33-ORDER-3', 1000, 1000, 'IRR', now() + interval '20 minutes')$q$,
+           plt_t.u('BA_A'), plt_t.u('TA'), plt_t.u('R1'), plt_t.u('GW1')),
+    'HK_PLT_PAYMENT_TARGET: top-up wallet does not belong to payer%');
+  PERFORM plt_t.fails('T33 provider_txn_ref set once',
+    $q$UPDATE platform.payment SET provider_txn_ref = 'other-txn' WHERE provider_txn_ref IS NOT NULL AND provider = 'zarinpal'$q$, 'HK_PLT_IMMUTABLE_FIELD: provider_txn_ref is set once%');
+  PERFORM plt_t.fails('T33 refunds start as requested',
+    format($q$INSERT INTO platform.refund (wallet_id, amount, method, destination_sheba, status, requested_by, approval_id) VALUES (%L, 10, 'paya', 'IR000000000000000000000009', 'approved', %L, (SELECT id FROM platform.approval_request LIMIT 1))$q$, v_w, plt_t.u('F')),
+    'HK_PLT_INVALID_TRANSITION: refunds start as requested%');
+  PERFORM plt_t.fails('T33 gateway refund needs a verified payment of the owner',
+    format($q$INSERT INTO platform.refund (wallet_id, payment_id, amount, method, requested_by) VALUES (%L, (SELECT id FROM platform.payment WHERE state = 'reversed' LIMIT 1), 10, 'gateway_refund', %L)$q$, v_w, plt_t.u('F')),
+    'HK_PLT_REFUND_SOURCE: gateway refund needs a verified payment of the wallet owner%');
+
+  -- نماینده
+  PERFORM plt_t.fails('T33 reversal of a reversal',
+    format($q$INSERT INTO platform.commission_entry (reseller_id, event, amount, reverses_entry_id) VALUES (%L, 'reversal', -1, (SELECT id FROM platform.commission_entry WHERE event = 'reversal' AND reseller_id = %L LIMIT 1))$q$, plt_t.u('R1'), plt_t.u('R1')),
+    'HK_PLT_COMMISSION_REVERSAL: reversals target an accrual of the same reseller%');
+  PERFORM plt_t.fails('T33 payouts start as draft',
+    format($q$INSERT INTO platform.payout (reseller_id, wallet_id, amount, sheba, status, requested_by_kind, requested_by_id) VALUES (%L, (SELECT id FROM platform.wallet WHERE reseller_id = %L), 1, 'IR000000000000000000000001', 'submitted', 'staff', %L)$q$,
+           plt_t.u('R1'), plt_t.u('R1'), plt_t.u('F')),
+    'HK_PLT_INVALID_TRANSITION: payouts start as draft%');
+  PERFORM plt_t.fails('T33 payout owner immutable',
+    format($q$UPDATE platform.payout SET reseller_id = %L WHERE reseller_id = %L$q$, plt_t.u('R2'), plt_t.u('R1')), 'HK_PLT_IMMUTABLE_FIELD: payout owner is immutable%');
+  PERFORM plt_t.fails('T33 service orders start as requested',
+    format($q$INSERT INTO platform.service_order (tenant_id, kind, status, quote_amount) VALUES (%L, 'training', 'quoted', 1)$q$, plt_t.u('TA')),
+    'HK_PLT_INVALID_TRANSITION: service orders start as requested%');
+
+  -- پشتیبانی و اطلاعیه
+  PERFORM plt_t.as_staff(plt_t.u('S'));
+  PERFORM plt_t.fails('T33 impersonation starts requested or approved',
+    format($q$INSERT INTO platform.impersonation_request (tenant_id, grant_id, requester_kind, staff_id, mode, reason, ticket_ref, max_minutes, status) VALUES (%L, %L, 'staff', %L, 'read_only', 'check the closing balances', 'T-000001', 30, 'issued')$q$,
+           plt_t.u('TA'), plt_t.u('G1'), plt_t.u('S')),
+    'HK_PLT_INVALID_TRANSITION: impersonation starts as requested (write) or approved (read-only)%');
+  PERFORM plt_t.fails('T33 impersonation approved -> used',
+    $q$UPDATE platform.impersonation_request SET status = 'used' WHERE status = 'approved'$q$, 'HK_PLT_INVALID_TRANSITION: impersonation approved -> used%');
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.fails('T33 announcements start as draft',
+    $q$INSERT INTO platform.announcement (kind, title_fa, body_fa, starts_at, ends_at, status, published_at, published_by) VALUES ('banner', 't', 'b', now(), now() + interval '1 day', 'published', now(), plt_t.u('A'))$q$,
+    'HK_PLT_INVALID_TRANSITION: announcements start as draft%');
+  INSERT INTO platform.announcement (kind, title_fa, body_fa, starts_at, ends_at, created_by) VALUES ('banner', 'آزمون', 'متن', now(), now() + interval '1 day', plt_t.u('A')) RETURNING id INTO v_ann;
+  PERFORM plt_t.fails('T33 announcement published_by is the actor',
+    format($q$UPDATE platform.announcement SET status = 'published', published_by = %L WHERE id = %L$q$, plt_t.u('O'), v_ann), 'HK_PLT_ACTOR_MISMATCH: published_by must be the acting staff member%');
+END $$;
+
+-- T33d نصب و لایسنس
+DO $$
+DECLARE
+  v_lic uuid; v_inst platform.installation%ROWTYPE; v_prev uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  SELECT * INTO v_inst FROM platform.installation WHERE id = plt_t.u('INST1');
+  PERFORM plt_t.fails('T33 fingerprint must be an object',
+    format($q$INSERT INTO platform.installation (id, tenant_id, install_pubkey, fingerprint) VALUES (%L, %L, decode(repeat('3a', 32), 'hex'), '[]')$q$, uuidv7(), v_inst.tenant_id),
+    'HK_PLT_FINGERPRINT_SHAPE: fingerprint must be an object%');
+  PERFORM plt_t.fails('T33 installations start pending activation',
+    format($q$INSERT INTO platform.installation (id, tenant_id, install_pubkey, fingerprint, status) VALUES (%L, %L, decode(repeat('3b', 32), 'hex'), plt_t.fp('t33'), 'active')$q$, uuidv7(), v_inst.tenant_id),
+    'HK_PLT_INVALID_TRANSITION: installations start pending activation%');
+  PERFORM plt_t.fails('T33 installation identity immutable',
+    format($q$UPDATE platform.installation SET install_pubkey = decode(repeat('3c', 32), 'hex') WHERE id = %L$q$, v_inst.id), 'HK_PLT_IMMUTABLE_FIELD: installation identity is immutable%');
+  PERFORM plt_t.fails('T33 installation active -> pending',
+    format($q$UPDATE platform.installation SET status = 'pending_activation' WHERE id = %L$q$, v_inst.id), 'HK_PLT_INVALID_TRANSITION: installation active -> pending_activation%');
+  PERFORM plt_t.fails('T33 licenses start as drafts (exact)',
+    format($q$INSERT INTO platform.license (tenant_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until, status) VALUES (%L, %L, 'perpetual', 'pro', '{accounting}', '{"users": 1}', current_date, current_date + 10, current_date + 10, 'issued')$q$,
+           v_inst.tenant_id, plt_t.u('PV3')),
+    'HK_PLT_INVALID_TRANSITION: licenses start as unsigned drafts%');
+  PERFORM plt_t.fails('T33 license limits must be an object',
+    format($q$INSERT INTO platform.license (tenant_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until) VALUES (%L, %L, 'perpetual', 'pro', '{accounting}', '[]', current_date, current_date + 10, current_date + 10)$q$,
+           v_inst.tenant_id, plt_t.u('PV3')),
+    'HK_PLT_LICENSE_SHAPE: limits must be an object%');
+  PERFORM plt_t.fails('T33 licenses for on-prem tenants only',
+    format($q$INSERT INTO platform.license (tenant_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until) VALUES (%L, %L, 'perpetual', 'pro', '{accounting}', '{"users": 1}', current_date, current_date + 10, current_date + 10)$q$,
+           plt_t.u('TA'), plt_t.u('PV3')),
+    'HK_PLT_NOT_ONPREM: licenses are for on-prem tenants%');
+  INSERT INTO platform.license (tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, valid_until, updates_until, support_until)
+  VALUES (v_inst.tenant_id, v_inst.id, plt_t.u('PV3'), 'trial', 'pro', '{accounting}', '{"users": 1}', current_date, current_date + 20, current_date + 20, current_date + 20)
+  RETURNING id INTO v_lic;
+  SELECT id INTO v_prev FROM platform.license WHERE installation_id = v_inst.id AND status = 'issued';
+  PERFORM plt_t.fails('T33 license binds to a live installation',
+    format($q$UPDATE platform.license SET status = 'issued', installation_id = %L WHERE id = %L$q$, uuidv7(), v_lic), 'HK_PLT_LICENSE_BINDING: license must bind to a live installation of the same tenant%');
+  PERFORM plt_t.fails('T33 successor replaces the issued license',
+    format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = %s, supersedes_license_id = (SELECT id FROM platform.license WHERE installation_id = %L AND status = 'revoked' LIMIT 1) WHERE id = %L$q$,
+           v_inst.fingerprint, v_inst.min_match, v_inst.id, v_lic),
+    'HK_PLT_LICENSE_SUPERSEDE: successor must replace the issued license of the same installation%');
+  PERFORM plt_t.fails('T33 license issued_by is the actor',
+    format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = %s, supersedes_license_id = %L, issued_by_kind = 'staff', issued_by_id = %L WHERE id = %L$q$,
+           v_inst.fingerprint, v_inst.min_match, v_prev, plt_t.u('O'), v_lic),
+    'HK_PLT_ACTOR_MISMATCH: issued_by must be the acting staff member%');
+  PERFORM plt_t.fails('T33 license draft -> expired',
+    format($q$UPDATE platform.license SET status = 'expired' WHERE id = %L$q$, v_lic), 'HK_PLT_INVALID_TRANSITION: license draft -> expired%');
+  UPDATE platform.license SET status = 'cancelled' WHERE id = v_lic;
+END $$;
+
+-- T33e قواعد، بستهٔ صنفی، درخواست داده
+DO $$
+DECLARE
+  v_pkg uuid; v_pub uuid; v_dr uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('T'));
+  SELECT id INTO v_pub FROM platform.rules_package WHERE code = 'ir.tax' AND status = 'published';
+  PERFORM plt_t.fails('T33 rules packages start as draft',
+    format($q$INSERT INTO platform.rules_package (code, version, seq, covers_from, min_engine_version, changelog_fa, authored_by, status) VALUES ('ir.tax', '1405.8', 8, current_date, '2026.11.0', 'x', %L, 'approved')$q$, plt_t.u('T')),
+    'HK_PLT_INVALID_TRANSITION: rules packages start as draft%');
+  INSERT INTO platform.rules_package (code, version, seq, covers_from, min_engine_version, changelog_fa, authored_by)
+  VALUES ('ir.tax', '1405.9', 9, current_date, '2026.11.0', 'بستهٔ آزمون ۳۳', plt_t.u('T')) RETURNING id INTO v_pkg;
+  PERFORM plt_t.fails('T33 content cannot move between packages',
+    format($q$UPDATE platform.rules_value SET package_id = %L WHERE package_id = %L$q$, v_pkg, v_pub), 'HK_PLT_IMMUTABLE_FIELD: content cannot move between packages%');
+  PERFORM plt_t.fails('T33 deprecated key takes no value',
+    format($q$INSERT INTO platform.rules_value (package_id, key, effective_from, value, source_ref, confidence) VALUES (%L, 'tax.vat.legacy_rate', current_date, '"9"', 'بخشنامه', 'high')$q$, v_pkg),
+    'HK_PLT_RULES_KEY_DEPRECATED: key tax.vat.legacy_rate is deprecated%');
+  INSERT INTO platform.rules_value (package_id, key, effective_from, value, source_ref, confidence)
+  VALUES (v_pkg, 'tax.vat.standard_rate', current_date, '"10"', 'قانون بودجه', 'high');
+  INSERT INTO platform.rules_golden_test (package_id, code, calculator, as_of, input, expected, signed_by)
+  VALUES (v_pkg, 'vat-10', 'tax.vat_line', current_date, '{"amount": "100"}', '{"vat": "10"}', 'staff:t');
+  UPDATE platform.rules_package SET status = 'in_review' WHERE id = v_pkg;
+  PERFORM plt_t.fails('T33 review round advances only on submission',
+    format($q$UPDATE platform.rules_package SET review_round = 7 WHERE id = %L$q$, v_pkg), 'HK_PLT_IMMUTABLE_FIELD: review round advances only on submission%');
+  PERFORM plt_t.fails('T33 rules package in_review -> published',
+    format($q$UPDATE platform.rules_package SET status = 'published' WHERE id = %L$q$, v_pkg), 'HK_PLT_INVALID_TRANSITION: rules package in_review -> published%');
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.fails('T33 reviewer is the acting staff member',
+    format($q$INSERT INTO platform.rules_review (package_id, round, reviewer_staff_id, qualification_role, decision) VALUES (%L, 1, %L, 'compliance_tax', 'approve')$q$, v_pkg, plt_t.u('T2')),
+    'HK_PLT_ACTOR_MISMATCH: reviewer must be the acting staff member%');
+  PERFORM plt_t.as_staff(plt_t.u('T'));
+  UPDATE platform.rules_package SET status = 'abandoned' WHERE id = v_pkg;
+
+  PERFORM plt_t.fails('T33 pack versions start as draft',
+    format($q$INSERT INTO platform.industry_pack_version (pack_code, version, manifest, manifest_sha256, min_app_version, authored_by, status) VALUES ('cafe', '8.0.0', '{"format":"hkpack/1","pack":"cafe","version":"8.0.0"}', plt_t.h('m8'), '2026.11.0', %L, 'in_review')$q$, plt_t.u('T')),
+    'HK_PLT_INVALID_TRANSITION: pack versions start as draft%');
+  INSERT INTO platform.industry_pack_version (pack_code, version, manifest, manifest_sha256, min_app_version, authored_by)
+  VALUES ('cafe', '9.0.0', '{"format":"hkpack/1","pack":"cafe","version":"9.0.0"}', plt_t.h('m9'), '2026.11.0', plt_t.u('T')),
+         ('cafe', '9.1.0', '{"format":"hkpack/1","pack":"cafe","version":"9.1.0"}', plt_t.h('m91'), '2026.11.0', plt_t.u('T'));
+  PERFORM plt_t.fails('T33 pack version draft -> published',
+    $q$UPDATE platform.industry_pack_version SET status = 'published' WHERE pack_code = 'cafe' AND version = '9.1.0'$q$, 'HK_PLT_INVALID_TRANSITION: pack version draft -> published%');
+  UPDATE platform.industry_pack_version SET status = 'in_review' WHERE pack_code = 'cafe' AND version = '9.0.0';
+  PERFORM plt_t.fails('T33 pack reviewer is the acting staff member',
+    format($q$UPDATE platform.industry_pack_version SET status = 'published', reviewed_by = %L, gate_passed = true, hksb_sha256 = plt_t.h('h9') WHERE pack_code = 'cafe' AND version = '9.0.0'$q$, plt_t.u('O')),
+    'HK_PLT_APPROVER_NOT_ELIGIBLE: reviewer must be the acting staff member with platform.pack.review%');
+  DELETE FROM platform.industry_pack_version WHERE pack_code = 'cafe' AND version = '9.1.0';
+
+  PERFORM plt_t.as_staff(plt_t.u('S'));
+  INSERT INTO platform.data_request (tenant_id, kind, requested_via, requester_name, created_by_staff, due_by)
+  VALUES (plt_t.u('TB'), 'full_export', 'tenant_owner', 'مالک کفش', plt_t.u('S'), current_date + 30) RETURNING id INTO v_dr;
+  UPDATE platform.data_request SET status = 'in_review' WHERE id = v_dr;
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.fails('T33 data request reviewer is the actor',
+    format($q$UPDATE platform.data_request SET status = 'approved', reviewer_staff_id = %L WHERE id = %L$q$, plt_t.u('O'), v_dr), 'HK_PLT_ACTOR_MISMATCH: reviewer must be the acting staff member%');
+  PERFORM plt_t.fails('T33 data request identity immutable',
+    format($q$UPDATE platform.data_request SET kind = 'personal_data_export' WHERE id = %L$q$, v_dr), 'HK_PLT_IMMUTABLE_FIELD: data request identity is immutable%');
+END $$;
+
 -- =====================================================================
 -- بخش ۴: جداسازی نماینده‌ها با RLS (hk_partner_app)
 -- =====================================================================
@@ -2190,6 +2811,13 @@ BEGIN
   PERFORM plt_t.fails('T26 partner cannot write keys of others',
     format($q$INSERT INTO platform.idempotency_key (principal_kind, principal_id, key, method, path, request_sha256, expires_at, response_status) VALUES ('staff', %L, 'stolen-key-000000001', 'POST', '/x', plt_t.h('x'), now() + interval '1 day', 200)$q$, plt_t.u('A')),
     '%row-level security%');
+  PERFORM plt_t.fails('T26 partner impersonation by the acting user only',
+    format($q$INSERT INTO platform.impersonation_request (tenant_id, grant_id, requester_kind, reseller_user_id, reseller_id, mode, reason, ticket_ref, max_minutes) VALUES (%L, %L, 'reseller_user', %L, %L, 'read_only', 'help with the opening balance', 'T-000002', 30)$q$,
+           plt_t.u('TA'), plt_t.u('G3'), plt_t.u('RU2'), plt_t.u('R1')),
+    'HK_PLT_PARTNER_SCOPE: partner impersonation is requested by the acting reseller user%');
+  PERFORM plt_t.fails('T26 partner messages authored by the acting user',
+    format($q$INSERT INTO platform.ticket_message (ticket_id, seq, author_kind, author_ref, visibility, body) VALUES (%L, 0, 'reseller_user', %L, 'partner', 'x')$q$, plt_t.u('TK2'), plt_t.u('RU2')),
+    'HK_PLT_PARTNER_SCOPE: partner messages are authored by the acting reseller user%');
   -- بدون زمینه: هیچ سطری
   PERFORM set_config('app.reseller_id', '', true);
   PERFORM plt_t.ok('T26 no context, no rows', (SELECT count(*) = 0 FROM platform.tenant) AND (SELECT count(*) = 0 FROM platform.invoice));
@@ -2251,6 +2879,133 @@ UPDATE platform.audit_log SET reason = 'tampered' WHERE seq = 2;
 DO $$
 BEGIN
   PERFORM plt_t.ok('T28 tamper detected', EXISTS (SELECT 1 FROM platform.audit_verify() WHERE seq = 2 AND problem = 'row_hash'));
+END $$;
+ROLLBACK;
+
+-- T32 حذف حتی برای مالک پایگاه داده ممنوع است (لایهٔ دوم پشت GRANT؛ پیام دقیق هر نگهبان)
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN SELECT * FROM (VALUES
+    ('audit_chain_head',        'audit chain head cannot be deleted'),
+    ('number_counter',          'number counters are never deleted'),
+    ('tenant_legal_hold',       'legal holds are released, never deleted'),
+    ('tenant',                  'tenants are purged by lifecycle, never deleted'),
+    ('tenant_placement',        'placements are retired, never deleted'),
+    ('cell_command',            'commands are never deleted'),
+    ('uplink_batch',            'uplink batches are kept for dedupe'),
+    ('tenant_entitlement_override', 'overrides are revoked, never deleted'),
+    ('ai_provider',             'AI providers are retired, never deleted'),
+    ('ai_tenant_override',      'AI overrides are revoked, never deleted'),
+    ('subscription',            'subscriptions are cancelled, never deleted'),
+    ('house_sync',              'house sync records are kept'),
+    ('wallet',                  'wallets are closed, never deleted'),
+    ('subscription_term',       'terms are voided, never deleted'),
+    ('payment',                 'payments are never deleted'),
+    ('refund',                  'refunds are cancelled, never deleted'),
+    ('payout',                  'payouts are cancelled, never deleted'),
+    ('support_consent',         'consent mirror rows are kept'),
+    ('impersonation_request',   'impersonation requests are kept'),
+    ('installation',            'installations are deactivated, never deleted'),
+    ('license',                 'licenses are cancelled or revoked, never deleted'),
+    ('license_activation',      'activation requests are kept'),
+    ('backup_drill',            'a finished drill is immutable; a running drill only finishes'),
+    ('rules_package',           'rules packages are abandoned, never deleted'),
+    ('approval_request',        'DELETE on platform.approval_request is not allowed'),
+    ('staff_role_assignment',   'DELETE on platform.staff_role_assignment is not allowed'),
+    ('service_order',           'DELETE on platform.service_order is not allowed'),
+    ('ticket',                  'DELETE on platform.ticket is not allowed')
+  ) v(tbl, msg) LOOP
+    PERFORM plt_t.fails('T32 owner cannot delete ' || r.tbl, format('DELETE FROM platform.%I', r.tbl), 'HK_PLT_IMMUTABLE: ' || r.msg || '%');
+  END LOOP;
+END $$;
+
+-- T32b شاخه‌های دفاع در عمق که از مسیر عادی برنامه دسترس‌پذیر نیستند: با دور زدن آگاهانه (نقش مالک) بررسی می‌شوند؛ همه rollback
+BEGIN;
+CREATE TABLE plt_t.poke (n int);
+CREATE FUNCTION plt_t.poke_fn() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN
+  UPDATE platform.number_counter SET next_value = next_value + 2 WHERE series = 'ticket';
+  RETURN NULL;
+END $f$;
+CREATE TRIGGER poke AFTER INSERT ON plt_t.poke FOR EACH ROW EXECUTE FUNCTION plt_t.poke_fn();
+DO $$
+BEGIN
+  PERFORM plt_t.fails('T32 counter advances by exactly one even from a trigger', $q$INSERT INTO plt_t.poke VALUES (1)$q$,
+    'HK_PLT_NUMBER_COUNTER: counter only advances by one%');
+END $$;
+ROLLBACK;
+
+BEGIN;
+SET LOCAL session_replication_role = replica;
+INSERT INTO platform.tenant (id, slug, display_name, deployment) VALUES ('70000000-0000-7000-8000-00000000ffff', 't32-orphan', 'بدون رویداد', 'saas_shared');
+SET LOCAL session_replication_role = origin;
+DO $$
+BEGIN
+  PERFORM plt_t.fails('T32 first lifecycle event is the creation event',
+    $q$INSERT INTO platform.tenant_lifecycle_event (tenant_id, seq, to_status, actor_kind, reason_code) VALUES ('70000000-0000-7000-8000-00000000ffff', 0, 'trial', 'system', 'manual_test')$q$,
+    'HK_PLT_INVALID_TRANSITION: first lifecycle event is the creation event%');
+END $$;
+ROLLBACK;
+
+BEGIN;
+DO $$
+DECLARE
+  v_p uuid; v_a uuid; v_w uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  INSERT INTO platform.approval_request (action, subject_type, subject_id, requested_by, reason)
+  VALUES ('invoice.void', 'invoice', uuidv7(), plt_t.u('A'), 'request that will expire') RETURNING id INTO v_p;
+  SELECT id INTO v_w FROM platform.wallet WHERE tenant_id = plt_t.u('TA');
+  v_a := plt_t.approve('wallet.manual_adjustment', 'wallet', v_w, plt_t.u('A'), plt_t.u('O'));
+  PERFORM set_config('session_replication_role', 'replica', true);
+  UPDATE platform.approval_request SET expires_at = now() - interval '1 minute' WHERE id IN (v_p, v_a);
+  PERFORM set_config('session_replication_role', 'origin', true);
+  PERFORM plt_t.as_staff(plt_t.u('O'));
+  PERFORM plt_t.fails('T32 expired request cannot be decided',
+    format($q$UPDATE platform.approval_request SET status = 'approved', decided_by = %L WHERE id = %L$q$, plt_t.u('O'), v_p),
+    'HK_PLT_APPROVAL_EXPIRED: approval request has expired%');
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.fails('T32 expired approval cannot be consumed',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id) VALUES (%L, 0, 'adjustment', 1, 0, 't32-adj-exp', %L)$q$, v_w, v_a),
+    'HK_PLT_APPROVAL_EXPIRED: approval has expired%');
+END $$;
+ROLLBACK;
+
+BEGIN;
+DO $$
+DECLARE
+  v_p platform.payment%ROWTYPE; v_w uuid; v_r uuid := uuidv7();
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  SELECT * INTO v_p FROM platform.payment WHERE state = 'verified' AND method = 'gateway' LIMIT 1;
+  SELECT id INTO v_w FROM platform.wallet WHERE tenant_id = v_p.tenant_id;
+  PERFORM set_config('session_replication_role', 'replica', true);
+  INSERT INTO platform.refund (id, wallet_id, payment_id, amount, method, status, approval_id, requested_by)
+  VALUES (v_r, v_w, v_p.id, v_p.verified_amount + 1, 'gateway_refund', 'approved', (SELECT id FROM platform.approval_request LIMIT 1), plt_t.u('F'));
+  UPDATE platform.wallet SET balance = 1000000000000000 WHERE id = v_w;
+  PERFORM set_config('session_replication_role', 'origin', true);
+  PERFORM plt_t.fails('T32 refund never exceeds the verified amount (concurrency guard)',
+    format($q$UPDATE platform.refund SET status = 'completed', bank_ref = 'B-32' WHERE id = %L$q$, v_r),
+    'HK_PLT_REFUND_EXCEEDS: refund exceeds the verified amount%');
+END $$;
+ROLLBACK;
+
+BEGIN;
+DO $$
+DECLARE
+  v_g uuid := uuidv7(); v_req uuid;
+BEGIN
+  INSERT INTO platform.support_consent (tenant_id, grant_id, grantee_kind, access_mode, max_session_minutes, starts_at, expires_at)
+  VALUES (plt_t.u('TA'), v_g, 'platform_support', 'read_only', 60, now() - interval '1 minute', now() + interval '1 day');
+  PERFORM plt_t.as_staff(plt_t.u('S'));
+  INSERT INTO platform.impersonation_request (tenant_id, grant_id, requester_kind, staff_id, mode, reason, ticket_ref, max_minutes)
+  VALUES (plt_t.u('TA'), v_g, 'staff', plt_t.u('S'), 'read_only', 'check the closing balances', 'T-000001', 30) RETURNING id INTO v_req;
+  UPDATE platform.support_consent SET revoked_at = now() WHERE grant_id = v_g;
+  PERFORM plt_t.fails('T32 consent revoked before the assertion is issued',
+    format($q$UPDATE platform.impersonation_request SET status = 'issued', assertion_jti = %L, issued_at = now(), assertion_expires_at = now() + interval '1 minute' WHERE id = %L$q$, uuidv7(), v_req),
+    'HK_PLT_CONSENT_INACTIVE: tenant consent ended before the assertion was issued%');
 END $$;
 ROLLBACK;
 
