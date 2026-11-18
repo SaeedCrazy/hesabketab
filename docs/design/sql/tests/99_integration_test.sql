@@ -255,6 +255,106 @@ BEGIN
   PERFORM it_rec('A', 'A2.fk_to_tenant_only_via_tenant_id', v IS NULL, 'tenant tables referencing core.tenant through another column: ' || v);
 END $$;
 
+-- ---------- A2-DAG: هر FK بین‌اسکیمایی در depends_on جدول ۰۱ §۵-۱ است یا استثنای برچسب‌دار پذیرفته (RV-ARCH-08) ----------
+-- مقایسهٔ شمارهٔ لایه کافی نبود: یال هم‌لایه (چرخهٔ inventory↔tax) و یال رو به پایینِ اعلام‌نشده (treasury→catalog،
+-- pos→ledger) از خودآزمایی قدیم 99 می‌گذشت. این بررسی‌ها تابع پایه core.xfk_dag_violations() را می‌سنجند که خودآزمایی
+-- 99 (HK_XFK_DAG) هم صدا می‌زند.
+DO $$
+DECLARE v text; v2 text;
+BEGIN
+  IF to_regprocedure('core.xfk_dag_violations()') IS NULL OR to_regprocedure('core.module_registry()') IS NULL THEN
+    PERFORM it_rec('A', 'A2.cross_schema_fks_follow_dag', false,
+                   'core.module_registry()/core.xfk_dag_violations() missing from 00_foundation.sql', 'RV-ARCH-08', 'integration');
+    RETURN;
+  END IF;
+  -- (۱) پایگاه یکپارچه: صفر FK بیرون از DAG بدون برچسب
+  SELECT string_agg(x.from_table || '/' || x.conname || ' -> ' || x.to_table || ' [' || x.problem || ']', ', '
+                    ORDER BY x.from_table::text, x.conname) INTO v
+    FROM core.xfk_dag_violations() x;
+  PERFORM it_rec('A', 'A2.cross_schema_fks_follow_dag', v IS NULL,
+                 'cross-schema FKs outside 01 §5-1 depends_on without HK_DAG_EXCEPTION: ' || v, 'RV-ARCH-08', 'integration');
+
+  -- (۲) رجیستری با اسکیماهای واقعی برابر است (اسکیمای تازه بدون ردیف DAG = ماژول بدون ADR)
+  SELECT string_agg(s.nspname, ', ' ORDER BY s.nspname) INTO v
+    FROM public.it_dp_schemas() s WHERE NOT EXISTS (SELECT 1 FROM core.module_registry() m WHERE m.module = s.nspname::text);
+  SELECT string_agg(m.module, ', ' ORDER BY m.module) INTO v2
+    FROM core.module_registry() m WHERE to_regnamespace(m.module) IS NULL;
+  PERFORM it_rec('A', 'A2.dag_registry_matches_schemas', v IS NULL AND v2 IS NULL,
+                 'schemas without a module_registry row: ' || coalesce(v, '-') || '; registry modules without a schema: ' || coalesce(v2, '-'),
+                 'RV-ARCH-08', 'integration');
+
+  -- (۳) خود رجیستری DAG است: هر وابستگی ثبت‌شده است، به لایهٔ هم‌سطح یا پایین‌تر می‌رود، و هیچ چرخه‌ای نیست
+  WITH RECURSIVE e AS (
+    SELECT m.module AS src, d AS dst FROM core.module_registry() m, unnest(m.depends_on) d
+  ), reach(src, dst, path) AS (
+    SELECT src, dst, ARRAY[src, dst] FROM e
+    UNION ALL
+    SELECT r.src, e.dst, r.path || e.dst FROM reach r JOIN e ON e.src = r.dst WHERE NOT e.dst = ANY (r.path)
+  )
+  SELECT string_agg(p, '; ' ORDER BY p) INTO v FROM (
+    SELECT 'unregistered dependency ' || e.src || '->' || e.dst AS p FROM e
+     WHERE NOT EXISTS (SELECT 1 FROM core.module_registry() m WHERE m.module = e.dst)
+    UNION ALL
+    SELECT 'upward dependency ' || e.src || '->' || e.dst FROM e
+      JOIN core.module_registry() ms ON ms.module = e.src JOIN core.module_registry() md ON md.module = e.dst
+     WHERE md.layer > ms.layer
+    UNION ALL
+    SELECT DISTINCT 'cycle at ' || r.src FROM reach r JOIN e ON e.src = r.dst AND e.dst = r.src
+  ) q;
+  PERFORM it_rec('A', 'A2.dag_registry_is_layered_dag', v IS NULL, v, 'RV-ARCH-08', 'integration');
+
+  -- (۴) هر برچسب HK_DAG_EXCEPTION یک استثنای پذیرفتهٔ change-requests.md (R-XFK بند ۵) است و هر استثنای پذیرفته
+  --     برچسب خورده است؛ بخشی نمی‌تواند با برچسب زدن به FK خودش از lint بگذرد.
+  WITH accepted(src, dst) AS (VALUES
+    ('core.role_assignment_scope', 'inventory.warehouse'), ('core.role_assignment_scope', 'treasury.cash_box'),
+    ('core.role_assignment_scope', 'pos.terminal'),        ('core.role_assignment_scope', 'ledger.dimension_value'),
+    ('rules.param_override', 'payroll.workshop'),
+    ('tax.invoice', 'sales.invoice'), ('tax.invoice_issue_line', 'sales.invoice_line'),
+    ('assets.disposal', 'sales.invoice'),
+    ('pos.cash_movement', 'ledger.posting_key')
+  ), labelled AS (
+    SELECT c.conrelid::regclass::text AS src, c.confrelid::regclass::text AS dst, c.conname
+      FROM pg_constraint c
+     WHERE c.contype = 'f' AND c.conparentid = 0
+       AND obj_description(c.oid, 'pg_constraint') LIKE 'HK_DAG_EXCEPTION:%'
+  )
+  SELECT string_agg(p, '; ' ORDER BY p) INTO v FROM (
+    SELECT 'label not in R-XFK-5: ' || l.src || '/' || l.conname || ' -> ' || l.dst AS p FROM labelled l
+     WHERE NOT EXISTS (SELECT 1 FROM accepted a WHERE a.src = l.src AND a.dst = l.dst)
+    UNION ALL
+    SELECT 'accepted exception without a labelled FK: ' || a.src || ' -> ' || a.dst FROM accepted a
+     WHERE NOT EXISTS (SELECT 1 FROM labelled l WHERE l.src = a.src AND l.dst = a.dst)
+  ) q;
+  PERFORM it_rec('A', 'A2.dag_exceptions_match_rulings', v IS NULL, v, 'RV-ARCH-08', 'integration');
+
+  -- (۵) کاوش: FKهای ساختگی در زیرتراکنش برگشتی. باید دقیقاً چهار مورد بی‌برچسب گرفته شوند — چرخهٔ هم‌لایهٔ
+  --     inventory↔tax، یال رو به پایین اعلام‌نشدهٔ treasury→catalog، یال رو به بالای ledger→inventory — و FK
+  --     اعلام‌شدهٔ sales→catalog و FK برچسب‌دار catalog→inventory گرفته نشوند. خودآزمایی قدیم 99 (مقایسهٔ لایه) هیچ‌کدام
+  --     از سه مورد اول را نمی‌گرفت.
+  v := NULL;
+  BEGIN
+    ALTER TABLE inventory.warehouse ADD COLUMN it_dag_probe uuid;
+    ALTER TABLE inventory.warehouse ADD CONSTRAINT it_dag_probe_1 FOREIGN KEY (tenant_id, it_dag_probe) REFERENCES tax.invoice (tenant_id, id);
+    ALTER TABLE tax.invoice ADD COLUMN it_dag_probe uuid;
+    ALTER TABLE tax.invoice ADD CONSTRAINT it_dag_probe_2 FOREIGN KEY (tenant_id, it_dag_probe) REFERENCES inventory.warehouse (tenant_id, id);
+    ALTER TABLE treasury.cash_box ADD COLUMN it_dag_probe uuid;
+    ALTER TABLE treasury.cash_box ADD CONSTRAINT it_dag_probe_3 FOREIGN KEY (tenant_id, it_dag_probe) REFERENCES catalog.item (tenant_id, id);
+    ALTER TABLE ledger.account ADD COLUMN it_dag_probe uuid;
+    ALTER TABLE ledger.account ADD CONSTRAINT it_dag_probe_4 FOREIGN KEY (tenant_id, it_dag_probe) REFERENCES inventory.warehouse (tenant_id, id);
+    ALTER TABLE sales.invoice ADD COLUMN it_dag_probe uuid;
+    ALTER TABLE sales.invoice ADD CONSTRAINT it_dag_probe_ok_declared FOREIGN KEY (tenant_id, it_dag_probe) REFERENCES catalog.item (tenant_id, id);
+    ALTER TABLE catalog.item ADD COLUMN it_dag_probe uuid;
+    ALTER TABLE catalog.item ADD CONSTRAINT it_dag_probe_ok_labelled FOREIGN KEY (tenant_id, it_dag_probe) REFERENCES inventory.warehouse (tenant_id, id);
+    COMMENT ON CONSTRAINT it_dag_probe_ok_labelled ON catalog.item IS 'HK_DAG_EXCEPTION: probe';
+    SELECT string_agg(x.conname, ',' ORDER BY x.conname) INTO v FROM core.xfk_dag_violations() x WHERE x.conname LIKE 'it_dag_probe%';
+    RAISE EXCEPTION 'IT_DAG_PROBE_DONE';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <> 'IT_DAG_PROBE_DONE' THEN v := 'probe error: ' || SQLSTATE || ' ' || SQLERRM; END IF;
+  END;
+  PERFORM it_rec('A', 'A2.dag_lint_flags_same_layer_upward_and_undeclared', v = 'it_dag_probe_1,it_dag_probe_2,it_dag_probe_3,it_dag_probe_4',
+                 'expected it_dag_probe_1..4 flagged, got: ' || coalesce(v, '<none flagged>'), 'RV-ARCH-08', 'integration');
+END $$;
+
 -- ---------- A3: مالکیت و امتیازهای نقش‌های زمان اجرا؛ جدول‌های فقط‌افزودنی ----------
 DO $$
 DECLARE v text; v_list text;

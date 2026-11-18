@@ -107,8 +107,14 @@
 4. **idempotent:**
    - قید هم‌نام باید هم‌تعریف باشد، وگرنه `HK_XFK_NAME_CLASH`.
    - FK هم‌ارز با نام دیگر دوباره ساخته نمی‌شود.
-5. **FK خلاف جهت DAG:** فقط با برچسب `COMMENT ON CONSTRAINT … 'HK_DAG_EXCEPTION: …'` مجاز است. خودآزمایی پایانی 99 هر FK بی‌برچسب خلاف DAG را با `HK_XFK_DAG` رد می‌کند.
-   - استثناهای پذیرفته:
+5. **FK بیرون از DAG:** هر FK بین‌اسکیمایی باید جفت (ماژول مبدأ، ماژول مقصد) آن در ستون «وابستگی مجاز» جدول 01 §۵-۱ باشد. این ستون فهرست کامل است، نه بستار گذرا؛ مثلاً `pos` به `ledger` وابسته نیست، هرچند `treasury` هست. مقایسهٔ شمارهٔ لایه کافی نیست (RV-ARCH-08)، چون یال هم‌لایه (چرخهٔ `inventory ↔ tax`) و یال رو به پایینِ اعلام‌نشده (`treasury → catalog`) را نمی‌گیرد.
+   - **منبع در پایگاه داده:** `core.module_registry()` در `00_foundation.sql` (ماژول، لایه، `depends_on`). برابر جدول 01 §۵-۱ است به‌اضافهٔ دو تصمیم پذیرفته: `catalog → parties` (04:CR-01) و `assistant` در L8 با وابستگی به L0 تا L7 (10:C-AS-05). `ModuleSpec.depends_on` باید با آن برابر باشد. هر تغییر DAG هر دو را با هم عوض می‌کند.
+   - **lint:** `core.xfk_dag_violations()` هر FK بیرون از `depends_on` را که برچسب `COMMENT ON CONSTRAINT … 'HK_DAG_EXCEPTION: …'` ندارد برمی‌گرداند. اسکیمای ثبت‌نشده هم خطاست. خودآزمایی پایانی 99 با `HK_XFK_DAG` متوقف می‌شود. آزمون یکپارچه این‌ها را می‌سنجد:
+     - `A2.cross_schema_fks_follow_dag`؛
+     - `A2.dag_registry_matches_schemas` و `A2.dag_registry_is_layered_dag`؛
+     - `A2.dag_exceptions_match_rulings`: هر برچسب باید در جدول زیر باشد، پس بخشی نمی‌تواند با برچسب زدن به FK خودش از lint بگذرد؛
+     - `A2.dag_lint_flags_same_layer_upward_and_undeclared` (کاوش).
+   - **استثناهای پذیرفته** (فقط این‌ها):
 
      | FK | جهت |
      |---|---|
@@ -117,9 +123,10 @@
      | `tax.invoice → sales.invoice` | L4→L5 |
      | `tax.invoice_issue_line → sales.invoice_line` | L4→L5 |
      | `assets.disposal → sales.invoice` | L4→L5 |
+     | `pos.cash_movement (posting_key) → ledger.posting_key` | L6→L3، بیرون از `pos.depends_on` (RV-ARCH-08). فقط کاتالوگ کد سراسری؛ کد `pos` هرگز `ledger` را import نمی‌کند (06 INV-POS-14) و ثبت را treasury انجام می‌دهد |
 
    - کد ماژول پایین‌دست هرگز ماژول بالادست را import نمی‌کند و شناسه را از payload فرمان یا رویداد می‌گیرد.
-   - این بند INV-ARCH-09 بند ۱ را اصلاح می‌کند.
+   - این بند INV-ARCH-09 بند ۱ و 01 §۵-۲ بند ۳ را اصلاح می‌کند: «هم‌جهت DAG» یعنی «در `depends_on`»، نه «لایهٔ پایین‌تر».
 6. **FKهای عمداً بیرون از 99** (در §۱۲ هر سند مستندند):
    - ارجاع‌های نرم و چندریختی.
    - FKهای تایپ‌شدهٔ اختیاری `migration.posting`.
@@ -168,16 +175,26 @@
 - **حفاظت:** `UnitOfWork` تنظیم `hk.*` را از کد ثبت‌نشده رد می‌کند (04:CR-10).
 
 ### R-IDEM — کدهای وضعیت Idempotency (تعارض 01 با 02 و 09)
-مطابق draft-ietf-httpapi-idempotency-key-header و 01 §۵-۵، 01:1332-1344 و 01:2682-2683:
+مطابق الگوریتم 01 §۵-۸ (`run_idempotent`، 01:1321-1349)، سناریوهای مرزی 01 §۸ ردیف ۱۵ و ۱۶، قاعدهٔ «اجباری» 01 §۶ و
+INV-API-01 (01:2617). این جدول را بازبینی RV-ARCH-13 / RV-X1-14 اصلاح کرد: نسخهٔ پیشین «کلید نیست» و «کلید بدشکل است» را
+در یک ردیف `400 core.idempotency.key_invalid` گذاشته بود و به‌اشتباه به 01 نسبت می‌داد.
 
 | حالت | کد وضعیت | کد خطا |
 |---|---|---|
-| کلید نیست یا بدشکل است | `400` | `core.idempotency.key_invalid` |
+| کلید نیست و مسیر آن را **اجباری** دارد (`money_moving` یا `Idem.REQUIRED`) | **`428`** | `core.idempotency.key_required` |
+| کلید هست ولی بدشکل است (با `IDEM_KEY_RE` نمی‌خواند) | `400` | `core.idempotency.key_invalid` |
 | درخواست اول در جریان است | `409` | `core.idempotency.in_progress`، با `Retry-After: 2` |
 | همان کلید با بدنه یا مسیر دیگر | **`422`** | `core.idempotency.key_reused` |
 
+- **انحراف آگاهانه از پیش‌نویس IETF:** draft-ietf-httpapi-idempotency-key-header برای «کلید نیست» `400` را توصیه (SHOULD) می‌کند. حساب‌کتاب `428 Precondition Required` (RFC 6585) را نگه می‌دارد:
+  - هم‌خوان با «نبودِ `If-Match`» که آن هم `428 core.concurrency.precondition_required` است (01:2132)؛
+  - کلاینت از کد وضعیت تشخیص می‌دهد که باید سرآیند بفرستد و همان درخواست را تکرار کند، بی‌آن‌که بدنه را تغییر دهد؛
+  - همهٔ بخش‌ها (01:2552 و 2617، 06:1712، 07:938، 08:1494، 09:1845) و آزمون قرارداد `test_money_moving_routes_require_idempotency` همین را فرض کرده‌اند.
+  - سه حالت دیگر (کلید بدشکل `400`، استفادهٔ دوباره `422`، درخواست هم‌زمان `409`) همان مقادیر پیش‌نویس‌اند.
+- **مسیر «پشتیبانی» (اختیاری):** بدون کلید اجرا می‌شود و بازپخش ندارد. کلید بدشکل همان `400` را می‌گیرد.
 - **بندهای مخالف:**
-  - 02 INV-IDEM-02 «همان کلید + درخواست دیگر ← ۴۰۹» (02:1345) باید اصلاح شود (RV-IT-07).
+  - 02 INV-IDEM-02 «همان کلید + درخواست دیگر ← ۴۰۹» (02:1345) و متن 02:1109 (`409 core.idempotency.key_reused`) باید `422` شوند (RV-IT-07). در همان 02:1109 `Retry-After: 1` باید `2` شود.
+  - 02:1173 نام کوتاه `428 idempotency_key_required` باید کد کامل `core.idempotency.key_required` شود (RV-X1-14). در همان سطر «`If-Match` نخواندن ← `409 version_conflict`» باید با 01:2132 یکی شود: `412 core.concurrency.stale` برای عدم تطابق و `428 core.concurrency.precondition_required` برای نبود سرآیند.
   - 09 «`HK_PLT_IDEMPOTENCY_COMPLETED` ← ۴۰۹» (09:1764) باید اصلاح شود (RV-IT-08).
 - **تعارض کسب‌وکاری ۴۰۹ می‌ماند.** این موارد مربوط به سرآیند `Idempotency-Key` نیستند:
   - کلید مبدأ تکراری با hash دیگر در ledger (INV-LED-26).
@@ -206,8 +223,38 @@
   | یکپارچه‌ساز | `HK_XFK` |
 
   `HK_AST` (دستیار) و `HK_ASSETS` (دارایی) جدا می‌مانند.
-- **API:** کد `<module>.<object>.<reason>` با ۳ یا ۴ بخش، در بدنهٔ RFC 9457. هر ماژول فقط با پیشوند ماژول خود کد می‌سازد.
-- **کد یکسان رد principal دستیار** (C-AS-11): وابستگی kernel `forbid_assistant_actor` و کد `assistant.write_forbidden` (۴۰۳). `ledger.journal.assistant_cannot_post` نام مستعار فقط‌افزودنی می‌ماند.
+- **API** (فیلد `code` در بدنهٔ RFC 9457؛ قاعدهٔ یکتا پس از بازبینی RV-X1-16):
+  1. **شکل:** `^[a-z]+(\.[a-z0-9_]+){2,3}$`، یعنی `<module>.<object>.<reason>` یا `<module>.<object>.<sub>.<reason>`. کد ۲ بخشی (`assistant.busy`، `sales.internal_inconsistency`) و کد بی‌پیشوند (`not_found`، `version_conflict`) هیچ استثنایی ندارد. توضیح regex در 01 §۵-۲۲-۲ (`{2}`) باید `{2,3}` شود.
+  2. **پیشوند = ماژول تعریف‌کننده:** بخش اول نام ماژولی از 01 §۵-۱ است که کد در `errors.yaml` همان ماژول تعریف شده است. `commerce` ماژول نیست و پیشوند نمی‌شود. کاتالوگ عمومی kernel پیشوند `core.` دارد (مثل نگاشت‌های 01 §۵-۵: `core.reference.not_found`، `core.validation.constraint`، `core.concurrency.*`، `core.idempotency.*`، `core.record.immutable`).
+  3. **صدور:** هر ماژول فقط کدهای خودش و کدهای عمومی `core.*` کاتالوگ kernel را برمی‌گرداند (نگاشت پایگاه داده همین را می‌کند). تنها کد بین‌ماژولی `assistant.principal.write_forbidden` است (بند ۵).
+  4. **ردهٔ ۵۰۰ (ناوردای شکسته، باگ):** یک املا: `<module>.internal.<reason>`. بخش `internal` رزرو است: وضعیت `500`، `category: internal`، `retryable: false`، بدون مقدار ستون یا stack. برعکس، هر کد `500` همین بخش را دارد. کدهای عمومی kernel: `core.internal.unexpected`، `core.internal.tenant_isolation` (Sev-1) و `core.internal.invariant` (Sev-2؛ هر ماژول می‌تواند آن را برگرداند، مثل 06:1629). پیشوند سطح بالای `internal.*` و شکل `<module>.internal_<x>` ممنوع است.
+  5. **رد principal دستیار** (C-AS-11): وابستگی kernel `forbid_assistant_actor` و کد `assistant.principal.write_forbidden` (۴۰۳). کد در `assistant/api/errors.yaml` تعریف می‌شود و kernel آن را از `ErrorCode` تولیدشدهٔ سراسری می‌گیرد، بی‌آن‌که `assistant` را import کند. نام‌های `assistant.write_forbidden` و `ledger.journal.assistant_cannot_post` فقط به‌شکل `alias_of` در کاتالوگ فقط‌افزودنی می‌مانند و هرگز صادر نمی‌شوند.
+  6. **lint:** `hk lint errors` (job `arch-py` در 01 §CI) بندهای ۱ تا ۴ را روی هر `errors.yaml` می‌سنجد (regex، پیشوند = `module:` فایل، `internal` ⇔ `500`، و `alias_of` فقط به کد موجود). آزمون: `tests/unit/kernel/test_error_catalog.py::test_codes_follow_r_err`.
+- **نام‌های ناسازگار در متن بخش‌ها** (برداشت بازبینی RV-X1-16 به‌اضافهٔ پویش جدول‌های نگاشت همهٔ سندها؛ هر بخش در متن خودش اصلاح می‌کند):
+
+  | سند و سطر | نام فعلی | نام درست |
+  |---|---|---|
+  | 01:1166 و 01:1167 | `internal.tenant_isolation`، `internal.unexpected` | `core.internal.tenant_isolation`، `core.internal.unexpected` |
+  | 02:565 و 02:1433 | `401 mfa_step_up_required` | `core.auth.mfa_step_up_required` |
+  | 02:622 و 02:624 | `403 field_write_denied`، `409 sod_conflict` | `core.field.write_denied`، `core.sod.conflict` |
+  | 02:1173 | `428 idempotency_key_required`، `409 version_conflict` | `core.idempotency.key_required` و R-IDEM (`412 core.concurrency.stale` / `428 core.concurrency.precondition_required`) |
+  | 02:1353، 02:1357، 02:1374 | `last_owner`، `fiscal_year_not_found`، `impersonation_ended` | `core.member.last_owner`، `core.numbering.fiscal_year_not_found`، `core.impersonation.ended` |
+  | 03:1052 | `ledger.reason_required` | `ledger.request.reason_required` |
+  | 04:1315 | `catalog.code_space_exhausted`، `parties.code_space_exhausted` | `catalog.code_series.exhausted`، `parties.code_series.exhausted` |
+  | 04:1321 (۵۰۰) | `core.immutable_field` | `parties.internal.immutable_field` و `catalog.internal.immutable_field` |
+  | 05:975 | `inventory.negative_stock` | `inventory.stock.negative` |
+  | 05:986 | `sales.internal_inconsistency` | `sales.internal.inconsistency` |
+  | 05:987 | `commerce.internal_link` | `<inventory\|sales\|purchase>.internal.link` (ماژول جدولی که پیام را بالا می‌برد) |
+  | 05:990 | `purchase.duplicate_supplier_invoice` | `purchase.invoice.duplicate_supplier_invoice` |
+  | 05:991 | `not_found` | `core.resource.not_found` |
+  | 06:2001 | `ledger.period_closed` (۴۲۲) | `ledger.period.closed` (۴۰۹؛ 03:1039) |
+  | 07:988 | `409 inquiry_pending` | `tax.invoice.inquiry_pending` |
+  | 10:1206، 10:1227، 10:1432؛ 05:1007 | `assistant.write_forbidden` | `assistant.principal.write_forbidden` |
+  | 10:1207 | `assistant.impersonation_forbidden` | `assistant.principal.impersonation_forbidden` |
+  | 10:1208، 10:1213، 10:1224 | `assistant.disabled`، `assistant.busy`، `assistant.validation` | `assistant.service.disabled`، `assistant.run.busy`، `assistant.thread.invalid` |
+  | 10:1216، 10:1219، 10:1225 | `internal.assistant_budget_config`، `internal.assistant_invariant`، `internal.assistant_retention` | `assistant.internal.budget_config`، `assistant.internal.invariant`، `assistant.internal.retention` |
+
+  نام پیشنهادی ستون سوم الزامی نیست؛ هر نام دیگری که بندهای ۱ تا ۴ را رعایت کند پذیرفته است. وضعیت HTTP هر سطر تغییر نمی‌کند، جز سطر 06:2001.
 
 ### R-INV — فضای نام شناسهٔ ناوردا
 هر سند فقط در فضای نام خودش شناسه **تعریف** می‌کند. ارجاع به شناسهٔ سند دیگر آزاد است.
@@ -335,6 +382,9 @@
 | 02:۱۳.۱۳ | هسته | کلید `fy:<uuid>` بدون FK | پذیرفته | جلوگیری از چرخه. سال مالی دارای سند حذف‌شدنی نیست | ۰۳ | انجام‌شده |
 | 02:۱۳.۱۴ | هسته | fan-out با تریگر | پذیرفته | R-OUTBOX. «رویداد بدون تحویل» در پایگاه داده ناممکن است | ۰۱ (متن) | باز (RV-IT-06) |
 | 02:۱۳.۱۵ | هسته | مجوز ۳ تا ۴ بخشی؛ نوع رویداد ۳ تا ۵ بخشی | پذیرفته | CHECKهای 10_core همین را اجبار می‌کنند | همه | انجام‌شده |
+| RV-ARCH-13 | بازبینی | R-IDEM «کلید نیست ← ۴۰۰» را به ۰۱ نسبت می‌داد، ولی ۰۱ و همهٔ بخش‌ها `428` دارند | پذیرفته | R-IDEM اصلاح شد: نبود کلید `428 core.idempotency.key_required`؛ کلید بدشکل `400 core.idempotency.key_invalid` | یکپارچه‌ساز / ۰۲ | انجام‌شده (قاعده)؛ باز (02:1173 نام کامل کد) |
+| RV-X1-14 | بازبینی | همان RV-ARCH-13 | تکراری | — | — | انجام‌شده (RV-ARCH-13) |
+| RV-X1-16 | بازبینی | R-ERR «۳ یا ۴ بخش، پیشوند ماژول» را می‌گفت ولی خودش `assistant.write_forbidden` (۲ بخش) را اجباری می‌کرد؛ سه املا برای ردهٔ ۵۰۰؛ پیشوند `commerce` | پذیرفته | R-ERR بندهای ۱ تا ۶: regex `{2,3}`، پیشوند = ماژول تعریف‌کننده، کاتالوگ عمومی `core.*`، ردهٔ ۵۰۰ فقط `<module>.internal.<reason>`، `assistant.principal.write_forbidden`، lint `hk lint errors`. جدول نام‌های ناسازگار در R-ERR | ۰۱ / ۰۲ / ۰۳ / ۰۴ / ۰۵ / ۰۶ / ۰۷ / ۱۰ | انجام‌شده (قاعده)؛ باز (متن بخش‌ها) |
 | 03:C-L01 | دفتر کل | `PRIMARY KEY (tenant_id, id)` برای جدول‌های پرحجم | پذیرفته | R-PK. پیش از تولید اعمال شود | ۰۳ | باز |
 | 03:C-L02 | دفتر کل | واژه‌نامهٔ posted، permanent و cancelled | پذیرفته | R-GLOSSARY | همه | انجام‌شده |
 | 03:C-L05 | دفتر کل | یک تراکنش، یک مستأجر | پذیرفته | R-TX | ۰۱ / ۰۲ (UoW) | باز (UoW) |
@@ -352,7 +402,7 @@
 | 10:C-AS-13 | دستیار | «تنها فراخوانی بیرونی» و حصار آن | پذیرفته | R-AI | ۰۱ / ۱۰ | انجام‌شده (قاعده) |
 | 10:C-AS-15 | دستیار | چند UoW در مسیر stream دستیار | پذیرفته (محدود به همین مسیر) | R-TX | ۰۱ / ۰۲ | باز (متن ۰۱ D-05) |
 | 10:C-AS-17 | دستیار | برخورد `INV-SEC-05` | پذیرفته | R-INV | ۰۶ / ۱۰ | باز (RV-IT-09، RV-IT-10) |
-| 10:C-AS-11 | دستیار | نام واحد نگهبان دستیار | پذیرفته | R-ERR | ۰۳ / ۰۵ / ۰۶ | باز |
+| 10:C-AS-11 | دستیار | نام واحد نگهبان دستیار | پذیرفته؛ نام کد با RV-X1-16 سه‌بخشی شد | R-ERR بند ۵: وابستگی `forbid_assistant_actor` و کد `assistant.principal.write_forbidden`؛ `assistant.write_forbidden` و `ledger.journal.assistant_cannot_post` فقط `alias_of` | ۰۳ / ۰۵ / ۰۶ / ۱۰ | باز |
 | 07:CR-CMP-09 | انطباق | محدودیت فنی API بیرونی = پارامتر قواعد با سقف عقلانی DB | پذیرفته | سازمان‌ها بی‌اعلام تغییر می‌دهند | همه | انجام‌شده (۰۷) |
 | 01:C-06 | معماری | نسخهٔ پین‌شده «کف» است؛ وصلهٔ امنیتی اجباری | پذیرفته | PostgreSQL 18.7 و PgBouncer 1.26.1 | ۰۱ | انجام‌شده |
 | 01:C-07 | معماری | همهٔ فایل‌های امضاشده HKSB v1 | پذیرفته | یک راستی‌آزما | ۰۱ / ۰۷ / ۰۸ / ۰۹ | انجام‌شده (قاعده) |
@@ -376,17 +426,18 @@
 | 01:C-18 | معماری | `SECURITY DEFINER` فقط با allowlist و پنج شرط | پذیرفته | `security_lint` شرط‌ها را می‌سنجد | ۰۱ | انجام‌شده |
 | 03:C-L06 | دفتر کل | سه تابع definer ledger در allowlist | پذیرفته | پنج شرط را دارند (lint صفر) | ۰۱ | باز (فایل allowlist) |
 | 05:CR-C04 | تجارت | ده تابع definer موجودی در allowlist | پذیرفته با بازبینی | یک الگوریتم برای ثبت و بازپخش؛ `hk_app` به مشتق‌ها دسترسی نوشتن ندارد. lint صفر | ۰۱ | باز (فایل allowlist) |
-| 04:CR-01 | دادهٔ پایه | `catalog.depends_on += parties` | پذیرفته | سه ارجاع ذاتی؛ چرخه ندارد | ۰۱ | باز (DAG و import-linter) |
+| 04:CR-01 | دادهٔ پایه | `catalog.depends_on += parties` | پذیرفته | سه ارجاع ذاتی؛ چرخه ندارد. در `core.module_registry()` (پایه) اعمال شد و lint DAG پایگاه داده آن را می‌پذیرد | ۰۱ | انجام‌شده (پایه)؛ باز (جدول ۰۱ §۵-۱، نمودار ۵-۲ و import-linter) |
 | 05:CR-C02 | تجارت | ماژول کدی `packs` و مجوزهای `packs.pack.*` | پذیرفته | بسته داده می‌ماند و `packs` فقط نصب‌کننده است. مجوزها هنوز در `core.permission` نیستند | ۰۱ / ۰۵ | باز |
 | 05:CR-C07 | تجارت | FK `core.role_assignment_scope → inventory.warehouse` فقط در 99 | پذیرفته | R-XFK بند ۵ (برچسب `HK_DAG_EXCEPTION`) | یکپارچه‌ساز | انجام‌شده |
 | 07:CR-CMP-08 | انطباق | استثنای DAG `rules.param_override → payroll.workshop`؛ جهت فشاری sales ← tax | پذیرفته | R-XFK بند ۵. FK `tax.invoice → sales.invoice` هم برچسب گرفت | یکپارچه‌ساز / ۰۱ | انجام‌شده (99)؛ باز (متن INV-ARCH-09) |
+| RV-ARCH-08 | بازبینی | lint DAG پایگاه داده فقط شمارهٔ لایه را می‌سنجید و یال هم‌لایه، چرخه و یال رو به پایینِ اعلام‌نشده را رد نمی‌کرد | پذیرفته | R-XFK بند ۵: `core.module_registry()` و `core.xfk_dag_violations()` در پایه؛ خودآزمایی 99 و پنج بررسی `A2.*` آزمون یکپارچه. متن ۰۱ (§۵-۲ بند ۳، INV-ARCH-09، §۱۲ بند ۱) باید بگوید «در `depends_on`»، نه «لایهٔ پایین‌تر»، و `test_cross_schema_fks_follow_dag` باید `core.module_registry()` را با `ModuleSpec` برابر بداند | یکپارچه‌ساز / ۰۱ | انجام‌شده (SQL و آزمون)؛ باز (متن ۰۱) |
 | 08:CR-MG06 | مهاجرت | لنگر اعتماد «کلید نشست» برای HIF در HKSB | پذیرفته | HIF روی ماشین مشتری ساخته می‌شود | ۰۱ | باز |
 | 08:CR-MG07 | مهاجرت | کمینهٔ ویندوز ۱۰ یا Server 2016 برای عامل؛ `python-tds` (MIT)؛ CI ویندوز | `python-tds` و CI پذیرفته؛ کمینهٔ سیستم‌عامل به تعویق | بخشی از مشتریان هلو و سپیدار روی Windows 7 هستند. تصمیم محصولی است | ۰۱ / ۰۸ | پرسش صاحب محصول |
 | 09:CR-PLT-03 | پلتفرم | HKSB نوع `state` با امضاکنندهٔ نصب | پذیرفته | زنجیرهٔ ریشه ← لایسنس ← `install_pubkey` | ۰۱ | باز |
 | 09:CR-PLT-11 | پلتفرم | ابرمجموعهٔ قرارداد §۴-۸ | پذیرفته | اطلاعی | ۰۱ | انجام‌شده |
 | 09:CR-PLT-12 | پلتفرم | مبدأهای `billing.` و `activate.` | پذیرفته | callback درگاه و فعال‌سازی On-prem به مبدأ عمومی نیاز دارند | ۰۱ | باز |
 | 09:CR-PLT-15 | پلتفرم | صفحهٔ کنترل به Valkey نیاز ندارد | پذیرفته | اطلاعی | — | انجام‌شده |
-| 10:C-AS-05 | دستیار | `assistant` در L8، `integrations.llm`، نقش فرایند `assistant`، `KeyPurpose.LLM_API_KEY`، stream روی POST، `contracts.ports.llm` | پذیرفته | R-AI. سطح L8 در خودآزمایی DAG فایل 99 آمده است | ۰۱ | باز (متن ۰۱) |
+| 10:C-AS-05 | دستیار | `assistant` در L8، `integrations.llm`، نقش فرایند `assistant`، `KeyPurpose.LLM_API_KEY`، stream روی POST، `contracts.ports.llm` | پذیرفته | R-AI. ردیف L8 با وابستگی به L0 تا L7 در `core.module_registry()` (پایه) آمده است | ۰۱ | باز (متن ۰۱) |
 | 10:C-AS-06 | دستیار | به‌روزرسانی فرض‌های پیش از پاسخ Q-F در ۰۱ | پذیرفته | API قابل تنظیم و ابزار درون‌فرایند | ۰۱ | باز |
 | 02:۱۳.۱۶ | هسته | هم‌راستایی با ۰۱ (ابرمجموعه، `lock_token`، `job_claim`، PIN برای هر عضویت) | پذیرفته | امنیت PIN برابر است و مدیریتش ساده‌تر. ۰۱ متن PIN و claim را به‌روز کند | ۰۱ | باز |
 | 07:CR-CMP-10 | انطباق | `hk migrate` در هر ارتقا `deployment_info.app_version` را به‌روز کند و `rules.golden.rerun` را صف کند | پذیرفته | دروازهٔ طلایی به آن تکیه دارد | ۰۱ / ۰۲ | باز |
@@ -493,6 +544,7 @@
 | 08:CR-MG02 | مهاجرت | `source_module='migration'` بی‌سند؛ `TreasuryImportService.*`؛ `import_cheque_history` | پذیرفته (`import_cheque_history` در v2) | CHECK `source_module` الگوی آزاد دارد و `migration` را می‌پذیرد | ۰۶ | باز (سرویس‌ها) |
 | 10:C-AS-09 | دستیار | `PartyReminderService` و مجوز `treasury.reminder.send` | پذیرفته | فقط با رضایت ثبت‌شدهٔ شخص | ۰۶ | باز |
 | 10:C-AS-17 | دستیار | تغییر نام `INV-SEC-*` و `INV-EDGE-*` در ۰۶ | پذیرفته | R-INV: `INV-POSSEC-*` و `INV-POSEDGE-*` | ۰۶ | باز (RV-IT-09) |
+| RV-ARCH-08 | بازبینی | FK `pos.cash_movement.posting_key → ledger.posting_key` با «pos در DAG به ledger وابسته نیست» (06:41) نمی‌خواند | FK می‌ماند و استثنای برچسب‌دار R-XFK بند ۵ شد. `ledger` به `pos.depends_on` افزوده **نمی‌شود** | فقط وجود کد در کاتالوگ سراسری تضمین می‌شود؛ تضمین import (INV-POS-14) سالم می‌ماند. 99 قید موجود را با `hk_add_fk` («هم‌ارز») برچسب می‌زند | ۰۶ | انجام‌شده (99)؛ باز (متن ۰۶: سطر ۴۱ و §۱۲؛ اختیاری: نام R-XFK-3 `fk_cash_movement__ledger_posting_key` در 40) |
 
 ## ۹. انطباق (`07-compliance.md`، `50_compliance.sql`)
 
@@ -555,17 +607,27 @@
 
 ---
 
-## نتیجهٔ هارنس (`PREFIX=it_ docs/design/sql/run_all.sh`)
+## نتیجهٔ هارنس (`PREFIX=fx_integration docs/design/sql/run_all.sh`، پس از رفع RV-ARCH-08)
 
-- **(a) زنجیرهٔ مستقل هر بخش:** هر ۹ بخش دارای SQL زنجیره و آزمونشان سبز است. اعمال دوبارهٔ `70_platform.sql` هم سبز است.
+- **(a) زنجیرهٔ مستقل هر بخش:** هر ۹ بخش دارای SQL زنجیره و آزمونشان سبز است. اعمال دوبارهٔ `70_platform.sql` هم سبز است. جمع: `PASS=72 FAIL=4 SKIP=0`. هر چهار FAIL یافتهٔ باز بخش‌های دیگرند (پایین).
 - **(b) پایگاه یکپارچه:**
-  - زنجیرهٔ 00 تا 80 و `99_cross_fk.sql` سبز است. ۵۴ FK افزوده شد، ۸ FK برچسب استثنای DAG دارند، و ۸۰ نگهبان TRUNCATE گذاشته شد.
-  - `core.security_lint()` قرمز است: ۳۹ ردیف `tenant_table_not_in_export_registry` در `catalog` و `parties` (RV-IT-01). این ردیف‌ها عمداً در allowlist نیامده‌اند.
+  - زنجیرهٔ 00 تا 80 و `99_cross_fk.sql` سبز است:
+    - ۵۴ FK افزوده شد؛
+    - ۹ FK برچسب استثنای DAG دارند: ۸ مورد پیشین به‌اضافهٔ `pos.cash_movement → ledger.posting_key`؛
+    - خودآزمایی `HK_XFK_DAG` بر پایهٔ `core.xfk_dag_violations()` صفر مورد دارد.
+  - `core.security_lint()` قرمز است: ۳۹ ردیف `tenant_table_not_in_export_registry` در `catalog` و `parties` (RV-IT-01، مسئول ۰۴). این ردیف‌ها عمداً در allowlist نیامده‌اند.
   - lint تکمیلی هارنس روی همهٔ اسکیماها صفر است.
+  - `tests/99_integration_test.sql`: ۱۰۳ از ۱۲۹ بررسی سبز است. پنج بررسی DAG تازه (`A2.cross_schema_fks_follow_dag`، `A2.dag_registry_matches_schemas`، `A2.dag_registry_is_layered_dag`، `A2.dag_exceptions_match_rulings`، `A2.dag_lint_flags_same_layer_upward_and_undeclared`) سبزند. روی 99 پیش از رفع، دو بررسی اول و چهارم قرمز می‌شوند. ۲۶ بررسی قرمز همه یافته‌های باز بخش‌های دیگرند، با شناسه و مسئول در گزارش:
+    - RV-IT-01 (۰۴)؛
+    - RV-IT-05، RV-IT2-07، RV-IT2-08، RV-IT2-12 (۰۲)؛
+    - RV-IT2-03 (۰۳)؛
+    - RV-IT2-01، RV-IT2-06، RV-IT2-09 (۰۵)؛
+    - RV-IT2-04، RV-IT2-05، RV-IT2-10، RV-IT2-11 (۰۶)؛
+    - RV-IT-SALESTAX (۰۷).
 - **(c) ترتیب دوم:** ترتیب `00,10,25,20,…,99` سبز است، جز همان lint.
-- **(d) idempotency:** اعمال دوبارهٔ همهٔ فایل‌ها روی پایگاه یکپارچه سبز است.
-- **اختیاری `INTEGRATED_TESTS=1`:** آزمون هر بخش روی کپی پایگاه یکپارچهٔ دارای 99 اجرا شد.
-  - masterdata، commerce، migration و assistant سبزند.
-  - core قرمز است: `security_lint is empty`، به‌خاطر RV-IT-01.
-  - ledger قرمز است: RV-IT-16.
-  - treasury_pos و compliance قرمزند، چون fixtureهایشان شناسهٔ ساختگی بین‌ماژولی دارند: `sales_doc_id = uuidv7()` و `workshop_ref` ساختگی. FKهای 99 درست همین را رد می‌کنند. پوشش بین‌ماژولی کار آزمون یکپارچهٔ بخش ۲ است.
+- **(d) idempotency:** اعمال دوبارهٔ همهٔ فایل‌ها روی پایگاه یکپارچه سبز است. 99 در هر سه اجرا همان قید موجود 40 را با برچسب `fk_cash_movement__ledger_posting_key` («هم‌ارز») پذیرفت.
+- **اختیاری `INTEGRATED_TESTS=1`** (اجرای پیشین `it_`؛ این بار اجرا نشد): آزمون هر بخش روی کپی پایگاه یکپارچهٔ دارای 99.
+  - masterdata، commerce، migration و assistant سبز بودند.
+  - core قرمز بود: `security_lint is empty`، به‌خاطر RV-IT-01.
+  - ledger قرمز بود: RV-IT-16.
+  - treasury_pos و compliance قرمز بودند، چون fixtureهایشان شناسهٔ ساختگی بین‌ماژولی دارند: `sales_doc_id = uuidv7()` و `workshop_ref` ساختگی. FKهای 99 درست همین را رد می‌کنند. پوشش بین‌ماژولی کار `tests/99_integration_test.sql` است.

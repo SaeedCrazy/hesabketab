@@ -14,8 +14,10 @@
 --            مبدأ فرق دارد، در توضیح همان سطر آمده و سند باید نام این فایل را بپذیرد.
 --   R-XFK-4  idempotent: اگر قیدی با همین نام هست باید هم‌تعریف باشد (وگرنه HK_XFK_NAME_CLASH)؛ اگر FK
 --            هم‌ارز (همان ستون‌ها و همان مقصد) با نام دیگری در فایل ماژول هست، این‌جا چیزی افزوده نمی‌شود.
---   R-XFK-5  FK خلاف جهت DAG (۰۱ §۵-۱) فقط با برچسب HK_DAG_EXCEPTION (COMMENT ON CONSTRAINT) مجاز است؛
---            lint آزمون test_cross_schema_fks_follow_dag این برچسب را از کاتالوگ می‌خواند. کد ماژول
+--   R-XFK-5  هر FK بین‌اسکیمایی که جفت (مبدأ، مقصد) آن در depends_on جدول ۰۱ §۵-۱ (core.module_registry() در
+--            00_foundation) نیست — خلاف جهت، هم‌لایه یا رو به پایینِ اعلام‌نشده — فقط با برچسب HK_DAG_EXCEPTION
+--            (COMMENT ON CONSTRAINT) مجاز است؛ core.xfk_dag_violations() همین را از کاتالوگ می‌خواند (خودآزمایی بخش ۸ و
+--            lint آزمون test_cross_schema_fks_follow_dag). مقایسهٔ شمارهٔ لایه کافی نیست (RV-ARCH-08). کد ماژول
 --            پایین‌دست هرگز ماژول بالادست را import نمی‌کند؛ شناسه را از payload فرمان/رویداد می‌گیرد.
 --   R-XFK-6  FKهایی که مقصدشان در فایل‌های پیش‌نیاز همان ماژول است جایشان در فایل خود ماژول است (R-ORDER).
 --            FKهای بخش ۰۳ و ۰۴ به core فعلاً این‌جا هستند تا آن دو بخش 10_core را پیش‌نیاز کنند و آن‌ها را
@@ -38,6 +40,9 @@ BEGIN
   END LOOP;
   IF EXISTS (SELECT FROM pg_namespace WHERE nspname = 'platform') THEN
     RAISE EXCEPTION 'HK_WRONG_DATABASE: 99_cross_fk.sql must not be applied to the control-plane database';
+  END IF;
+  IF to_regprocedure('core.xfk_dag_violations()') IS NULL THEN
+    RAISE EXCEPTION 'HK_PREREQ: 99_cross_fk.sql needs core.xfk_dag_violations() from the current 00_foundation.sql';
   END IF;
 END $$;
 
@@ -215,6 +220,19 @@ SELECT fk, pg_temp.hk_add_fk(fk, src::regclass, cols, dst::regclass, refcols, da
    'L1 rules -> L5 payroll; workshop-level parameter override; rules code never imports payroll (CR-CMP-08)')
 ) AS v(fk, src, cols, dst, refcols, dag);
 
+-- =====================================================================
+-- ۵-ب. pos → ledger (رو به پایین ولی بیرون از pos.depends_on؛ 01 §۵-۱ و 06 INV-POS-14) — استثنای برچسب‌دار (RV-ARCH-08)
+--    pos.cash_movement.posting_key کد کاتالوگ سراسری ledger.posting_key است (بدون tenant_id ⇒ تک‌ستونی، R-XFK-2).
+--    40_treasury_pos.sql آن را درون‌خطی با نام خودکار cash_movement_posting_key_fkey می‌سازد؛ hk_add_fk آن را «هم‌ارز»
+--    می‌شناسد و همان را برچسب می‌زند. اگر 40 قید را با نام R-XFK-3 بسازد یا بردارد، این سطر همان را برچسب می‌زند یا
+--    می‌سازد. کد pos هرگز ledger را import نمی‌کند: کد را از فهرست دلیل‌های ورود/خروج نقد treasury می‌گیرد و
+--    treasury سند را ثبت می‌کند. FK فقط وجود کد را تضمین می‌کند.
+-- =====================================================================
+SELECT fk, pg_temp.hk_add_fk(fk, src::regclass, cols, dst::regclass, refcols, dag) AS status FROM (VALUES
+  ('fk_cash_movement__ledger_posting_key', 'pos.cash_movement', '{posting_key}'::text[], 'ledger.posting_key', '{key}'::text[],
+   'L6 pos -> L3 ledger, not in pos.depends_on; FK to the global code catalog ledger.posting_key only; pos never imports ledger (06 INV-POS-14); treasury posts the pay-in/out (RV-ARCH-08)')
+) AS v(fk, src, cols, dst, refcols, dag);
+
 -- ---------- عمداً بیرون از این فایل ----------
 -- * migration.posting.{stock_doc_id, cheque_id, open_item_id} (08-migration.md:1940-1952): پیشنهادی و
 --   «فقط اگر ستون‌ها افزوده شوند». این فایل ستون نمی‌سازد؛ تصمیم CR-MG-OPT در change-requests.md (رد).
@@ -258,7 +276,8 @@ END $$;
 
 -- =====================================================================
 -- ۸. خودآزمایی پایانی (روی کل پایگاه، نه فقط این فایل): هیچ FK «NOT VALID» نمانده، هر FK بین دو جدول
---    مستأجری tenant_id دارد، و هر FK بین‌اسکیمایی خلاف DAG برچسب HK_DAG_EXCEPTION دارد.
+--    مستأجری tenant_id دارد، و هر FK بین‌اسکیمایی بیرون از depends_on (core.xfk_dag_violations()) برچسب
+--    HK_DAG_EXCEPTION دارد.
 --    (وجود تک‌تک FKهای بالا را pg_temp.hk_add_fk تضمین می‌کند: یا افزوده/موجود/هم‌ارز، یا خطا.)
 -- =====================================================================
 DO $$
@@ -285,21 +304,12 @@ BEGIN
     RAISE EXCEPTION 'HK_XFK_NO_TENANT: %', v_bad;
   END IF;
 
-  -- FK بین‌اسکیمایی خلاف DAG بدون برچسب
-  SELECT string_agg(c.conrelid::regclass || '/' || c.conname, ', ') INTO v_bad
-    FROM pg_constraint c
-    JOIN pg_class s ON s.oid = c.conrelid  JOIN pg_namespace sn ON sn.oid = s.relnamespace
-    JOIN pg_class d ON d.oid = c.confrelid JOIN pg_namespace dn ON dn.oid = d.relnamespace
-    JOIN (VALUES ('ref',0),('core',0),('rules',1),('parties',2),('catalog',2),('ledger',3),('inventory',4),
-                 ('treasury',4),('tax',4),('assets',4),('sales',5),('purchase',5),('payroll',5),('pos',6),
-                 ('reports',7),('migration',7),('assistant',8)) AS ls(nsp, lvl) ON ls.nsp = sn.nspname
-    JOIN (VALUES ('ref',0),('core',0),('rules',1),('parties',2),('catalog',2),('ledger',3),('inventory',4),
-                 ('treasury',4),('tax',4),('assets',4),('sales',5),('purchase',5),('payroll',5),('pos',6),
-                 ('reports',7),('migration',7),('assistant',8)) AS ld(nsp, lvl) ON ld.nsp = dn.nspname
-   WHERE c.contype = 'f' AND sn.nspname <> dn.nspname AND ld.lvl > ls.lvl
-     AND coalesce(obj_description(c.oid, 'pg_constraint'), '') NOT LIKE 'HK_DAG_EXCEPTION:%';
+  -- FK بین‌اسکیمایی بیرون از depends_on (۰۱ §۵-۱ + تصمیم‌ها) بدون برچسب HK_DAG_EXCEPTION؛ شامل هم‌لایه و چرخه
+  SELECT string_agg(v.from_table || '/' || v.conname || ' -> ' || v.to_table || ' [' || v.problem || ']', ', '
+                    ORDER BY v.from_table::text, v.conname) INTO v_bad
+    FROM core.xfk_dag_violations() v;
   IF v_bad IS NOT NULL THEN
-    RAISE EXCEPTION 'HK_XFK_DAG: cross-schema FK against the DAG without HK_DAG_EXCEPTION: %', v_bad;
+    RAISE EXCEPTION 'HK_XFK_DAG: cross-schema FK outside the module DAG (01 §5-1 depends_on) without HK_DAG_EXCEPTION: %', v_bad;
   END IF;
 END $$;
 

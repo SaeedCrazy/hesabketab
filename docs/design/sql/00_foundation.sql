@@ -148,6 +148,62 @@ BEGIN
   END LOOP;
 END $$;
 
+-- ---------- نقشهٔ ماژول‌ها و DAG در پایگاه داده (INV-ARCH-09؛ R-XFK-5؛ RV-ARCH-08) ----------
+-- هر اسکیمای صفحهٔ داده = یک ماژول. depends_on دقیقاً ستون «وابستگی مجاز» جدول ۰۱ §۵-۱ است (فهرست کامل، نه بستار
+-- گذرا) به‌اضافهٔ تصمیم‌های پذیرفتهٔ یکپارچه‌سازی: catalog → parties (04:CR-01) و assistant در L8 با وابستگی به
+-- L0 تا L7 (10:C-AS-05). ماژول‌های بی‌اسکیما (kernel، contracts، integrations، edge) و platform (پایگاه جدا) این‌جا
+-- نیستند. ModuleSpec.depends_on (پایتون) باید با همین برابر باشد (01 INV-ARCH-07)؛ هر تغییر DAG هر دو را با هم عوض می‌کند.
+CREATE OR REPLACE FUNCTION core.module_registry()
+RETURNS TABLE (module text, layer smallint, depends_on text[])
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT m.module, m.layer::smallint, m.depends_on FROM (VALUES
+    ('ref',       0, '{}'::text[]),
+    ('core',      0, '{ref}'),
+    ('rules',     1, '{core,ref}'),
+    ('parties',   2, '{core,ref,rules}'),
+    ('catalog',   2, '{core,ref,rules,parties}'),                                        -- 04:CR-01
+    ('ledger',    3, '{core,ref,rules,parties}'),
+    ('inventory', 4, '{core,ref,rules,parties,catalog,ledger}'),
+    ('treasury',  4, '{core,ref,rules,parties,ledger}'),
+    ('tax',       4, '{core,ref,rules,parties,catalog,ledger}'),
+    ('assets',    4, '{core,ref,rules,parties,ledger}'),
+    ('sales',     5, '{core,ref,rules,parties,catalog,ledger,inventory,treasury,tax}'),     -- L0..L4 جز assets
+    ('purchase',  5, '{core,ref,rules,parties,catalog,ledger,inventory,treasury,tax}'),     -- L0..L4 جز assets
+    ('payroll',   5, '{core,ref,rules,parties,ledger,treasury}'),
+    ('pos',       6, '{core,ref,rules,parties,catalog,inventory,treasury,tax,sales}'),      -- بدون ledger (06 INV-POS-14)
+    ('reports',   7, '{core,ref,rules,parties,catalog,ledger,inventory,treasury,tax,assets,sales,purchase,payroll,pos}'),
+    ('migration', 7, '{core,ref,rules,parties,catalog,ledger,inventory,treasury,tax,assets,sales,purchase,payroll,pos}'),
+    ('assistant', 8, '{core,ref,rules,parties,catalog,ledger,inventory,treasury,tax,assets,sales,purchase,payroll,pos,reports,migration}')  -- 10:C-AS-05
+  ) AS m(module, layer, depends_on)
+$$;
+
+-- هر FK بین‌اسکیمایی که جفت (ماژول مبدأ، ماژول مقصد) آن در depends_on نیست — هم‌لایه، چرخه، رو به بالا، یا رو به
+-- پایینِ اعلام‌نشده — و برچسب «HK_DAG_EXCEPTION: <دلیل>» (COMMENT ON CONSTRAINT) ندارد. اسکیمای ثبت‌نشده (ماژول
+-- تازه بدون ADR و ردیف بالا) هم خطاست. قیدهای فرزند پارتیشن (conparentid ≠ 0) برچسب والد را دارند و شمرده نمی‌شوند.
+-- خودآزمایی پایانی 99_cross_fk.sql (HK_XFK_DAG) و آزمون یکپارچه (A2.cross_schema_fks_follow_dag) همین را صدا می‌زنند.
+CREATE OR REPLACE FUNCTION core.xfk_dag_violations()
+RETURNS TABLE (from_table regclass, conname name, to_table regclass, from_module text, to_module text, problem text)
+LANGUAGE sql STABLE AS $$
+  SELECT c.conrelid::regclass, c.conname, c.confrelid::regclass, sn.nspname::text, dn.nspname::text,
+         CASE WHEN ms.module IS NULL THEN 'unregistered_schema:' || sn.nspname
+              WHEN md.module IS NULL THEN 'unregistered_schema:' || dn.nspname
+              WHEN sn.nspname::text = ANY (md.depends_on) OR ms.layer < md.layer THEN 'against_dag'
+              ELSE 'not_in_depends_on' END
+    FROM pg_catalog.pg_constraint c
+    JOIN pg_catalog.pg_class s     ON s.oid = c.conrelid
+    JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
+    JOIN pg_catalog.pg_class d     ON d.oid = c.confrelid
+    JOIN pg_catalog.pg_namespace dn ON dn.oid = d.relnamespace
+    LEFT JOIN core.module_registry() ms ON ms.module = sn.nspname::text
+    LEFT JOIN core.module_registry() md ON md.module = dn.nspname::text
+   WHERE c.contype = 'f' AND c.conparentid = 0
+     AND sn.nspname <> dn.nspname
+     AND NOT (ms.module IS NOT NULL AND md.module IS NOT NULL AND dn.nspname::text = ANY (ms.depends_on))
+     AND coalesce(pg_catalog.obj_description(c.oid, 'pg_constraint'), '') NOT LIKE 'HK_DAG_EXCEPTION:%'
+$$;
+-- فقط برای migrate، lint و آزمون؛ نقش‌های زمان اجرا به آن نیازی ندارند
+REVOKE EXECUTE ON FUNCTION core.module_registry(), core.xfk_dag_violations() FROM PUBLIC;
+
 -- ---------- انواع دامنه (هرگز float برای پول/مقدار) ----------
 DO $$
 BEGIN
@@ -336,7 +392,8 @@ BEGIN
   END LOOP;
   FOR o IN SELECT p.oid::regprocedure AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = 'core'
-              AND p.proname IN ('current_tenant_id','current_user_id','enable_tenant_rls','forbid_mutation','make_append_only','touch_row')
+              AND p.proname IN ('current_tenant_id','current_user_id','enable_tenant_rls','forbid_mutation','make_append_only','touch_row',
+                                'module_registry','xfk_dag_violations')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = 'hk_migrator') LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO hk_migrator', o.fn);
   END LOOP;
