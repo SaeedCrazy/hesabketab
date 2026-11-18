@@ -17,6 +17,11 @@
 --         تریگرهای deferred در commit آن اجرا می‌شوند. موارد منفیِ deferred با «SET CONSTRAINTS ALL IMMEDIATE»
 --         درون زیرتراکنش expect_error آزموده می‌شوند. زمینهٔ مستأجر با set_config('app.tenant_id', ..., true).
 --         T20 هر بررسی تریگر/تابعی را که آزمون جهش (neutralize هر raise_error) بی‌آزمون یافت، با الگوی دقیق کد و پیام می‌آزماید.
+--   T21..T28 (دور یکپارچه‌سازی): نگهبان‌ها و راستی‌آزمایی‌های یافته‌های RV-*؛ گروه‌های وابسته به core (T28: پیوند شمارهٔ عطف،
+--         تأیید قفل‌گشایی، مشترک رویداد) فقط وقتی 10_core پیش‌تر اعمال شده اجرا می‌شوند (زنجیرهٔ 00 → 10 → 20 یا پایگاه یکپارچه)
+--         و در زنجیرهٔ مستقل 00 → 20 با NOTICE «SKIP» رد می‌شوند.
+--   T29 (همروندی، postgres + dblink): هر مسابقهٔ RV-LEDGER-01..04 با دو یا سه نشست واقعی (dblink به همین پایگاه از سوکت محلی؛
+--         پیش‌نیاز: افزونهٔ contrib «dblink» و احراز trust/peer روی سوکت محلی برای کاربر جاری).
 --   بخش ۳ (tamper، نقش postgres، ROLLBACK): دست‌کاری مستقیم سطر دائم با غیرفعال کردن تریگر و کشف آن با
 --         verify_permanent_chain و verify_balance_buckets؛ و آزمون hk_readonly.
 -- خروجی موفق با «ALL 20_ledger TESTS PASSED» پایان می‌یابد؛ هر شکست «TEST FAILED: ...» است و psql با کد ≠ ۰ خارج می‌شود.
@@ -38,7 +43,26 @@ INSERT INTO core.company (tenant_id, id, code, name) VALUES
   ('0b000000-0000-7000-8000-000000000001', '0b000000-0000-7000-8000-0000000000c1', 'C1', 'شرکت ب'),
   -- T20 (شکاف‌های آزمون جهش): CA3 با کدینگ و سال، CA4 خالی (بدون حساب و سال)
   ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c3', 'C3', 'شرکت الف ۳'),
-  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c4', 'C4', 'شرکت الف ۴');
+  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c4', 'C4', 'شرکت الف ۴'),
+  -- دور یکپارچه‌سازی: CA5 همروندی (T29)، CA6 بستن سال/تطبیق/تسعیر (T22)، CA7 حذف صفرها (T23)، CA8 گروه‌های وابسته به core (T28)
+  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c5', 'C5', 'شرکت الف ۵'),
+  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c6', 'C6', 'شرکت الف ۶'),
+  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c7', 'C7', 'شرکت الف ۷'),
+  ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000c8', 'C8', 'شرکت الف ۸');
+-- ارز آزمایشی «ریال جدید» (کد واقعی هنوز قطعی نیست، C-L10) برای آزمون تبدیل در بستن سال (T23)
+INSERT INTO ref.currency (code, name_fa, name_en, minor_unit) VALUES ('XRN', 'ریال جدید (آزمون)', 'New Rial (test)', 2);
+-- اگر 10_core اعمال شده: کاربر آزمون عضو هر دو مستأجر است (FKهای کنشگر 99 و core؛ C-L18)
+DO $$
+BEGIN
+  IF to_regclass('core.app_user') IS NOT NULL THEN
+    EXECUTE $x$INSERT INTO core.app_user (id, display_name) VALUES ('0a000000-0000-7000-8000-00000000a001', 'کاربر آزمون دفتر کل')
+                ON CONFLICT DO NOTHING$x$;
+    EXECUTE $x$INSERT INTO core.tenant_membership (tenant_id, user_id, status, is_owner, joined_at) VALUES
+                ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-00000000a001', 'active', true, now()),
+                ('0b000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-00000000a001', 'active', true, now())
+                ON CONFLICT DO NOTHING$x$;
+  END IF;
+END $$;
 INSERT INTO core.branch (tenant_id, id, company_id, code, name) VALUES
   ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000b1', '0a000000-0000-7000-8000-0000000000c1', 'BR1', 'شعبه ۱'),
   ('0a000000-0000-7000-8000-000000000001', '0a000000-0000-7000-8000-0000000000b2', '0a000000-0000-7000-8000-0000000000c2', 'BR1', 'شعبه ۱'),
@@ -113,10 +137,15 @@ END $$;
 CREATE OR REPLACE FUNCTION public.t_post(p_company uuid, p_date date, p_lines jsonb, p_type text DEFAULT 'manual',
                                          p_source text DEFAULT 'ledger', p_doc_id uuid DEFAULT NULL, p_event text DEFAULT 'post',
                                          p_soft boolean DEFAULT false, p_unit core.amount_unit DEFAULT NULL,
-                                         p_count integer DEFAULT NULL, p_total numeric DEFAULT NULL)
+                                         p_count integer DEFAULT NULL, p_total numeric DEFAULT NULL,
+                                         p_no_source boolean DEFAULT false)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE v_id uuid := uuidv7(); v_fy uuid; v_base char(3); v_ref bigint; v_n int; v_tot numeric; v_memo numeric;
 BEGIN
+  -- سند ماژولی و ورودی همیشه مرجع مبدأ دارد (INV-LED-26)؛ آزمون منفی همین قاعده p_no_source را می‌دهد
+  IF p_doc_id IS NULL AND p_type IN ('module','opening_import','history_import') AND NOT p_no_source THEN
+    p_doc_id := uuidv7();
+  END IF;
   SELECT f.id, f.base_currency INTO v_fy, v_base FROM ledger.fiscal_year f
    WHERE f.company_id = p_company AND p_date BETWEEN f.start_date AND f.end_date;
   v_ref := public.t_ref(p_company, p_date);
@@ -169,15 +198,16 @@ END $$;
 
 -- زیردفتر جعلی اشخاص (به‌جای ماژول parties/sales مرحلهٔ ۲) برای آزمون قرارداد subledger_source
 CREATE TABLE public.t_party_items (tenant_id uuid NOT NULL, company_id uuid NOT NULL, account_id uuid NOT NULL,
-                                   party_dim uuid NOT NULL, amount numeric NOT NULL);
+                                   party_dim uuid NOT NULL, amount numeric NOT NULL,
+                                   currency char(3) NOT NULL DEFAULT 'IRR', amount_txn numeric);
 ALTER TABLE public.t_party_items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON public.t_party_items USING (tenant_id = core.current_tenant_id()) WITH CHECK (tenant_id = core.current_tenant_id());
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.t_party_items TO hk_app;
 CREATE OR REPLACE FUNCTION public.t_party_subledger(p_company_id uuid, p_as_of date)
 RETURNS TABLE (account_id uuid, dim_value_id uuid, currency char(3), balance_base numeric, balance_txn numeric)
 LANGUAGE sql STABLE AS $$
-  SELECT i.account_id, i.party_dim, 'IRR'::char(3), sum(i.amount), sum(i.amount)
-    FROM public.t_party_items i WHERE i.company_id = p_company_id GROUP BY 1, 2
+  SELECT i.account_id, i.party_dim, i.currency, sum(i.amount), sum(COALESCE(i.amount_txn, i.amount))
+    FROM public.t_party_items i WHERE i.company_id = p_company_id GROUP BY 1, 2, 3
 $$;
 INSERT INTO ledger.subledger_source (subledger_kind, owner_module, balance_function, dim_slot, compare_txn, introduced_in)
 VALUES ('party', 'tests', 'public.t_party_subledger', 1, true, 'test');
@@ -212,6 +242,19 @@ INSERT INTO ledger.coa_template (code, version, industry_pack, extends_code, ext
 INSERT INTO ledger.coa_template_account (template_code, template_version, code, parent_code, level, name_fa, kind, account_type, dimension_rules) VALUES
   ('test.badparent', 1, '91', '9', 2, 'بی‌والد', 'posting', 'asset', '{}'),
   ('test.baddim', 1, '1', NULL, 1, 'حساب', 'posting', 'asset', '{"no_such_type":"optional"}');
+-- افزونهٔ صنفی آزمایشی روی ir.general (T24؛ RV-LEDGER-09) و قالب بی‌پوشش (RV-IT2-03)
+INSERT INTO ledger.coa_template (code, version, industry_pack, extends_code, extends_version, name_fa, code_mode, levels, source, confidence) VALUES
+  ('test.cafe',    1, 'cafe', 'ir.general', 1, 'آزمون افزونهٔ کافه', 'hierarchical', '[{"level":1,"name_fa":"گروه","segment_length":1}]', 'test', 'low'),
+  ('test.badext',  1, 'test', 'ir.general', 1, 'آزمون افزونهٔ ناسازگار', 'hierarchical', '[{"level":1,"name_fa":"گروه","segment_length":1}]', 'test', 'low'),
+  ('test.nocover', 1, 'test', NULL, NULL, 'آزمون پوشش', 'free', '[{"level":1,"name_fa":"گروه","segment_length":2}]', 'test', 'low');
+INSERT INTO ledger.coa_template_account (template_code, template_version, code, parent_code, level, name_fa, kind, account_type, nature, tags, dimension_rules) VALUES
+  ('test.cafe', 1, '61',   '6',  2, 'فروش', 'group', 'income', 'credit', '{}', '{}'),
+  ('test.cafe', 1, '6106', '61', 3, 'فروش منوی کافه', 'posting', 'income', 'credit', '{pl.revenue}', '{"cost_center":"optional"}'),
+  ('test.badext', 1, '6101', '61', 3, 'فروش کالا (گروه!)', 'group', 'income', 'credit', '{}', '{}'),
+  ('test.nocover', 1, '10', NULL, 1, 'حساب', 'posting', 'asset', 'debit', '{}', '{}');
+INSERT INTO ledger.coa_template_posting_rule (template_code, template_version, posting_key, priority, conditions, account_code) VALUES
+  ('test.cafe', 1, 'sales.revenue', 50, '{"attr:item_posting_group":"menu"}', '6106'),
+  ('test.cafe', 1, 'sales.revenue', 100, '{}', '6101');
 INSERT INTO ledger.report_template (code, version, kind, name_fa) VALUES ('test.badformula', 1, 'custom', 'آزمون فرمول');
 INSERT INTO ledger.report_template_row (template_code, template_version, row_code, sort_order, label_fa, row_type, formula)
 VALUES ('test.badformula', 1, 'TOTAL', 1, 'جمع', 'formula', 'AAA + BBB');
@@ -228,7 +271,12 @@ DECLARE n integer; CA uuid := '0a000000-0000-7000-8000-0000000000c1'; CA2 uuid :
 BEGIN
   PERFORM t_ctx('A');
   PERFORM ledger.provision_tenant();
-  PERFORM assert_true((SELECT count(*) FROM ledger.dimension_type) = 9, 'T00 provision dimension types');
+  -- قابل حمل روی پایگاه یکپارچه (RV-IT-16): همهٔ کاتالوگ (بخش‌ها نوع می‌افزایند، مثل payment_gateway) و کدهای شناختهٔ ledger
+  PERFORM assert_true((SELECT count(*) FROM ledger.dimension_type) = (SELECT count(*) FROM ledger.dimension_type_catalog),
+                      'T00 provision dimension types = catalog');
+  PERFORM assert_true((SELECT count(*) FROM ledger.dimension_type WHERE code IN ('party','bank_account','cash_box','petty_cash',
+                         'pos_terminal','payment_gateway','fixed_asset','cost_center','project')) = 9, 'T00 provision ledger-known dimension types');
+  PERFORM assert_true(NOT EXISTS (SELECT 1 FROM ledger.dimension_type WHERE code = 'employee'), 'T00 employee dimension retired (CR-05)');
   PERFORM assert_true(ledger.provision_tenant() = 0, 'T00 provision is idempotent');
   n := ledger.apply_coa_template(CA, 'ir.general', 1);
   PERFORM assert_true(n >= 90, 'T00 template applied: ' || n);
@@ -236,8 +284,7 @@ BEGIN
   INSERT INTO ledger.dimension_value (tenant_id, dimension_type_id, code, name, source_module, source_entity_id)
   SELECT core.current_tenant_id(), t.id, v.code, v.name, v.src, uuidv7()
     FROM (VALUES ('party','P1','مشتری ۱','parties'), ('party','P2','مشتری ۲','parties'), ('party','PX','غیرفعال','parties'),
-                 ('cash_box','CB1','صندوق ۱','treasury'), ('bank_account','BK1','بانک ملت','treasury'),
-                 ('employee','E1','کارمند ۱','payroll')) v(type, code, name, src)
+                 ('cash_box','CB1','صندوق ۱','treasury'), ('bank_account','BK1','بانک ملت','treasury')) v(type, code, name, src)
     JOIN ledger.dimension_type t ON t.code = v.type;
   INSERT INTO ledger.dimension_value (tenant_id, dimension_type_id, code, name, is_group)
   SELECT core.current_tenant_id(), t.id, 'CCG', 'گروه مراکز', true FROM ledger.dimension_type t WHERE t.code = 'cost_center';
@@ -295,7 +342,7 @@ BEGIN
      'HK_LEDGER_ACCOUNT_DEPTH', 'T02 depth limited by coa_level');
   PERFORM expect_error(format($q$INSERT INTO ledger.account (tenant_id, company_id, parent_id, level, code, name, kind, account_type)
      VALUES (core.current_tenant_id(), %L, %L, 3, '1198', 'x', 'posting', 'asset')$q$, CA2, t_acc(CA, '11')),
-     'violates foreign key|HK_LEDGER', 'T02 parent must be in the same company');
+     'violates foreign key constraint "account_tenant_id_company_id_parent_id_fkey"', 'T02 parent must be in the same company');
   PERFORM expect_error(format($q$INSERT INTO ledger.account (tenant_id, company_id, parent_id, level, code, name, kind, account_type)
      VALUES (core.current_tenant_id(), %L, %L, 3, '1101', 'x', 'posting', 'asset')$q$, CA, t_acc(CA, '11')),
      'duplicate key', 'T02 code unique per company');
@@ -330,7 +377,7 @@ BEGIN
      'HK_LEDGER_FY_CHAIN', 'T03 only one first year per company');
   PERFORM expect_error(format($q$INSERT INTO ledger.fiscal_year (tenant_id, company_id, code, name, start_date, end_date, base_currency, previous_year_id)
      VALUES (core.current_tenant_id(), %L, 'X', 'x', '2026-06-01', '2027-05-31', 'IRR', %L)$q$, CA, t_fy(CA, '1405')),
-     'conflicting key|exclusion|HK_LEDGER_FY_CHAIN', 'T03 overlapping years rejected');
+     '^HK_LEDGER_FY_CHAIN: a fiscal year must start the day after', 'T03 overlapping years rejected (chain guard first; EXCLUDE in T19)');
   PERFORM expect_error(format($q$INSERT INTO ledger.fiscal_year (tenant_id, company_id, code, name, start_date, end_date, base_currency, previous_year_id)
      VALUES (core.current_tenant_id(), %L, 'X', 'x', '2027-03-21', '2028-03-19', 'USD', %L)$q$, CA, t_fy(CA, '1405')),
      'HK_LEDGER_FY_CURRENCY', 'T03 base currency equals company base');
@@ -469,7 +516,7 @@ BEGIN
   PERFORM expect_error(format($q$UPDATE ledger.journal SET description = 'x' WHERE id = %L$q$, j), 'permission denied', 'T07 header content not updatable');
   PERFORM expect_error(format($q$DELETE FROM ledger.journal WHERE id = %L$q$, j), 'permission denied', 'T07 journals are not deletable');
   PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent' WHERE id = %L$q$, j),
-     'HK_LEDGER_|check constraint', 'T07 no direct jump to permanent');
+     '^HK_LEDGER_OPENING_PENDING', 'T07 no direct jump to permanent');
   PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'voided', void_reason = 'test reason' WHERE id = %L$q$, j),
      'HK_LEDGER_VOID_PAIR', 'T07 void requires the mirror journal');
   PERFORM expect_error(format($q$INSERT INTO ledger.journal_line (tenant_id, journal_id, line_no, account_id, currency, exchange_rate, debit_txn, debit_base)
@@ -619,9 +666,16 @@ BEGIN
     SELECT * INTO x FROM ledger.journal WHERE id = x.id;
     x.permanent_no := fyr.last_permanent_no + 1;
     h := sha256(fyr.chain_head_hash || convert_to(ledger.journal_canonical(x), 'UTF8'));
+    -- موقتِ زودتر (y) پیش از دیرتر (x) دائم می‌شود (INV-LED-22): بررسی سطری جدا ندارد (RV-LEDGER-07) و از سه لایهٔ دیگر می‌آید:
+    -- دائم شدن x بی‌بُرش commit نمی‌شود، و جلو بردن بُرش تا x با y موقت ممنوع است
     PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent', permanent_no = %s, daily_no = 1, finalized_at = now(),
          chain_prev_hash = %L, chain_hash = %L WHERE id = %L$q$, x.permanent_no, fyr.chain_head_hash, h, x.id),
-       'HK_LEDGER_PERMANENT_PENDING_EARLIER', 'T10 earlier temporary journals block a later permanent');
+       '^HK_LEDGER_PERMANENT_CUTOFF', 'T10 earlier temporary journals block a later permanent (no cut-off)');
+    PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent', permanent_no = %s, daily_no = 1, finalized_at = now(),
+         chain_prev_hash = %L, chain_hash = %L WHERE id = %L;
+         UPDATE ledger.fiscal_year SET finalized_through = '2026-07-10', last_permanent_no = %s, chain_head_hash = %L WHERE id = %L$q$,
+         x.permanent_no, fyr.chain_head_hash, h, x.id, x.permanent_no, h, fy),
+       '^HK_LEDGER_FINALIZE_GAP', 'T10 earlier temporary journals block a later permanent (cut-off over a temporary)');
     PERFORM ledger.void_journal(y, uuidv7(), t_ref(CA, '2026-07-05'), 'V-Y', 'آزمون ترتیب');
     PERFORM expect_error(format($q$UPDATE ledger.journal SET status = 'permanent', permanent_no = %s, daily_no = 1, finalized_at = now(),
          chain_prev_hash = %L, chain_hash = '\x00' WHERE id = %L$q$, x.permanent_no, fyr.chain_head_hash, x.id),
@@ -714,7 +768,8 @@ BEGIN
      'HK_LEDGER_MAPPING_MISSING', 'T12 missing mapping is an error (no silent default)');
   PERFORM expect_error(format($q$INSERT INTO ledger.posting_rule (tenant_id, company_id, posting_key, priority, conditions, account_id)
      VALUES (core.current_tenant_id(), %L, 'sales.revenue', 100, '{}', %L)$q$, CA, t_acc(CA, '6102')),
-     'conflicting key|exclusion', 'T12 duplicate rule with overlapping validity rejected');
+     'conflicting key value violates exclusion constraint "posting_rule_tenant_id_company_id_posting_key_priority_md5_excl"',
+     'T12 duplicate rule with overlapping validity rejected');
   PERFORM expect_error(format($q$INSERT INTO ledger.posting_rule (tenant_id, company_id, posting_key, priority, account_id)
      VALUES (core.current_tenant_id(), %L, 'sales.revenue', 7, %L)$q$, CA, t_acc(CA, '1101')),
      'HK_LEDGER_MAPPING_ACCOUNT_TYPE', 'T12 mapped account type must match the key');
@@ -736,6 +791,10 @@ BEGIN
     (core.current_tenant_id(), rt, 'USD', 'IRR', '2026-05-01', 500000), (core.current_tenant_id(), rt, 'USD', 'IRR', '2026-05-10', 520000);
   SELECT * INTO r FROM ledger.rate_on(rt, 'USD', 'IRR', '2026-05-09');
   PERFORM assert_true(r.rate = 500000 AND r.rate_date = '2026-05-01', 'T13 latest rate on or before date');
+  -- دو نرخ پیش از تاریخ: تازه‌ترین برمی‌گردد، نه قدیمی‌ترین (RV-LEDGER-08)
+  SELECT * INTO r FROM ledger.rate_on(rt, 'USD', 'IRR', '2026-05-12');
+  PERFORM assert_true(r.rate = 520000 AND r.rate_date = '2026-05-10', 'T13 latest of several earlier rates');
+  PERFORM assert_true(NOT EXISTS (SELECT 1 FROM ledger.rate_on(rt, 'USD', 'IRR', '2026-04-30')), 'T13 no rate before the first rate date');
   PERFORM assert_true((SELECT rate FROM ledger.rate_on(rt, 'IRR', 'IRR', '2026-05-09')) = 1, 'T13 same currency rate is 1');
   PERFORM expect_error(format($q$INSERT INTO ledger.exchange_rate (tenant_id, rate_type_id, currency, base_currency, rate_date, rate)
      VALUES (core.current_tenant_id(), %L, 'EUR', 'IRR', '2026-05-01', 0)$q$, rt), 'check constraint', 'T13 rate must be positive');
@@ -755,9 +814,17 @@ BEGIN
   SELECT core.current_tenant_id(), CA, l.account_id, l.dim1_id, sum(l.debit_base - l.credit_base)
     FROM ledger.journal_line l JOIN ledger.account a ON a.id = l.account_id
    WHERE l.company_id = CA AND a.subledger_kind = 'party' GROUP BY l.account_id, l.dim1_id;
-  PERFORM assert_true(NOT EXISTS (SELECT 1 FROM ledger.check_control_accounts(CA, '2027-03-20')), 'T14 GL equals subledger');
+  PERFORM assert_true(NOT EXISTS (SELECT 1 FROM ledger.check_control_accounts(CA, '2027-03-20') WHERE subledger_kind = 'party'),
+                      'T14 GL equals subledger');
   UPDATE public.t_party_items SET amount = amount + 1 WHERE party_dim = t_dim('party','P1');
-  PERFORM assert_true((SELECT count(*) FROM ledger.check_control_accounts(CA, '2027-03-20')) = 1, 'T14 difference detected');
+  PERFORM assert_true((SELECT count(*) FROM ledger.check_control_accounts(CA, '2027-03-20')
+                        WHERE subledger_kind = 'party' AND problem = 'difference') = 1, 'T14 difference detected');
+  -- حساب کنترلی‌ای که برای نوعش زیردفتری ثبت یا نصب نشده «بی‌زیردفتر» گزارش می‌شود (RV-LEDGER-13؛ سناریوی ۱۷)
+  IF to_regprocedure('inventory.ledger_subledger_stock(uuid,date)') IS NULL THEN
+    PERFORM assert_true(EXISTS (SELECT 1 FROM ledger.check_control_accounts(CA, '2027-03-20')
+                                 WHERE subledger_kind = 'inventory' AND account_id = t_acc(CA, '1401') AND problem = 'no_subledger'),
+                        'T14 control account without a registered subledger is reported (no_subledger)');
+  END IF;
   UPDATE public.t_party_items SET amount = amount - 1 WHERE party_dim = t_dim('party','P1');
   -- ادغام شخص: سطرهای قدیم دست نمی‌خورند؛ تطبیق به مقصد ادغام نسبت می‌دهد
   INSERT INTO ledger.dimension_value (tenant_id, dimension_type_id, code, name, source_module, source_entity_id)
@@ -770,7 +837,8 @@ BEGIN
      'HK_LEDGER_DIM_MERGE', 'T14 merge target must be the same type');
   UPDATE ledger.dimension_value SET merged_into_id = t_dim('party','P1'), is_active = false WHERE code = 'P3';
   UPDATE public.t_party_items SET amount = amount + 123 WHERE party_dim = t_dim('party','P1');
-  PERFORM assert_true(NOT EXISTS (SELECT 1 FROM ledger.check_control_accounts(CA, '2027-03-20')), 'T14 merged dimension resolved to survivor');
+  PERFORM assert_true(NOT EXISTS (SELECT 1 FROM ledger.check_control_accounts(CA, '2027-03-20') WHERE subledger_kind = 'party'),
+                      'T14 merged dimension resolved to survivor');
   PERFORM expect_error(format($q$SELECT t_post(%L, '2026-07-16', '[{"a":"1201","dr":1,"d1":"%s"},{"a":"6101","cr":1}]', 'module', 'sales')$q$,
      CA, t_dim('party','P3')), 'HK_LEDGER_DIM_NOT_POSTABLE', 'T14 merged value is not postable');
   PERFORM expect_error($q$UPDATE ledger.dimension_value SET merged_into_id = NULL, is_active = true WHERE code = 'P3'$q$,
@@ -808,7 +876,7 @@ BEGIN
   END LOOP;
   UPDATE ledger.fiscal_year SET status = 'closing' WHERE id = fy;
   PERFORM expect_error(format($q$SELECT t_post(%L, '2026-09-01', '[{"a":"5101","dr":1},{"a":"5201","cr":1}]')$q$, CA2),
-     'HK_LEDGER_YEAR_NOT_OPEN|HK_LEDGER_PERIOD_CLOSED', 'T15 no regular posting while closing');
+     '^HK_LEDGER_YEAR_NOT_OPEN', 'T15 no regular posting while closing');
   PERFORM expect_error(format($q$UPDATE ledger.fiscal_year SET status = 'closed' WHERE id = %L$q$, fy),
      'HK_LEDGER_FY_NO_OPENING', 'T15 closed requires the next opening');
 END $$;
@@ -864,7 +932,7 @@ BEGIN
   PERFORM ledger.finalize_through(fy2, '2027-03-21');
   PERFORM assert_true((SELECT journal_type FROM ledger.journal WHERE fiscal_year_id = fy2 AND permanent_no = 1) = 'opening', 'T15 opening is #1 of next year');
   PERFORM expect_error(format($q$SELECT t_post(%L, '2027-03-21', '[{"a":"5101","dr":1},{"a":"5201","cr":1}]', 'opening_import', p_unit => 'IRR')$q$,
-     CA2), 'HK_LEDGER_FINALIZED_DATE|HK_LEDGER_OPENING_STATE', 'T15 no second opening after finalization');
+     CA2), '^HK_LEDGER_FINALIZED_DATE', 'T15 no second opening after finalization');
 END $$;
 
 -- ---------- T16: پوشش قالب گزارش برای شرکت CA و تراز سال ----------
@@ -909,7 +977,7 @@ BEGIN
      'HK_LEDGER_JOURNAL_NOT_FOUND', 'T17 a B line cannot target an A journal');
   PERFORM expect_error(format($q$INSERT INTO ledger.journal_line (tenant_id, journal_id, line_no, account_id, currency, exchange_rate, debit_txn, debit_base)
      VALUES ('0a000000-0000-7000-8000-000000000001', %L, 1, %L, 'IRR', 1, 1, 1)$q$, ja, acc_a),
-     'row-level security|HK_LEDGER_JOURNAL_NOT_FOUND', 'T17 B cannot write A rows');
+     '^HK_LEDGER_JOURNAL_NOT_FOUND', 'T17 B cannot write A rows (header invisible under B context)');
   PERFORM expect_error(format($q$SELECT ledger.finalize_through(%L, '2026-04-01')$q$, t_fy('0a000000-0000-7000-8000-0000000000c1', '1405')),
      'HK_LEDGER_NO_FISCAL_YEAR', 'T17 B cannot finalize A year');
   -- تعویض مستأجر وسط تراکنش: بررسی‌های deferred صریحاً شکست می‌خورند (fail-safe)

@@ -4,8 +4,11 @@
 -- دفتر کل فقط‌افزودنی، شماره‌گذاری دائم ترتیبی، ارز و نرخ، نگاشت حساب (posting profile)،
 -- بستن سال، تراز و صورت‌های مالی، و توابع راستی‌آزمایی.
 --
--- پیش‌نیاز: 00_foundation.sql. (به 10_core.sql وابسته نیست؛ اگر آن فایل پیش از این اجرا شده باشد
--- ثبت در کاتالوگ‌های core به‌صورت شرطی انجام می‌شود.)
+-- ترتیب رسمی (R-ORDER): 00_foundation.sql → 10_core.sql → این فایل. فایل هنوز روی 00 تنها هم اعمال می‌شود
+-- (زنجیرهٔ مستقل هارنس)، ولی هر بخش وابسته به core فقط وقتی 10_core.sql پیش‌تر اعمال شده فعال است:
+--   • ثبت در کاتالوگ‌های core (رجیستری صدور، مجوزها، مشترک رویداد) — شرطی هنگام اعمال؛
+--   • پیوند شمارهٔ عطف با core.number_issued (RV-LEDGER-21) و سنجش تأیید قفل‌گشایی با core.approval_request
+--     (RV-LEDGER-20) — شرطی هنگام اجرا (to_regclass)، پس ترتیب اعمال اهمیتی ندارد.
 -- اجرا با نقش migrator/superuser. برنامه با hk_app (نه مالک، NOBYPASSRLS) وصل می‌شود.
 -- پیشوند پیام خطاها: HK_LEDGER_* (SQLSTATE P0001) — نگاشت به کد API در سند §۵-۱۲.
 -- =====================================================================
@@ -44,6 +47,21 @@ BEGIN
   IF p_tenant IS DISTINCT FROM core.current_tenant_id() THEN
     RAISE EXCEPTION 'HK_LEDGER_TENANT_CONTEXT: tenant context changed inside the transaction' USING ERRCODE = 'P0001';
   END IF;
+END $$;
+
+-- نگهبان منشأ تراکنش (C-AS-02، R-AI-PRINCIPAL): در تراکنش آغازشده با مدل دستیار ('assistant') یا تحقق پیشنهاد
+-- ('assistant_confirm') هیچ نوشتنی در جدول‌های ثبت و وضعیت دفتر کل مجاز نیست (پیش‌نویس با created_via='assistant' آزاد است).
+-- GUC تراکنشی app.actor_via در رجیستری R-GUC ثبت است و UnitOfWork آن را می‌گذارد. تا core.forbid_actor_via() در 10_core
+-- نیامده همین تابع محلی (هم‌معنا) به کار می‌رود؛ پس از آن بدنهٔ تریگرها به تابع core اشاره می‌کند.
+CREATE OR REPLACE FUNCTION ledger.forbid_actor_via() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v text := COALESCE(NULLIF(current_setting('app.actor_via', true), ''), 'direct');
+BEGIN
+  IF v IN ('assistant', 'assistant_confirm') THEN
+    RAISE EXCEPTION 'HK_LEDGER_ACTOR_VIA: % on %.% is not allowed in an assistant-originated transaction (actor_via=%)',
+      TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME, v USING ERRCODE = 'P0001';
+  END IF;
+  RETURN CASE TG_OP WHEN 'DELETE' THEN OLD ELSE NEW END;
 END $$;
 
 -- گرد کردن با حالت مشخص (همتای Python: Decimal.quantize)
@@ -264,6 +282,25 @@ CREATE TABLE IF NOT EXISTS ledger.coa_level (
 );
 SELECT core.enable_tenant_rls('ledger.coa_level');
 
+-- افزونه‌های کدینگ بستهٔ صنفی که روی کدینگ پایهٔ شرکت اعمال شده‌اند (ir.cafe، ir.apparel، ir.electrical روی ir.general؛
+-- RV-LEDGER-09). فقط‌افزودنی؛ هر افزونه یک بار برای هر شرکت (اعمال دوباره بی‌اثر است).
+CREATE TABLE IF NOT EXISTS ledger.coa_extension_applied (
+  tenant_id         uuid NOT NULL REFERENCES core.tenant(id),
+  id                uuid NOT NULL DEFAULT uuidv7(),
+  company_id        uuid NOT NULL,
+  template_code     text NOT NULL,
+  template_version  integer NOT NULL,
+  accounts_added    integer NOT NULL CHECK (accounts_added >= 0),
+  rules_added       integer NOT NULL CHECK (rules_added >= 0),
+  applied_at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, company_id, template_code),
+  FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
+  FOREIGN KEY (template_code, template_version) REFERENCES ledger.coa_template(code, version)
+);
+SELECT core.enable_tenant_rls('ledger.coa_extension_applied');
+
 -- =====================================================================
 -- ۳. ابعاد (تفصیلی شناور)
 -- =====================================================================
@@ -410,6 +447,12 @@ CREATE TABLE IF NOT EXISTS ledger.fiscal_year (
   finalized_through  date,                 -- سندهای تا این تاریخ دائم‌اند؛ ثبت با تاریخ ≤ آن ممنوع
   last_permanent_no  integer NOT NULL DEFAULT 0 CHECK (last_permanent_no >= 0),
   chain_head_hash    bytea,
+  -- کد رهگیری پلمپ دفاتر سال (سازمان ثبت اسناد و املاک؛ پیش‌نیاز ارسال دفاتر الکترونیکی مادهٔ ۹۵؛ RV-LEDGER-30).
+  -- پس از ثبت رسید هر خروجی دفاتر این سال تغییرناپذیر است (fiscal_year_guard).
+  books_registration_code text CHECK (books_registration_code IS NULL
+                                      OR (books_registration_code = btrim(books_registration_code)
+                                          AND char_length(books_registration_code) BETWEEN 3 AND 60
+                                          AND books_registration_code !~ '[[:cntrl:]]')),
   status_reason      text,
   closed_at          timestamptz,
   closed_by          uuid,
@@ -980,7 +1023,10 @@ CREATE TABLE IF NOT EXISTS ledger.eledger_export (
   FOREIGN KEY (tenant_id, company_id, fiscal_year_id) REFERENCES ledger.fiscal_year(tenant_id, company_id, id),
   CHECK (to_date >= from_date),
   CHECK (total_debit = total_credit),
-  CHECK ((status = 'submitted') = (submitted_at IS NOT NULL))
+  -- رسید ارسال فقط با ارسال ثبت می‌شود و پس از آن (حتی در superseded) می‌ماند؛ گذارها در eledger_export_guard
+  CHECK (status <> 'generated' OR (submitted_at IS NULL AND submission_ref IS NULL)),
+  CHECK (status <> 'submitted' OR (submitted_at IS NOT NULL AND submission_ref IS NOT NULL)),
+  CHECK ((submitted_at IS NULL) = (submission_ref IS NULL))
 );
 SELECT core.enable_tenant_rls('ledger.eledger_export');
 
@@ -1158,6 +1204,34 @@ END $$;
 DROP TRIGGER IF EXISTS trg_guard ON ledger.dimension_value;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON ledger.dimension_value FOR EACH ROW EXECUTE FUNCTION ledger.dimension_value_guard();
 
+-- ادغام همیشه تخت است (RV-LEDGER-06): در پایان تراکنش هیچ مقداری به مقدار ادغام‌شده اشاره نمی‌کند، پس مقدار مؤثر
+-- (v_dimension_effective و check_control_accounts) با یک گام به مقصد نهایی می‌رسد. ادغام زنجیره‌ای (B→C وقتی A→B)
+-- فقط وقتی commit می‌شود که DimensionService.merge در همان تراکنش هر مقدارِ اشاره‌کننده به بازنده را به برنده برگرداند.
+CREATE OR REPLACE FUNCTION ledger.dimension_merge_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_cur ledger.dimension_value; v_ptr text;
+BEGIN
+  PERFORM ledger.assert_tenant_context(NEW.tenant_id);
+  SELECT * INTO v_cur FROM ledger.dimension_value WHERE tenant_id = NEW.tenant_id AND id = NEW.id;
+  IF v_cur.merged_into_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+  IF EXISTS (SELECT 1 FROM ledger.dimension_value t WHERE t.tenant_id = v_cur.tenant_id AND t.id = v_cur.merged_into_id
+                AND t.merged_into_id IS NOT NULL) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_DIM_MERGE_CHAIN', format('dimension value %s is merged into a merged value', v_cur.code));
+  END IF;
+  SELECT string_agg(x.code, ',' ORDER BY x.code) INTO v_ptr FROM ledger.dimension_value x
+   WHERE x.tenant_id = v_cur.tenant_id AND x.merged_into_id = v_cur.id;
+  IF v_ptr IS NOT NULL THEN
+    PERFORM ledger.raise_error('HK_LEDGER_DIM_MERGE_CHAIN',
+      format('values %s still point to merged value %s; re-point them to the winner in the same transaction', v_ptr, v_cur.code));
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_merge_verify ON ledger.dimension_value;
+CREATE CONSTRAINT TRIGGER trg_merge_verify AFTER INSERT OR UPDATE OF merged_into_id ON ledger.dimension_value
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.merged_into_id IS NOT NULL) EXECUTE FUNCTION ledger.dimension_merge_verify();
+
 CREATE OR REPLACE FUNCTION ledger.posting_rule_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE a ledger.account; k ledger.posting_key;
@@ -1210,9 +1284,17 @@ BEGIN
      IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.company_id, OLD.start_date, OLD.end_date, OLD.base_currency, OLD.previous_year_id) THEN
     PERFORM ledger.raise_error('HK_LEDGER_FY_IMMUTABLE', 'dates, currency and chain of a fiscal year are immutable');
   END IF;
-  -- قفل انحصاری ردیف تا ثبت‌های در جریان (که FOR KEY SHARE گرفته‌اند) تمام شوند
-  IF NEW.status <> OLD.status OR NEW.finalized_through IS DISTINCT FROM OLD.finalized_through THEN
+  -- قفل انحصاری ردیف تا ثبت‌های در جریان (که FOR KEY SHARE گرفته‌اند) تمام شوند. قفل خود UPDATE (FOR NO KEY UPDATE)
+  -- با FOR KEY SHARE تعارض ندارد؛ پس هر گذار محدودکننده — وضعیت، بُرش و وضعیت افتتاحیه (RV-LEDGER-04: تکهٔ افتتاحیهٔ
+  -- در جریان پیش از سنجش صفر بودن حساب واسط) — صریحاً FOR UPDATE می‌گیرد و سپس بررسی‌ها را با snapshot تازه اجرا می‌کند.
+  IF NEW.status <> OLD.status OR NEW.finalized_through IS DISTINCT FROM OLD.finalized_through
+     OR NEW.opening_state <> OLD.opening_state THEN
     PERFORM 1 FROM ledger.fiscal_year WHERE tenant_id = OLD.tenant_id AND id = OLD.id FOR UPDATE;
+  END IF;
+  IF NEW.books_registration_code IS DISTINCT FROM OLD.books_registration_code AND EXISTS (
+       SELECT 1 FROM ledger.eledger_export e WHERE e.tenant_id = OLD.tenant_id AND e.fiscal_year_id = OLD.id
+          AND e.submitted_at IS NOT NULL) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_BOOKS_CODE_LOCKED', 'the books registration code is fixed once an e-ledger export of the year is submitted');
   END IF;
   SELECT * INTO nxt FROM ledger.fiscal_year WHERE tenant_id = OLD.tenant_id AND previous_year_id = OLD.id;
 
@@ -1305,26 +1387,71 @@ END $$;
 DROP TRIGGER IF EXISTS trg_guard ON ledger.fiscal_year;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON ledger.fiscal_year FOR EACH ROW EXECUTE FUNCTION ledger.fiscal_year_guard();
 
--- پوشش کامل سال با دوره‌ها (در پایان تراکنش ساخت سال)
-CREATE OR REPLACE FUNCTION ledger.fiscal_year_verify() RETURNS trigger
+-- نگهبان ارز پایهٔ شرکت (C-L09، RV-IT-03): پس از نخستین سال مالی، core.company.base_currency فقط از مسیر رویهٔ حذف صفرها
+-- (GUC تراکنشی hk.redenomination='on' در رجیستری R-GUC؛ UnitOfWork آن را فقط برای همان رویه می‌گذارد) تغییر می‌کند.
+-- این نگهبان سال مالی را می‌خواند، پس طبق جهت DAG مال ledger است و روی جدول core در این فایل نصب می‌شود.
+CREATE OR REPLACE FUNCTION ledger.company_base_currency_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE s record;
 BEGIN
-  PERFORM ledger.assert_tenant_context(NEW.tenant_id);
+  IF NEW.base_currency IS DISTINCT FROM OLD.base_currency THEN
+    PERFORM ledger.assert_tenant_context(OLD.tenant_id);   -- بدون زمینهٔ مستأجر RLS سال‌ها را پنهان می‌کرد (fail-closed)
+    IF COALESCE(current_setting('hk.redenomination', true), '') <> 'on' AND EXISTS (
+         SELECT 1 FROM ledger.fiscal_year f WHERE f.tenant_id = OLD.tenant_id AND f.company_id = OLD.id) THEN
+      PERFORM ledger.raise_error('HK_LEDGER_BASE_CURRENCY_LOCKED',
+        'the base currency of a company with fiscal years changes only through the redenomination procedure');
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_ledger_base_currency_guard ON core.company;
+CREATE TRIGGER trg_ledger_base_currency_guard BEFORE UPDATE OF base_currency ON core.company
+  FOR EACH ROW EXECUTE FUNCTION ledger.company_base_currency_guard();
+
+-- پوشش کامل سال با دوره‌ها (در پایان تراکنش ساخت سال)
+CREATE OR REPLACE FUNCTION ledger.assert_period_partition(p_tenant uuid, p_fiscal_year_id uuid) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE s record; fy ledger.fiscal_year;
+BEGIN
+  SELECT * INTO fy FROM ledger.fiscal_year WHERE tenant_id = p_tenant AND id = p_fiscal_year_id;
+  IF NOT FOUND THEN
+    RETURN;   -- سال در همان تراکنش حذف شده (فقط مسیر پاک‌سازی مالک)؛ FK دوره‌های باقی‌مانده را می‌سنجد
+  END IF;
   SELECT count(*) AS n, min(p.start_date) AS mn, max(p.end_date) AS mx, COALESCE(sum(p.end_date - p.start_date + 1), 0) AS days,
          bool_and(p.period_no = p.rn) AS ordered
     INTO s
     FROM (SELECT fp.*, row_number() OVER (ORDER BY fp.start_date) AS rn
-            FROM ledger.fiscal_period fp WHERE fp.tenant_id = NEW.tenant_id AND fp.fiscal_year_id = NEW.id) p;
-  IF s.n = 0 OR s.mn <> NEW.start_date OR s.mx <> NEW.end_date OR s.days <> (NEW.end_date - NEW.start_date + 1) OR NOT s.ordered THEN
+            FROM ledger.fiscal_period fp WHERE fp.tenant_id = p_tenant AND fp.fiscal_year_id = p_fiscal_year_id) p;
+  IF s.n = 0 OR s.mn <> fy.start_date OR s.mx <> fy.end_date OR s.days <> (fy.end_date - fy.start_date + 1) OR NOT s.ordered THEN
     PERFORM ledger.raise_error('HK_LEDGER_PERIOD_COVERAGE',
       'periods must partition the fiscal year exactly and be numbered 1..n in date order');
   END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION ledger.fiscal_year_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM ledger.assert_tenant_context(NEW.tenant_id);
+  PERFORM ledger.assert_period_partition(NEW.tenant_id, NEW.id);
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_verify ON ledger.fiscal_year;
 CREATE CONSTRAINT TRIGGER trg_verify AFTER INSERT ON ledger.fiscal_year
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger.fiscal_year_verify();
+
+-- هر درج یا حذف دوره، حتی پس از ساخت سال و حتی با نقش مالک، افراز سال را دوباره می‌سنجد (RV-LEDGER-19).
+-- hk_app حق DELETE روی دوره و سال ندارد؛ این تریگر لایهٔ دوم است.
+CREATE OR REPLACE FUNCTION ledger.fiscal_period_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE r ledger.fiscal_period;
+BEGIN
+  IF TG_OP = 'DELETE' THEN r := OLD; ELSE r := NEW; END IF;
+  PERFORM ledger.assert_tenant_context(r.tenant_id);
+  PERFORM ledger.assert_period_partition(r.tenant_id, r.fiscal_year_id);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_verify ON ledger.fiscal_period;
+CREATE CONSTRAINT TRIGGER trg_verify AFTER INSERT OR DELETE ON ledger.fiscal_period
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger.fiscal_period_verify();
 
 -- ---------- دوره ----------
 CREATE OR REPLACE FUNCTION ledger.fiscal_period_guard() RETURNS trigger
@@ -1379,11 +1506,22 @@ BEGIN
       PERFORM ledger.raise_error('HK_LEDGER_PERIOD_NOT_FINALIZED', 'lock requires all journals of the period to be permanent');
     END IF;
   ELSIF (OLD.status, NEW.status) = ('locked','closed') THEN
+    IF fy.status = 'locked' THEN
+      PERFORM ledger.raise_error('HK_LEDGER_PERIOD_TRANSITION', 'periods of a locked fiscal year cannot be unlocked');
+    END IF;
     IF NEW.status_approval_ref IS NULL OR NEW.status_reason IS NULL OR char_length(btrim(NEW.status_reason)) < 5 THEN
       PERFORM ledger.raise_error('HK_LEDGER_UNLOCK_APPROVAL', 'unlocking a period requires an approval reference and a reason');
     END IF;
-    IF fy.status = 'locked' THEN
-      PERFORM ledger.raise_error('HK_LEDGER_PERIOD_TRANSITION', 'periods of a locked fiscal year cannot be unlocked');
+    -- تأیید باید واقعاً «تأییدشده» و برای همین دوره و شرکت باشد (RV-LEDGER-20). core.approval_request با 10_core می‌آید
+    -- (R-ORDER)؛ بررسی هنگام اجرا شرطی است تا فایل روی 00 تنها هم اعمال شود.
+    IF to_regclass('core.approval_request') IS NOT NULL THEN
+      IF NOT EXISTS (SELECT 1 FROM core.approval_request ar
+                      WHERE ar.tenant_id = NEW.tenant_id AND ar.id = NEW.status_approval_ref AND ar.status = 'approved'
+                        AND ar.subject_type = 'ledger.fiscal_period' AND ar.subject_id = NEW.id
+                        AND ar.company_id = NEW.company_id) THEN
+        PERFORM ledger.raise_error('HK_LEDGER_UNLOCK_APPROVAL',
+          'the approval reference must be an approved request for this period (subject ledger.fiscal_period) of this company');
+      END IF;
     END IF;
   ELSE
     PERFORM ledger.raise_error('HK_LEDGER_PERIOD_TRANSITION', format('period transition %s -> %s is not allowed', OLD.status, NEW.status));
@@ -1395,16 +1533,39 @@ END $$;
 DROP TRIGGER IF EXISTS trg_guard ON ledger.fiscal_period;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON ledger.fiscal_period FOR EACH ROW EXECUTE FUNCTION ledger.fiscal_period_guard();
 
+-- تاریخچهٔ فقط‌افزودنی را فقط همین تریگر می‌نویسد (RV-LEDGER-24): hk_app حق INSERT روی period_status_event ندارد و
+-- تابع با نقش hk_ledger_definer (NOLOGIN، NOBYPASSRLS) و مقایسهٔ صریح مستأجر اجرا می‌شود (D-L24).
 CREATE OR REPLACE FUNCTION ledger.fiscal_period_history() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM core.current_tenant_id() THEN
+    RAISE EXCEPTION 'HK_LEDGER_TENANT_CONTEXT: period status change outside the current tenant context' USING ERRCODE = 'P0001';
+  END IF;
   INSERT INTO ledger.period_status_event (tenant_id, period_id, from_status, to_status, reason, approval_ref, actor_user_id)
   VALUES (NEW.tenant_id, NEW.id, OLD.status, NEW.status, NEW.status_reason, NEW.status_approval_ref, core.current_user_id());
   RETURN NULL;
 END $$;
+ALTER FUNCTION ledger.fiscal_period_history() OWNER TO hk_ledger_definer;
+COMMENT ON FUNCTION ledger.fiscal_period_history() IS
+  'HK_DEFINER_REVIEWED: 2026-11-18 section 03 (RV-LEDGER-24); appends the period transition of the current tenant only (explicit check + RLS); fixed search_path; no dynamic SQL';
 DROP TRIGGER IF EXISTS trg_history ON ledger.fiscal_period;
 CREATE TRIGGER trg_history AFTER UPDATE OF status ON ledger.fiscal_period
   FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status) EXECUTE FUNCTION ledger.fiscal_period_history();
+
+-- قفل ماژولی گذار محدودکننده است (RV-LEDGER-01، D-L09): درج قفل ردیف دوره را FOR UPDATE می‌گیرد، پس منتظر ثبت‌های در جریان
+-- همان دوره (FOR KEY SHARE در journal_before_insert) می‌ماند و ثبت‌های بعدی قفل را می‌بینند. قرارداد خواننده (مثلاً تهیهٔ
+-- اظهارنامه): اول قفل، بعد خواندن ارقام در همان تراکنش. گشودن قفل (DELETE) محدودکننده نیست.
+CREATE OR REPLACE FUNCTION ledger.period_module_lock_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM 1 FROM ledger.fiscal_period WHERE tenant_id = NEW.tenant_id AND id = NEW.period_id FOR UPDATE;
+  IF NOT FOUND THEN
+    PERFORM ledger.raise_error('HK_LEDGER_NO_PERIOD', 'module lock refers to an unknown period');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON ledger.period_module_lock;
+CREATE TRIGGER trg_guard BEFORE INSERT ON ledger.period_module_lock FOR EACH ROW EXECUTE FUNCTION ledger.period_module_lock_guard();
 
 -- =====================================================================
 -- ۱۴. تریگرهای سند و سطر
@@ -1487,7 +1648,9 @@ BEGIN
   END IF;
 
   IF NEW.reversal_of_journal_id IS NOT NULL THEN
-    SELECT * INTO o FROM ledger.journal WHERE tenant_id = NEW.tenant_id AND id = NEW.reversal_of_journal_id;
+    -- FOR SHARE با قفل ابطال (FOR UPDATE / UPDATE وضعیت) تعارض دارد: برگشت منتظر ابطال در جریان می‌ماند و وضعیت تازه را
+    -- می‌خواند، و ابطالِ بعدی برگشت فعال را می‌بیند (RV-LEDGER-03؛ هر مسیر درج، نه فقط ledger.reverse_journal)
+    SELECT * INTO o FROM ledger.journal WHERE tenant_id = NEW.tenant_id AND id = NEW.reversal_of_journal_id FOR SHARE;
     IF NOT FOUND OR o.status NOT IN ('temporary','permanent') OR o.entry_class <> 'regular' THEN
       PERFORM ledger.raise_error('HK_LEDGER_REVERSAL_TARGET', 'only a temporary or permanent regular journal can be reversed');
     END IF;
@@ -1509,6 +1672,19 @@ BEGIN
   END IF;   -- origin = 'import': هر ماژول مالک داده (ledger، migration، treasury، inventory، ...) با واحد مبلغ صریح
   IF t.requires_input_unit AND NEW.input_amount_unit IS NULL THEN
     PERFORM ledger.raise_error('HK_LEDGER_INPUT_UNIT', 'imported amounts must declare their unit (IRR/IRT/IRR_NEW)');
+  END IF;
+  -- idempotency ساختاری (INV-LED-26، RV-LEDGER-17): سند ماژولی و ورودی بدون مرجع مبدأ از journal_source_uq بیرون می‌ماند
+  IF t.origin IN ('module','import') AND NEW.source_doc_id IS NULL THEN
+    PERFORM ledger.raise_error('HK_LEDGER_SOURCE_REQUIRED',
+      format('%s journals must carry their source reference (source_doc_type, source_doc_id)', NEW.journal_type));
+  END IF;
+  -- پیوند شمارهٔ عطف (INV-LED-40، RV-LEDGER-21، RV-IT2-13): اگر شمارهٔ این سند در همین تراکنش با core.number_next
+  -- (doc_type='ledger.journal'، doc_id=شناسهٔ سند) صادر شده و فراخوان پیوند را نداده، پیوند پر می‌شود؛ درستی پیوند و
+  -- اجباری بودن آن را journal_verify در commit می‌سنجد.
+  IF NEW.number_issued_id IS NULL AND to_regclass('core.number_issued') IS NOT NULL THEN
+    SELECT n.id INTO NEW.number_issued_id FROM core.number_issued n
+     WHERE n.tenant_id = NEW.tenant_id AND n.doc_type = 'ledger.journal' AND n.doc_id = NEW.id AND n.status = 'used'
+     ORDER BY n.issued_at DESC LIMIT 1;
   END IF;
 
   -- بُرش نهایی‌سازی
@@ -1621,11 +1797,11 @@ BEGIN
         PERFORM ledger.raise_error('HK_LEDGER_DAILY_NO', 'daily number must continue within the day');
       END IF;
     END IF;
-    IF EXISTS (SELECT 1 FROM ledger.journal j WHERE j.tenant_id = OLD.tenant_id AND j.company_id = OLD.company_id
-                 AND j.fiscal_year_id = OLD.fiscal_year_id AND j.status = 'temporary' AND j.id <> OLD.id
-                 AND (j.journal_date, j.class_rank) < (OLD.journal_date, OLD.class_rank)) THEN
-      PERFORM ledger.raise_error('HK_LEDGER_PERMANENT_PENDING_EARLIER', 'earlier temporary journals must become permanent first');
-    END IF;
+    -- «موقت‌های زودتر پیش‌تر دائم می‌شوند» بررسی جداگانهٔ سطری ندارد (RV-LEDGER-07: هر بررسی سطری روی ایندکس اسناد موقت
+    -- در قطعی کردن انبوه O(n²) بود). این ناوردا از سه بررسی دیگر نتیجه می‌شود: (۱) دائم ⇔ تاریخ ≤ بُرش
+    -- (journal_permanent_verify، deferred)؛ (۲) جلو رفتن بُرش با موقتِ ≤ بُرش ممکن نیست (HK_LEDGER_FINALIZE_GAP)؛
+    -- (۳) شمارهٔ دائم n پس از n−1 به ترتیب تاریخ (HK_LEDGER_PERMANENT_ORDER). پس موقتِ زودتر یا پیش‌تر دائم می‌شود یا تراکنش
+    -- commit نمی‌شود (آزمون T10 «earlier temporary journals block a later permanent»).
     IF NEW.chain_hash IS DISTINCT FROM sha256(NEW.chain_prev_hash || convert_to(ledger.journal_canonical(NEW), 'UTF8')) THEN
       PERFORM ledger.raise_error('HK_LEDGER_CHAIN_CONTENT', 'chain_hash does not match the canonical content');
     END IF;
@@ -1656,7 +1832,30 @@ CREATE TRIGGER trg_nodelete BEFORE DELETE ON ledger.journal FOR EACH ROW EXECUTE
 DROP TRIGGER IF EXISTS trg_touch ON ledger.journal;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON ledger.journal FOR EACH ROW EXECUTE FUNCTION core.touch_row();
 
--- در پایان تراکنش: تعداد سطرها، تراز پایه، تراز انتظامی، و آینه بودن ابطال/برگشت
+-- پیوند شمارهٔ عطف با موتور شماره‌گذاری core (فقط وقتی 10_core اعمال شده صدا زده می‌شود؛ ارجاع به core.* هنگام اجرا حل می‌شود)
+CREATE OR REPLACE FUNCTION ledger.verify_number_link(p_tenant uuid, p_journal_id uuid, p_company_id uuid, p_fiscal_year_id uuid,
+                                                     p_reference_no bigint, p_number_issued_id uuid) RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  IF p_number_issued_id IS NULL THEN
+    IF EXISTS (SELECT 1 FROM core.number_series s WHERE s.tenant_id = p_tenant AND s.company_id = p_company_id
+                  AND s.doc_type = 'ledger.journal' AND s.is_active) THEN
+      PERFORM ledger.raise_error('HK_LEDGER_NUMBER_LINK',
+        format('reference number %s must be issued by core.number_next (series ledger.journal) and linked', p_reference_no));
+    END IF;
+    RETURN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM core.number_issued n JOIN core.number_series s ON s.tenant_id = n.tenant_id AND s.id = n.series_id
+                  WHERE n.tenant_id = p_tenant AND n.id = p_number_issued_id AND n.status = 'used'
+                    AND n.doc_type = 'ledger.journal' AND n.doc_id = p_journal_id AND n.value = p_reference_no
+                    AND n.period_key = 'fy:' || p_fiscal_year_id::text
+                    AND s.company_id = p_company_id AND s.doc_type = 'ledger.journal') THEN
+    PERFORM ledger.raise_error('HK_LEDGER_NUMBER_LINK',
+      format('number %s was not issued as reference %s of this journal (ledger.journal, fy:%s)', p_number_issued_id, p_reference_no, p_fiscal_year_id));
+  END IF;
+END $$;
+
+-- در پایان تراکنش: تعداد سطرها، تراز پایه، تراز انتظامی، آینه بودن ابطال/برگشت، و پیوند شمارهٔ عطف
 CREATE OR REPLACE FUNCTION ledger.journal_verify() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE s record; o ledger.journal; v_bad integer;
@@ -1694,6 +1893,11 @@ BEGIN
     IF v_bad > 0 THEN
       PERFORM ledger.raise_error('HK_LEDGER_MIRROR', format('%s lines of %s do not mirror the original', v_bad, NEW.reference_text));
     END IF;
+  END IF;
+  -- شمارهٔ عطف = شمارهٔ صادرشدهٔ core (INV-LED-40، RV-LEDGER-21): پیوند، اگر هست، باید همین سند، همین نوع سند، همین شرکت،
+  -- کلید سال (fy:<id>) و همین مقدار باشد؛ و شرکتی که سری فعال ledger.journal دارد (راه‌اندازی تولیدی) سند بی‌پیوند نمی‌پذیرد.
+  IF to_regclass('core.number_issued') IS NOT NULL THEN
+    PERFORM ledger.verify_number_link(NEW.tenant_id, NEW.id, NEW.company_id, NEW.fiscal_year_id, NEW.reference_no, NEW.number_issued_id);
   END IF;
   RETURN NULL;
 END $$;
@@ -1843,6 +2047,102 @@ DROP TRIGGER IF EXISTS trg_immutable ON ledger.period_status_event;
 CREATE TRIGGER trg_immutable BEFORE UPDATE OR DELETE ON ledger.period_status_event FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation();
 DROP TRIGGER IF EXISTS trg_immutable ON ledger.integrity_run;
 CREATE TRIGGER trg_immutable BEFORE UPDATE OR DELETE ON ledger.integrity_run FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation();
+DROP TRIGGER IF EXISTS trg_immutable ON ledger.coa_extension_applied;
+CREATE TRIGGER trg_immutable BEFORE UPDATE OR DELETE ON ledger.coa_extension_applied FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation();
+
+-- خروجی دفاتر الکترونیکی سابقهٔ یک ارسال قانونی است (RV-LEDGER-18): محتوای فایل پس از تولید ثابت است؛ فقط وضعیت و رسید
+-- ارسال تغییر می‌کنند، با گذارهای generated → submitted، و generated|submitted → superseded. رسید پس از ثبت ثابت می‌ماند.
+CREATE OR REPLACE FUNCTION ledger.eledger_export_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_mutable constant text[] := ARRAY['status','submitted_at','submission_ref','updated_at','row_version'];
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status <> 'generated' THEN
+      PERFORM ledger.raise_error('HK_LEDGER_EXPORT_TRANSITION', 'an e-ledger export is inserted as generated');
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF (to_jsonb(NEW) - v_mutable) IS DISTINCT FROM (to_jsonb(OLD) - v_mutable) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_EXPORT_IMMUTABLE', 'e-ledger export content is immutable after generation');
+  END IF;
+  IF OLD.submitted_at IS NOT NULL AND (NEW.submitted_at, NEW.submission_ref) IS DISTINCT FROM (OLD.submitted_at, OLD.submission_ref) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_EXPORT_IMMUTABLE', 'the submission receipt of an e-ledger export cannot change');
+  END IF;
+  IF NEW.status <> OLD.status AND (OLD.status, NEW.status) NOT IN (('generated','submitted'), ('generated','superseded'),
+                                                                   ('submitted','superseded')) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_EXPORT_TRANSITION', format('e-ledger export transition %s -> %s is not allowed', OLD.status, NEW.status));
+  END IF;
+  IF NEW.status = OLD.status AND (NEW.submitted_at, NEW.submission_ref) IS DISTINCT FROM (OLD.submitted_at, OLD.submission_ref) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_EXPORT_TRANSITION', 'the submission receipt is recorded only by generated -> submitted');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON ledger.eledger_export;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON ledger.eledger_export FOR EACH ROW EXECUTE FUNCTION ledger.eledger_export_guard();
+
+-- اجرای بستن سال (RV-LEDGER-18): مشخصات اجرا ثابت؛ شناسه‌های سند فقط یک بار و فقط در running پر می‌شوند؛
+-- گذارها running → completed|failed و completed → reverted (بازگشایی).
+CREATE OR REPLACE FUNCTION ledger.year_close_run_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_fixed constant text[] := ARRAY['tenant_id','id','company_id','fiscal_year_id','next_fiscal_year_id','conversion_factor',
+                                   'started_by','started_at'];
+  k text;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status <> 'running' OR NEW.completed_at IS NOT NULL OR NEW.reverted_at IS NOT NULL THEN
+      PERFORM ledger.raise_error('HK_LEDGER_RUN_TRANSITION', 'a year-close run is inserted as running');
+    END IF;
+    RETURN NEW;
+  END IF;
+  FOREACH k IN ARRAY v_fixed LOOP
+    IF (to_jsonb(NEW) -> k) IS DISTINCT FROM (to_jsonb(OLD) -> k) THEN
+      PERFORM ledger.raise_error('HK_LEDGER_RUN_IMMUTABLE', format('year-close run field %s is immutable', k));
+    END IF;
+  END LOOP;
+  FOREACH k IN ARRAY ARRAY['pl_closing_journal_id','re_transfer_journal_id','balance_closing_journal_id','opening_journal_id',
+                           'net_result_base','summary'] LOOP
+    IF (to_jsonb(NEW) -> k) IS DISTINCT FROM (to_jsonb(OLD) -> k)
+       AND (OLD.status <> 'running' OR (k <> 'summary' AND (to_jsonb(OLD) -> k) <> 'null'::jsonb)) THEN
+      PERFORM ledger.raise_error('HK_LEDGER_RUN_IMMUTABLE', format('year-close run field %s is set once while running', k));
+    END IF;
+  END LOOP;
+  IF NEW.status <> OLD.status THEN
+    IF (OLD.status, NEW.status) NOT IN (('running','completed'), ('running','failed'), ('completed','reverted')) THEN
+      PERFORM ledger.raise_error('HK_LEDGER_RUN_TRANSITION', format('year-close run transition %s -> %s is not allowed', OLD.status, NEW.status));
+    END IF;
+    IF NEW.status = 'completed' THEN NEW.completed_at := COALESCE(NEW.completed_at, now()); END IF;
+    IF NEW.status = 'reverted' THEN NEW.reverted_at := COALESCE(NEW.reverted_at, now()); END IF;
+  ELSIF (NEW.completed_at, NEW.reverted_at) IS DISTINCT FROM (OLD.completed_at, OLD.reverted_at) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_RUN_IMMUTABLE', 'completion and revert times are set by their transitions');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON ledger.year_close_run;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON ledger.year_close_run FOR EACH ROW EXECUTE FUNCTION ledger.year_close_run_guard();
+
+-- اجرای تسعیر: snapshot نرخ و سند تسعیر ثابت؛ سند برگشت فقط یک بار؛ تنها گذار posted → voided
+CREATE OR REPLACE FUNCTION ledger.fx_revaluation_run_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_mutable constant text[] := ARRAY['status','reversal_journal_id','updated_at','row_version'];
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status <> 'posted' THEN
+      PERFORM ledger.raise_error('HK_LEDGER_RUN_TRANSITION', 'a revaluation run is inserted as posted');
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF (to_jsonb(NEW) - v_mutable) IS DISTINCT FROM (to_jsonb(OLD) - v_mutable)
+     OR (OLD.reversal_journal_id IS NOT NULL AND NEW.reversal_journal_id IS DISTINCT FROM OLD.reversal_journal_id) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_RUN_IMMUTABLE', 'revaluation run content is immutable (the reversal journal is set once)');
+  END IF;
+  IF NEW.status <> OLD.status AND (OLD.status, NEW.status) <> ('posted','voided') THEN
+    PERFORM ledger.raise_error('HK_LEDGER_RUN_TRANSITION', format('revaluation run transition %s -> %s is not allowed', OLD.status, NEW.status));
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON ledger.fx_revaluation_run;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON ledger.fx_revaluation_run FOR EACH ROW EXECUTE FUNCTION ledger.fx_revaluation_run_guard();
 
 -- updated_at و row_version روی جدول‌های تغییرپذیر
 DO $$
@@ -1858,12 +2158,35 @@ BEGIN
   END LOOP;
 END $$;
 
+-- نگهبان دستیار (C-AS-02، INV-LED-44) روی جدول‌های ثبت، وضعیت، نگاشت و کدینگ؛ نام "0_…" تا پیش از هر تریگر دیگر اجرا شود.
+-- journal_line تریگر جدا ندارد: هر سطر تازه به سرسندی نیاز دارد که در همان تراکنش درج شده (جایگاه‌های line_no پس از commit
+-- پرند)، و درج سرسند همین‌جا رد می‌شود.
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT * FROM (VALUES
+      ('ledger.journal', 'INSERT OR UPDATE'), ('ledger.fiscal_year', 'INSERT OR UPDATE'), ('ledger.fiscal_period', 'INSERT OR UPDATE'),
+      ('ledger.period_module_lock', 'INSERT OR DELETE'), ('ledger.posting_rule', 'INSERT OR UPDATE OR DELETE'),
+      ('ledger.account', 'INSERT OR UPDATE OR DELETE'), ('ledger.account_dimension_rule', 'INSERT OR UPDATE OR DELETE'),
+      ('ledger.company_config', 'INSERT OR UPDATE'), ('ledger.coa_level', 'INSERT OR UPDATE OR DELETE'),
+      ('ledger.coa_extension_applied', 'INSERT'), ('ledger.year_close_run', 'INSERT OR UPDATE'),
+      ('ledger.fx_revaluation_run', 'INSERT OR UPDATE'), ('ledger.eledger_export', 'INSERT OR UPDATE')) AS v(tbl, ev) LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS "0_actor_via_guard" ON %s', r.tbl);
+    EXECUTE format('CREATE TRIGGER "0_actor_via_guard" BEFORE %s ON %s FOR EACH ROW EXECUTE FUNCTION ledger.forbid_actor_via()',
+                   r.ev, r.tbl);
+  END LOOP;
+END $$;
+
 -- =====================================================================
 -- ۱۵. عملیات (توابع با نقش فراخوان؛ RLS برقرار است)
 -- =====================================================================
 -- ابطال سند موقت: سند آینه با همان تاریخ؛ هر دو «باطل» و بیرون از شماره‌گذاری دائم
+-- p_number_issued_id: شمارهٔ عطف تازهٔ سند ابطال از core.number_next (RV-IT2-13). اگر داده نشود ولی شماره با doc_id همین سند
+-- صادر شده باشد، تریگر درج پیوند را پر می‌کند؛ journal_verify درستی و اجباری بودن پیوند را می‌سنجد.
+DROP FUNCTION IF EXISTS ledger.void_journal(uuid, uuid, bigint, text, text, boolean);
 CREATE OR REPLACE FUNCTION ledger.void_journal(p_journal_id uuid, p_void_id uuid, p_reference_no bigint, p_reference_text text,
-                                               p_reason text, p_soft_close_override boolean DEFAULT false)
+                                               p_reason text, p_soft_close_override boolean DEFAULT false,
+                                               p_number_issued_id uuid DEFAULT NULL)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE j ledger.journal;
 BEGIN
@@ -1873,12 +2196,12 @@ BEGIN
                               entry_class, class_rank, status, reference_no, reference_text, description, source_module,
                               source_doc_type, source_doc_id, source_doc_no, source_event, base_currency, line_count,
                               total_debit_base, total_credit_base, memo_debit_base, memo_credit_base, soft_close_override,
-                              void_of_journal_id, void_reason)
+                              void_of_journal_id, void_reason, number_issued_id)
   VALUES (j.tenant_id, p_void_id, j.company_id, j.fiscal_year_id, j.period_id, j.branch_id, j.journal_date, 'void',
           j.entry_class, j.class_rank, 'voided', p_reference_no, p_reference_text, 'ابطال: ' || j.description, j.source_module,
           j.source_doc_type, j.source_doc_id, j.source_doc_no, 'void:' || left(j.source_event, 55), j.base_currency, j.line_count,
           j.total_debit_base, j.total_credit_base, j.memo_debit_base, j.memo_credit_base, p_soft_close_override,
-          j.id, p_reason);
+          j.id, p_reason, p_number_issued_id);
   INSERT INTO ledger.journal_line (tenant_id, journal_id, line_no, company_id, fiscal_year_id, period_id, journal_date, entry_class,
                                    account_id, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, dim6_id, currency,
                                    exchange_rate, rate_type_id, debit_txn, credit_txn, debit_base, credit_base, line_kind,
@@ -1893,9 +2216,11 @@ BEGIN
 END $$;
 
 -- سند برگشت (معکوس) با تاریخ ≥ تاریخ اصل؛ اصل تغییر نمی‌کند و «برگشت‌خورده» حالت مشتق است
+DROP FUNCTION IF EXISTS ledger.reverse_journal(uuid, uuid, date, bigint, text, text, text, boolean);
 CREATE OR REPLACE FUNCTION ledger.reverse_journal(p_journal_id uuid, p_reversal_id uuid, p_date date, p_reference_no bigint,
                                                   p_reference_text text, p_description text DEFAULT NULL,
-                                                  p_source_event text DEFAULT 'reverse', p_soft_close_override boolean DEFAULT false)
+                                                  p_source_event text DEFAULT 'reverse', p_soft_close_override boolean DEFAULT false,
+                                                  p_number_issued_id uuid DEFAULT NULL)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE j ledger.journal;
 BEGIN
@@ -1904,13 +2229,13 @@ BEGIN
   INSERT INTO ledger.journal (tenant_id, id, company_id, branch_id, journal_date, journal_type, status, reference_no, reference_text,
                               description, source_module, source_doc_type, source_doc_id, source_doc_no, source_event,
                               base_currency, line_count, total_debit_base, total_credit_base, memo_debit_base, memo_credit_base,
-                              soft_close_override, reversal_of_journal_id, entry_class, class_rank)
+                              soft_close_override, reversal_of_journal_id, entry_class, class_rank, number_issued_id)
   SELECT j.tenant_id, p_reversal_id, j.company_id, j.branch_id, p_date,
          CASE WHEN j.journal_type = 'fx_revaluation' THEN 'fx_revaluation_reversal' ELSE 'reversal' END,
          'temporary', p_reference_no, p_reference_text, COALESCE(p_description, 'برگشت: ' || j.description),
          j.source_module, j.source_doc_type, j.source_doc_id, j.source_doc_no, p_source_event,
          f.base_currency, j.line_count, j.total_debit_base, j.total_credit_base, j.memo_debit_base, j.memo_credit_base,
-         p_soft_close_override, j.id, 'regular', 1
+         p_soft_close_override, j.id, 'regular', 1, p_number_issued_id
     FROM ledger.fiscal_year f
    WHERE f.tenant_id = j.tenant_id AND f.company_id = j.company_id AND p_date BETWEEN f.start_date AND f.end_date;
   IF NOT FOUND THEN PERFORM ledger.raise_error('HK_LEDGER_NO_FISCAL_YEAR', format('no fiscal year contains %s', p_date)); END IF;
@@ -2005,6 +2330,26 @@ BEGIN
   RETURN NEXT;
 END $$;
 
+-- گام ۲ الگوریتم post (RV-LEDGER-29): قفل تراکنشی روی کلید مبدأ و سپس جست‌وجوی سند باطل‌نشدهٔ همان کلید. درخواست هم‌زمانِ دوم
+-- پشت قفل می‌ماند و پس از commit اولی سند او را می‌بیند (بازپخش با hash یکسان، یا ledger.posting.source_conflict با hash دیگر)،
+-- به‌جای 23505 روی journal_source_uq که کل تراکنش فراخوان را خراب می‌کرد.
+CREATE OR REPLACE FUNCTION ledger.claim_source(p_company_id uuid, p_source_module text, p_source_doc_type text,
+                                               p_source_doc_id uuid, p_source_event text)
+RETURNS TABLE (journal_id uuid, request_hash bytea)
+LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE v_tenant uuid := core.current_tenant_id();
+BEGIN
+  IF v_tenant IS NULL THEN PERFORM ledger.raise_error('HK_LEDGER_TENANT_CONTEXT', 'tenant context is required'); END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws(':', 'ledger.source', v_tenant, p_company_id, p_source_module,
+                                                           p_source_doc_type, p_source_doc_id, p_source_event), 0));
+  RETURN QUERY
+    SELECT j.id, j.request_hash FROM ledger.journal j
+     WHERE j.tenant_id = v_tenant AND j.company_id = p_company_id AND j.source_module = p_source_module
+       AND j.source_doc_type = p_source_doc_type AND j.source_doc_id = p_source_doc_id AND j.source_event = p_source_event
+       AND j.status <> 'voided';
+END $$;
+
 -- آخرین نرخ تا یک تاریخ
 CREATE OR REPLACE FUNCTION ledger.rate_on(p_rate_type_id uuid, p_currency char(3), p_base char(3), p_date date)
 RETURNS TABLE (rate numeric, rate_date date)
@@ -2034,11 +2379,34 @@ BEGIN
   RETURN n;
 END $$;
 
--- اعمال قالب کدینگ روی یک شرکت (سطوح، پیکربندی، حساب‌ها، قواعد بُعد، نگاشت‌ها)
-CREATE OR REPLACE FUNCTION ledger.apply_coa_template(p_company_id uuid, p_code text, p_version integer)
+-- پوشش کلیدهای نگاشت در یک قالب (RV-IT2-03): کلیدهایی که قالب برایشان قاعدهٔ بی‌شرط (conditions = '{}') ندارد، پس روی شرکت تازه
+-- با HK_LEDGER_MAPPING_MISSING می‌ایستند. دامنه: کلیدهای is_required همیشه؛ به‌اضافهٔ کلیدهای ماژول‌های p_modules، یا همهٔ
+-- کلیدهای کاتالوگ وقتی p_modules = NULL (همهٔ ماژول‌های نسخه). قالب افزونه (extends) قواعد قالب پایه را هم به حساب می‌آورد.
+CREATE OR REPLACE FUNCTION ledger.posting_key_coverage(p_code text, p_version integer, p_modules text[] DEFAULT NULL)
+RETURNS TABLE (posting_key text, owner_module text, is_required boolean)
+LANGUAGE sql STABLE AS $$
+  WITH RECURSIVE chain AS (
+    SELECT t.code, t.version, t.extends_code, t.extends_version FROM ledger.coa_template t
+     WHERE t.code = p_code AND t.version = p_version
+    UNION ALL
+    SELECT b.code, b.version, b.extends_code, b.extends_version FROM ledger.coa_template b
+      JOIN chain c ON b.code = c.extends_code AND b.version = c.extends_version
+  )
+  SELECT k.key, k.owner_module, k.is_required FROM ledger.posting_key k
+   WHERE (k.is_required OR p_modules IS NULL OR k.owner_module = ANY (p_modules))
+     AND NOT EXISTS (SELECT 1 FROM ledger.coa_template_posting_rule r JOIN chain c
+                       ON r.template_code = c.code AND r.template_version = c.version
+                      WHERE r.posting_key = k.key AND r.conditions = '{}'::jsonb)
+   ORDER BY k.key
+$$;
+
+-- اعمال قالب کدینگ روی یک شرکت (سطوح، پیکربندی، حساب‌ها، قواعد بُعد، نگاشت‌ها). قالبی که کلیدهای ماژول‌های فعال را
+-- نگاشت نکند رد می‌شود (HK_LEDGER_TEMPLATE_COVERAGE؛ p_modules = NULL یعنی همهٔ ماژول‌های نسخه).
+DROP FUNCTION IF EXISTS ledger.apply_coa_template(uuid, text, integer);
+CREATE OR REPLACE FUNCTION ledger.apply_coa_template(p_company_id uuid, p_code text, p_version integer, p_modules text[] DEFAULT NULL)
 RETURNS integer LANGUAGE plpgsql AS $$
 DECLARE v_tenant uuid := core.current_tenant_id(); tpl ledger.coa_template; lvl jsonb; ta record; v_parent uuid; v_id uuid;
-        v_count integer := 0; d record; v_type uuid;
+        v_count integer := 0; d record; v_type uuid; v_missing text;
 BEGIN
   SELECT * INTO tpl FROM ledger.coa_template WHERE code = p_code AND version = p_version AND status = 'published';
   IF NOT FOUND THEN PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_NOT_FOUND', format('template %s v%s not found', p_code, p_version)); END IF;
@@ -2082,7 +2450,91 @@ BEGIN
     FROM ledger.coa_template_posting_rule r
     JOIN ledger.account a ON a.company_id = p_company_id AND a.code = r.account_code
    WHERE r.template_code = p_code AND r.template_version = p_version;
+  SELECT string_agg(c.posting_key, ', ' ORDER BY c.posting_key) INTO v_missing
+    FROM ledger.posting_key_coverage(p_code, p_version, p_modules) c;
+  IF v_missing IS NOT NULL THEN
+    PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_COVERAGE', format('template %s v%s has no default mapping for: %s', p_code, p_version, v_missing));
+  END IF;
   RETURN v_count;
+END $$;
+
+-- افزونهٔ کدینگ بستهٔ صنفی روی کدینگ پایهٔ شرکت (RV-LEDGER-09؛ AccountService.apply_extension؛ Applier بستهٔ ۰۵):
+-- فقط اگر قالب پایهٔ اعمال‌شدهٔ شرکت همان extends افزونه باشد. حساب‌ها و قواعد بُعد و نگاشت‌های نبوده افزوده می‌شوند؛
+-- حساب هم‌کد باید هم‌شکل باشد و قاعدهٔ هم‌کلید (کلید، اولویت، شرط) باید به همان حساب اشاره کند، وگرنه کل اعمال برمی‌گردد.
+-- اعمال دوبارهٔ همان نسخه بی‌اثر است (۰ برمی‌گرداند).
+CREATE OR REPLACE FUNCTION ledger.apply_coa_extension(p_company_id uuid, p_code text, p_version integer)
+RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE v_tenant uuid := core.current_tenant_id(); tpl ledger.coa_template; cfg ledger.company_config; prev ledger.coa_extension_applied;
+        ta record; ex ledger.account; pa ledger.account; v_parent uuid; v_id uuid; v_acc integer := 0; v_rules integer := 0;
+        d record; v_type uuid; r record; v_target uuid; v_existing uuid;
+BEGIN
+  IF v_tenant IS NULL THEN PERFORM ledger.raise_error('HK_LEDGER_TENANT_CONTEXT', 'tenant context is required'); END IF;
+  SELECT * INTO tpl FROM ledger.coa_template WHERE code = p_code AND version = p_version AND status = 'published';
+  IF NOT FOUND THEN PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_NOT_FOUND', format('template %s v%s not found', p_code, p_version)); END IF;
+  IF tpl.extends_code IS NULL THEN
+    PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_NOT_EXTENSION', format('template %s is a base chart; use apply_coa_template', p_code));
+  END IF;
+  SELECT * INTO cfg FROM ledger.company_config WHERE tenant_id = v_tenant AND company_id = p_company_id;
+  IF NOT FOUND OR (cfg.coa_template_code, cfg.coa_template_version) IS DISTINCT FROM (tpl.extends_code, tpl.extends_version) THEN
+    PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_BASE_MISMATCH',
+      format('extension %s requires base chart %s v%s', p_code, tpl.extends_code, tpl.extends_version));
+  END IF;
+  SELECT * INTO prev FROM ledger.coa_extension_applied
+   WHERE tenant_id = v_tenant AND company_id = p_company_id AND template_code = p_code;
+  IF FOUND THEN
+    IF prev.template_version = p_version THEN RETURN 0; END IF;
+    PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_EXTENSION_APPLIED',
+      format('extension %s v%s is already applied; a version upgrade is a pack migration', p_code, prev.template_version));
+  END IF;
+  FOR ta IN SELECT * FROM ledger.coa_template_account
+             WHERE template_code = p_code AND template_version = p_version ORDER BY level, code LOOP
+    SELECT * INTO ex FROM ledger.account WHERE tenant_id = v_tenant AND company_id = p_company_id AND code = ta.code;
+    IF FOUND THEN
+      SELECT * INTO pa FROM ledger.account WHERE tenant_id = v_tenant AND id = ex.parent_id;
+      IF ex.kind <> ta.kind OR ex.account_type <> ta.account_type OR ex.level <> ta.level
+         OR pa.code IS DISTINCT FROM ta.parent_code THEN
+        PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_CONFLICT', format('account %s exists with a different shape', ta.code));
+      END IF;
+      CONTINUE;
+    END IF;
+    v_parent := NULL;
+    IF ta.parent_code IS NOT NULL THEN
+      SELECT id INTO v_parent FROM ledger.account WHERE tenant_id = v_tenant AND company_id = p_company_id AND code = ta.parent_code;
+      IF v_parent IS NULL THEN PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_PARENT', format('parent %s missing', ta.parent_code)); END IF;
+    END IF;
+    INSERT INTO ledger.account (tenant_id, company_id, parent_id, level, code, name, name_en, kind, account_type, nature, role, tags,
+                                posting_policy, allowed_source_modules, subledger_kind, currency_policy, revalue_fx, branch_rule)
+    VALUES (v_tenant, p_company_id, v_parent, ta.level, ta.code, ta.name_fa, ta.name_en, ta.kind, ta.account_type, ta.nature, ta.role,
+            ta.tags, ta.posting_policy, ta.allowed_source_modules, ta.subledger_kind, ta.currency_policy, ta.revalue_fx, ta.branch_rule)
+    RETURNING id INTO v_id;
+    v_acc := v_acc + 1;
+    FOR d IN SELECT key, value #>> '{}' AS req FROM jsonb_each(ta.dimension_rules) LOOP
+      SELECT id INTO v_type FROM ledger.dimension_type WHERE tenant_id = v_tenant AND code = d.key;
+      IF v_type IS NULL THEN PERFORM ledger.raise_error('HK_LEDGER_DIM_TYPE_MISSING', format('dimension type %s not provisioned', d.key)); END IF;
+      INSERT INTO ledger.account_dimension_rule (tenant_id, account_id, dimension_type_id, requirement) VALUES (v_tenant, v_id, v_type, d.req);
+    END LOOP;
+  END LOOP;
+  FOR r IN SELECT * FROM ledger.coa_template_posting_rule
+            WHERE template_code = p_code AND template_version = p_version ORDER BY posting_key, priority LOOP
+    SELECT id INTO v_target FROM ledger.account WHERE tenant_id = v_tenant AND company_id = p_company_id AND code = r.account_code;
+    IF v_target IS NULL THEN PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_PARENT', format('mapped account %s missing', r.account_code)); END IF;
+    SELECT pr.account_id INTO v_existing FROM ledger.posting_rule pr
+     WHERE pr.tenant_id = v_tenant AND pr.company_id = p_company_id AND pr.posting_key = r.posting_key AND pr.is_active
+       AND pr.priority = r.priority AND pr.conditions = r.conditions;
+    IF FOUND THEN
+      IF v_existing <> v_target THEN
+        PERFORM ledger.raise_error('HK_LEDGER_TEMPLATE_CONFLICT',
+          format('company already maps %s (priority %s, %s) to another account', r.posting_key, r.priority, r.conditions));
+      END IF;
+      CONTINUE;
+    END IF;
+    INSERT INTO ledger.posting_rule (tenant_id, company_id, posting_key, priority, conditions, account_id)
+    VALUES (v_tenant, p_company_id, r.posting_key, r.priority, r.conditions, v_target);
+    v_rules := v_rules + 1;
+  END LOOP;
+  INSERT INTO ledger.coa_extension_applied (tenant_id, company_id, template_code, template_version, accounts_added, rules_added)
+  VALUES (v_tenant, p_company_id, p_code, p_version, v_acc, v_rules);
+  RETURN v_acc + v_rules;
 END $$;
 
 -- =====================================================================
@@ -2090,13 +2542,20 @@ END $$;
 -- =====================================================================
 CREATE OR REPLACE FUNCTION ledger.compact_balance_buckets(p_company_id uuid, p_period_id uuid)
 RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-DECLARE v_tenant uuid := core.current_tenant_id(); n integer;
+DECLARE v_tenant uuid := core.current_tenant_id(); n integer; v_fy uuid;
 BEGIN
   IF v_tenant IS NULL THEN
     RAISE EXCEPTION 'HK_LEDGER_TENANT_CONTEXT: tenant context is required' USING ERRCODE = 'P0001';
   END IF;
+  SELECT p.fiscal_year_id INTO v_fy FROM ledger.fiscal_period p
+   WHERE p.tenant_id = v_tenant AND p.company_id = p_company_id AND p.id = p_period_id;
+  IF v_fy IS NULL THEN
+    RAISE EXCEPTION 'HK_LEDGER_NO_PERIOD: period not found for this company' USING ERRCODE = 'P0001';
+  END IF;
+  -- همان قفل rebuild_balance_buckets (هر دو به ازای شرکت و سال؛ RV-LEDGER-02): فشرده‌سازی و بازسازی هم‌زمان سریال می‌شوند
+  -- و دستور بعدی snapshot تازه (پس از commit دیگری) می‌گیرد؛ وگرنه بازسازی ردیف‌های فشرده‌شدهٔ تازه را نمی‌دید و دوبار می‌شمرد.
   PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
-    'ledger.bucket:' || v_tenant::text || ':' || p_company_id::text || ':' || p_period_id::text, 0));
+    'ledger.bucket:' || v_tenant::text || ':' || p_company_id::text || ':' || v_fy::text, 0));
   WITH victims AS (
     DELETE FROM ledger.balance_bucket b
      WHERE b.tenant_id = v_tenant AND b.company_id = p_company_id AND b.period_id = p_period_id
@@ -2128,7 +2587,7 @@ BEGIN
     RAISE EXCEPTION 'HK_LEDGER_TENANT_CONTEXT: tenant context is required' USING ERRCODE = 'P0001';
   END IF;
   PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
-    'ledger.bucket.rebuild:' || v_tenant::text || ':' || p_company_id::text || ':' || p_fiscal_year_id::text, 0));
+    'ledger.bucket:' || v_tenant::text || ':' || p_company_id::text || ':' || p_fiscal_year_id::text, 0));
   -- یک دستور = یک snapshot: سطرهای دیده‌شده دقیقاً همان‌هایی‌اند که سطل‌هایشان حذف می‌شود
   WITH del AS (
     DELETE FROM ledger.balance_bucket b
@@ -2296,22 +2755,38 @@ BEGIN
   END IF;
 END $$;
 
--- تطبیق حساب‌های کنترلی با زیردفترهای ثبت‌شده (خالی = برابر)
-CREATE OR REPLACE FUNCTION ledger.check_control_accounts(p_company_id uuid, p_as_of date)
+-- تطبیق حساب‌های کنترلی با زیردفترهای ثبت‌شده (خالی = برابر). ستون problem:
+--   'difference'   : ماندهٔ GL (به بُعد مؤثر و ارز) ≠ ماندهٔ زیردفتر؛
+--   'no_subledger' : حساب کنترلی‌ای که برای subledger_kind آن تابع زیردفتری ثبت یا نصب نشده (RV-LEDGER-13؛ سناریوی مرزی ۱۷).
+-- بازهٔ GL (RV-LEDGER-12): سالِ شامل as_of، و تا وقتی افتتاحیهٔ آن ثبت نشده (opening_state ≠ posted) سال‌های قبلی زنجیره هم؛
+-- کلاس closing همیشه و افتتاحیهٔ سال‌های میانی (تکرار ماندهٔ سال قبل) کنار گذاشته می‌شوند. زیردفتر ماندهٔ تجمعی است.
+-- تسعیر (RV-LEDGER-15): سند تسعیر و برگشت آن کنار گذاشته می‌شوند، مگر برگشتی که اصلش بیرون از بازه است: افتتاحیهٔ داخل
+-- بازه ماندهٔ تسعیرشدهٔ سال قبل را آورده و همان برگشت اثر تسعیر را خنثی می‌کند.
+DROP FUNCTION IF EXISTS ledger.check_control_accounts(uuid, date);
+CREATE FUNCTION ledger.check_control_accounts(p_company_id uuid, p_as_of date)
 RETURNS TABLE (subledger_kind text, account_id uuid, dim_value_id uuid, currency char(3),
-               gl_base numeric, sub_base numeric, gl_txn numeric, sub_txn numeric)
+               gl_base numeric, sub_base numeric, gl_txn numeric, sub_txn numeric, problem text)
 LANGUAGE plpgsql STABLE AS $$
 #variable_conflict use_column
-DECLARE s ledger.subledger_source; fy ledger.fiscal_year; v_dim text;
+DECLARE s ledger.subledger_source; fy ledger.fiscal_year; y ledger.fiscal_year; v_years uuid[]; v_dim text;
 BEGIN
   SELECT * INTO fy FROM ledger.fiscal_year f WHERE f.company_id = p_company_id AND p_as_of BETWEEN f.start_date AND f.end_date;
   IF NOT FOUND THEN PERFORM ledger.raise_error('HK_LEDGER_NO_FISCAL_YEAR', 'no fiscal year contains the date'); END IF;
-  FOR s IN SELECT * FROM ledger.subledger_source ORDER BY subledger_kind LOOP
-    IF to_regprocedure(s.balance_function || '(uuid,date)') IS NULL THEN
-      RETURN QUERY SELECT s.subledger_kind, a.id, NULL::uuid, NULL::char(3), NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric
-                     FROM ledger.account a WHERE a.company_id = p_company_id AND a.subledger_kind = s.subledger_kind;
-      CONTINUE;
-    END IF;
+  v_years := ARRAY[fy.id]; y := fy;
+  WHILE y.previous_year_id IS NOT NULL AND y.opening_state <> 'posted' LOOP
+    SELECT * INTO y FROM ledger.fiscal_year f WHERE f.tenant_id = fy.tenant_id AND f.id = y.previous_year_id;
+    v_years := y.id || v_years;
+  END LOOP;
+  -- y = نخستین سال بازه؛ افتتاحیهٔ همین سال ماندهٔ پیش از بازه را می‌آورد
+  RETURN QUERY
+    SELECT a.subledger_kind, a.id, NULL::uuid, NULL::char(3), NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, 'no_subledger'::text
+      FROM ledger.account a
+      LEFT JOIN ledger.subledger_source ss ON ss.subledger_kind = a.subledger_kind
+     WHERE a.company_id = p_company_id AND a.subledger_kind IS NOT NULL
+       AND (ss.subledger_kind IS NULL OR to_regprocedure(ss.balance_function || '(uuid,date)') IS NULL)
+     ORDER BY a.subledger_kind, a.code;
+  FOR s IN SELECT * FROM ledger.subledger_source x
+            WHERE to_regprocedure(x.balance_function || '(uuid,date)') IS NOT NULL ORDER BY x.subledger_kind LOOP
     v_dim := CASE WHEN s.dim_slot IS NULL THEN 'NULL::uuid'
                   ELSE format('(SELECT COALESCE(dv.merged_into_id, dv.id) FROM ledger.dimension_value dv WHERE dv.tenant_id = l.tenant_id AND dv.id = l.dim%s_id)', s.dim_slot) END;
     RETURN QUERY EXECUTE format($q$
@@ -2322,66 +2797,101 @@ BEGIN
           JOIN ledger.account a ON a.tenant_id = l.tenant_id AND a.id = l.account_id
           JOIN ledger.journal j ON j.tenant_id = l.tenant_id AND j.id = l.journal_id
           JOIN ledger.journal_type jt ON jt.code = j.journal_type
-         WHERE l.company_id = $1 AND l.fiscal_year_id = $3 AND l.journal_date <= $2 AND a.subledger_kind = $4
-           AND l.entry_class <> 'closing' AND NOT jt.excluded_from_subledger_check
+          LEFT JOIN ledger.journal o ON o.tenant_id = j.tenant_id AND o.id = j.reversal_of_journal_id
+         WHERE l.company_id = $1 AND l.fiscal_year_id = ANY ($3) AND l.journal_date <= $2 AND a.subledger_kind = $4
+           AND l.entry_class <> 'closing'
+           AND NOT (l.entry_class = 'opening' AND l.fiscal_year_id <> $6)
+           AND (NOT jt.excluded_from_subledger_check
+                OR (j.journal_type = 'fx_revaluation_reversal' AND o.fiscal_year_id <> ALL ($3)))
          GROUP BY 1, 2, 3
       ), sub AS (
         SELECT x.account_id AS acc, x.dim_value_id AS dim, x.currency AS cur, sum(x.balance_base) AS base, sum(x.balance_txn) AS txn
           FROM %2$s($1, $2) x GROUP BY 1, 2, 3
       )
       SELECT $4::text, COALESCE(gl.acc, sub.acc), COALESCE(gl.dim, sub.dim), COALESCE(gl.cur, sub.cur)::char(3),
-             gl.base, sub.base, gl.txn, sub.txn
+             gl.base, sub.base, gl.txn, sub.txn, 'difference'::text
         FROM gl FULL JOIN sub ON gl.acc = sub.acc AND gl.dim IS NOT DISTINCT FROM sub.dim AND gl.cur = sub.cur
        WHERE COALESCE(gl.base, 0) <> COALESCE(sub.base, 0)
           OR ($5 AND COALESCE(gl.txn, 0) <> COALESCE(sub.txn, 0))
     $q$, v_dim, s.balance_function)
-    USING p_company_id, p_as_of, fy.id, s.subledger_kind, s.compare_txn;
+    USING p_company_id, p_as_of, v_years, s.subledger_kind, s.compare_txn, y.id;
   END LOOP;
 END $$;
 
--- بستن سال: حساب‌های موقت صفر، همهٔ حساب‌ها پس از اختتامیه صفر، افتتاحیهٔ سال بعد = قرینهٔ اختتامیه
+-- بستن سال (خالی = درست):
+--   temporary_account_not_closed : حساب درآمد/هزینه پیش از اختتامیه (به‌جز اسناد بستنِ باطل‌شده و آینه‌شان؛ RV-LEDGER-05) صفر نیست
+--   balance_not_closed / txn_balance_not_closed : پس از اختتامیه ماندهٔ پایه / ارزی کلیدی (حساب، شعبه، شش بُعد، ارز) صفر نیست
+--                                                 (RV-LEDGER-16: تفکیک بُعد و ارز D-L11)
+--   opening_mismatch : افتتاحیهٔ سال بعد ≠ −اختتامیه × conversion_factor اجرای بستن (ارز پایهٔ قدیم ↔ ارز پایهٔ سال بعد؛
+--                      مبلغ ارزی سطر غیرپایه بی‌ضریب). با ضریب ≠ ۱ مدارا نیم واحد ارز پایهٔ جدید برای هر کلید است و سطرهای
+--                      rounding افتتاحیه (تفاوت گرد به ledger.rounding) کنار گذاشته می‌شوند؛ با ضریب ۱ برابری دقیق.
 CREATE OR REPLACE FUNCTION ledger.check_year_close(p_fiscal_year_id uuid)
 RETURNS TABLE (problem text, account_id uuid, amount numeric)
 LANGUAGE sql STABLE AS $$
   WITH fy AS (SELECT * FROM ledger.fiscal_year WHERE id = p_fiscal_year_id),
-  nxt AS (SELECT n.* FROM ledger.fiscal_year n JOIN fy ON n.previous_year_id = fy.id),
-  bal AS (
-    SELECT l.account_id, a.account_type, sum(l.debit_base - l.credit_base) AS b,
-           sum(l.debit_base - l.credit_base) FILTER (WHERE l.entry_class <> 'closing'
-              OR j.journal_type IN ('closing_pl','closing_re')) AS b_before_balance_close
-      FROM ledger.journal_line l JOIN fy ON l.fiscal_year_id = fy.id
+  nxt AS (SELECT n.* FROM ledger.fiscal_year n JOIN fy ON n.tenant_id = fy.tenant_id AND n.previous_year_id = fy.id),
+  run AS (
+    SELECT COALESCE((SELECT r.conversion_factor FROM ledger.year_close_run r JOIN fy ON r.tenant_id = fy.tenant_id AND r.fiscal_year_id = fy.id
+                      WHERE r.status IN ('running','completed') LIMIT 1), 1)::numeric AS f,
+           COALESCE((SELECT power(10::numeric, -c.minor_unit) / 2 FROM nxt JOIN ref.currency c ON c.code = nxt.base_currency), 0) AS half
+  ),
+  ln AS (
+    SELECT l.*, a.account_type, j.journal_type, j.status AS jstatus
+      FROM ledger.journal_line l JOIN fy ON l.tenant_id = fy.tenant_id AND l.fiscal_year_id = fy.id
       JOIN ledger.account a ON a.tenant_id = l.tenant_id AND a.id = l.account_id
       JOIN ledger.journal j ON j.tenant_id = l.tenant_id AND j.id = l.journal_id
-     GROUP BY l.account_id, a.account_type
+  ),
+  key_bal AS (
+    SELECT account_id, account_type, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, dim6_id, currency,
+           sum(debit_base - credit_base) AS b, sum(debit_txn - credit_txn) AS t,
+           sum(debit_base - credit_base) FILTER (WHERE entry_class <> 'closing'
+              OR (journal_type IN ('closing_pl','closing_re') AND jstatus <> 'voided')) AS b_pre,
+           sum(debit_txn - credit_txn) FILTER (WHERE entry_class <> 'closing'
+              OR (journal_type IN ('closing_pl','closing_re') AND jstatus <> 'voided')) AS t_pre
+      FROM ln
+     GROUP BY account_id, account_type, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, dim6_id, currency
   ),
   close_bal AS (
-    SELECT l.account_id, l.branch_id, l.dim1_id, l.dim2_id, l.dim3_id, l.dim4_id, l.dim5_id, l.dim6_id, l.currency,
+    SELECT l.account_id, l.branch_id, l.dim1_id, l.dim2_id, l.dim3_id, l.dim4_id, l.dim5_id, l.dim6_id,
+           (l.currency = fy.base_currency) AS is_base,
+           CASE WHEN l.currency = fy.base_currency THEN (SELECT nxt.base_currency FROM nxt) ELSE l.currency END AS open_cur,
            sum(l.debit_base - l.credit_base) AS b, sum(l.debit_txn - l.credit_txn) AS t
-      FROM ledger.journal_line l JOIN fy ON l.fiscal_year_id = fy.id
-      JOIN ledger.journal j ON j.tenant_id = l.tenant_id AND j.id = l.journal_id
-     WHERE j.journal_type = 'closing_balance' AND j.status <> 'voided'
-     GROUP BY 1,2,3,4,5,6,7,8,9
+      FROM ln l CROSS JOIN fy
+     WHERE l.journal_type = 'closing_balance' AND l.jstatus <> 'voided'
+     GROUP BY 1,2,3,4,5,6,7,8,9,10
   ),
   open_bal AS (
     SELECT l.account_id, l.branch_id, l.dim1_id, l.dim2_id, l.dim3_id, l.dim4_id, l.dim5_id, l.dim6_id, l.currency,
+           (l.currency = nxt.base_currency) AS is_base,
            sum(l.debit_base - l.credit_base) AS b, sum(l.debit_txn - l.credit_txn) AS t
-      FROM ledger.journal_line l JOIN nxt ON l.fiscal_year_id = nxt.id
+      FROM ledger.journal_line l JOIN nxt ON l.tenant_id = nxt.tenant_id AND l.fiscal_year_id = nxt.id
       JOIN ledger.journal j ON j.tenant_id = l.tenant_id AND j.id = l.journal_id
      WHERE j.journal_type = 'opening' AND j.status <> 'voided'
-     GROUP BY 1,2,3,4,5,6,7,8,9
+       AND (l.line_kind <> 'rounding' OR (SELECT f FROM run) = 1)
+     GROUP BY 1,2,3,4,5,6,7,8,9,10
+  ),
+  om AS (
+    SELECT COALESCE(c.account_id, o.account_id) AS account_id,
+           COALESCE(o.b, 0) + COALESCE(c.b, 0) * run.f AS diff_b,
+           COALESCE(o.t, 0) + COALESCE(c.t, 0) * CASE WHEN COALESCE(c.is_base, o.is_base) THEN run.f ELSE 1 END AS diff_t,
+           CASE WHEN run.f = 1 THEN 0 ELSE run.half END AS tol_b,
+           CASE WHEN run.f = 1 OR NOT COALESCE(c.is_base, o.is_base) THEN 0 ELSE run.half END AS tol_t
+      FROM close_bal c FULL JOIN open_bal o
+        ON c.account_id = o.account_id AND c.open_cur = o.currency AND c.branch_id IS NOT DISTINCT FROM o.branch_id
+       AND c.dim1_id IS NOT DISTINCT FROM o.dim1_id AND c.dim2_id IS NOT DISTINCT FROM o.dim2_id
+       AND c.dim3_id IS NOT DISTINCT FROM o.dim3_id AND c.dim4_id IS NOT DISTINCT FROM o.dim4_id
+       AND c.dim5_id IS NOT DISTINCT FROM o.dim5_id AND c.dim6_id IS NOT DISTINCT FROM o.dim6_id
+      CROSS JOIN run
   )
-  SELECT 'temporary_account_not_closed', bal.account_id, bal.b_before_balance_close FROM bal
-   WHERE bal.account_type IN ('income','expense') AND COALESCE(bal.b_before_balance_close, 0) <> 0
+  SELECT 'temporary_account_not_closed', k.account_id, k.b_pre FROM key_bal k
+   WHERE k.account_type IN ('income','expense') AND (COALESCE(k.b_pre, 0) <> 0 OR COALESCE(k.t_pre, 0) <> 0)
   UNION ALL
-  SELECT 'balance_not_closed', bal.account_id, bal.b FROM bal WHERE bal.b <> 0
+  SELECT 'balance_not_closed', k.account_id, k.b FROM key_bal k WHERE k.b <> 0
   UNION ALL
-  SELECT 'opening_mismatch', COALESCE(c.account_id, o.account_id), COALESCE(c.b, 0) + COALESCE(o.b, 0)
-    FROM close_bal c FULL JOIN open_bal o
-      ON c.account_id = o.account_id AND c.currency = o.currency AND c.branch_id IS NOT DISTINCT FROM o.branch_id
-     AND c.dim1_id IS NOT DISTINCT FROM o.dim1_id AND c.dim2_id IS NOT DISTINCT FROM o.dim2_id
-     AND c.dim3_id IS NOT DISTINCT FROM o.dim3_id AND c.dim4_id IS NOT DISTINCT FROM o.dim4_id
-     AND c.dim5_id IS NOT DISTINCT FROM o.dim5_id AND c.dim6_id IS NOT DISTINCT FROM o.dim6_id
-   WHERE EXISTS (SELECT 1 FROM nxt) AND (COALESCE(c.b, 0) + COALESCE(o.b, 0) <> 0 OR COALESCE(c.t, 0) + COALESCE(o.t, 0) <> 0)
+  SELECT 'txn_balance_not_closed', k.account_id, k.t FROM key_bal k WHERE k.t <> 0
+  UNION ALL
+  SELECT 'opening_mismatch', om.account_id, om.diff_b FROM om
+   WHERE EXISTS (SELECT 1 FROM nxt) AND (abs(om.diff_b) > om.tol_b OR abs(om.diff_t) > om.tol_t)
 $$;
 
 -- انطباق حساب با انتخاب‌گر ردیف قالب گزارش
@@ -2515,9 +3025,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ledger.rate_type, ledger.company_config,
       ledger.dimension_value, ledger.account, ledger.account_dimension_rule, ledger.exchange_rate, ledger.posting_rule,
       ledger.journal_draft, ledger.journal_draft_line, ledger.recurring_journal, ledger.recurring_journal_line,
       ledger.report_account_map TO hk_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ledger.fiscal_year, ledger.fiscal_period TO hk_app;
+-- سال و دوره حذف‌شدنی نیستند (RV-LEDGER-19؛ 02:۱۳.۱۳)؛ تاریخچهٔ وضعیت دوره را فقط تریگر definer می‌نویسد (RV-LEDGER-24)
+GRANT SELECT, INSERT, UPDATE ON ledger.fiscal_year, ledger.fiscal_period TO hk_app;
+REVOKE DELETE ON ledger.fiscal_year, ledger.fiscal_period FROM hk_app;
 GRANT SELECT, INSERT, DELETE ON ledger.period_module_lock TO hk_app;
-GRANT SELECT, INSERT ON ledger.period_status_event, ledger.journal_line, ledger.integrity_run TO hk_app;
+GRANT SELECT ON ledger.period_status_event TO hk_app;
+REVOKE INSERT, UPDATE, DELETE ON ledger.period_status_event FROM hk_app;
+GRANT SELECT, INSERT ON ledger.journal_line, ledger.integrity_run, ledger.coa_extension_applied TO hk_app;
 GRANT SELECT, INSERT ON ledger.journal TO hk_app;
 GRANT UPDATE (status, permanent_no, daily_no, finalized_at, finalized_by, chain_prev_hash, chain_hash,
               reviewed_at, reviewed_by, void_reason) ON ledger.journal TO hk_app;
@@ -2529,7 +3043,9 @@ GRANT SELECT ON ALL TABLES IN SCHEMA ledger TO hk_readonly;
 
 -- نقش definer فقط آنچه سطل‌ها لازم دارند
 GRANT SELECT, INSERT, DELETE ON ledger.balance_bucket TO hk_ledger_definer;
-GRANT SELECT ON ledger.journal_line TO hk_ledger_definer;
+GRANT SELECT ON ledger.journal_line, ledger.fiscal_period TO hk_ledger_definer;
+GRANT INSERT ON ledger.period_status_event TO hk_ledger_definer;
+REVOKE ALL ON FUNCTION ledger.fiscal_period_history() FROM PUBLIC;
 
 REVOKE ALL ON FUNCTION ledger.compact_balance_buckets(uuid, uuid), ledger.rebuild_balance_buckets(uuid, uuid),
                        ledger.bucket_from_lines() FROM PUBLIC;
@@ -2563,7 +3079,9 @@ INSERT INTO ledger.dimension_type_catalog (code, slot, owner_module, is_hierarch
   ('cash_box',     1, 'treasury', false, 'صندوق',               '1.0'),
   ('petty_cash',   1, 'treasury', false, 'تنخواه‌گردان',          '1.0'),
   ('pos_terminal', 1, 'treasury', false, 'پایانهٔ کارتخوان',     '1.0'),
-  ('employee',     1, 'payroll',  false, 'کارکنان',             '1.0'),
+  -- payment_gateway را بخش ۰۶ هم با همین تعریف (ON CONFLICT DO NOTHING) ثبت می‌کند؛ این‌جا هم می‌آید تا حساب قالب
+  -- «واسط درگاه» در زنجیرهٔ مستقل قاعدهٔ بُعد داشته باشد. نوع employee حذف شد (CR-05، CR-CMP-03): کارمند همان شخص است.
+  ('payment_gateway', 1, 'treasury', false, 'درگاه پرداخت',     '1.0'),
   ('fixed_asset',  1, 'assets',   false, 'دارایی ثابت',         '1.0'),
   ('cost_center',  2, 'ledger',   true,  'مرکز هزینه',          '1.0'),
   ('project',      3, 'ledger',   true,  'پروژه',               '1.0')
@@ -2613,7 +3131,50 @@ INSERT INTO ledger.posting_key (key, owner_module, expected_account_types, is_re
   ('payroll.salary_payable',           'payroll',   '{liability}',        false, 'حقوق پرداختنی', '1.0'),
   ('payroll.insurance_payable',        'payroll',   '{liability}',        false, 'حق بیمهٔ پرداختنی', '1.0'),
   ('payroll.tax_payable',              'payroll',   '{liability}',        false, 'مالیات حقوق پرداختنی', '1.0'),
-  ('payroll.employer_insurance_expense','payroll',   '{expense}',          false, 'حق بیمهٔ سهم کارفرما', '1.0')
+  ('payroll.employer_insurance_expense','payroll',   '{expense}',          false, 'حق بیمهٔ سهم کارفرما', '1.0'),
+  -- کلیدهای جریان‌های v1 که بخش‌های ۰۵، ۰۶ و ۰۷ در فایل خود (با همین تعریف، ON CONFLICT DO NOTHING) ثبت می‌کنند؛ این‌جا هم
+  -- می‌آیند تا قالب ir.general برایشان قاعدهٔ پیش‌فرض داشته باشد (RV-IT2-03، CR-T02، CR-T07، CR-CMP-03). تعریف هر کلید مال
+  -- ماژول مالک است و هر دو نسخه باید برابر بمانند (آزمون یکپارچه C0).
+  ('purchase.grni',                  'purchase',  '{liability}',        false, 'کالای دریافتی صورتحساب‌نشده', '1.0'),
+  ('purchase.price_difference',      'purchase',  '{expense,income}',   false, 'تفاوت قیمت خرید', '1.0'),
+  ('purchase.purchases',             'purchase',  '{expense}',          false, 'خرید کالا (حالت ادواری)', '1.0'),
+  ('purchase.returns',               'purchase',  '{expense,income}',   false, 'برگشت از خرید (حالت ادواری)', '1.0'),
+  ('purchase.discount',              'purchase',  '{expense,income}',   false, 'تخفیفات خرید (حالت ادواری)', '1.0'),
+  ('purchase.landed_cost_clearing',  'purchase',  '{liability,asset}',  false, 'واسط هزینه‌های جانبی خرید', '1.0'),
+  ('inventory.waste',                'inventory', '{expense}',          false, 'ضایعات کالا', '1.0'),
+  ('inventory.internal_consumption', 'inventory', '{expense}',          false, 'مصرف داخلی کالا', '1.0'),
+  ('inventory.opening_stock',        'inventory', '{expense}',          false, 'موجودی ابتدای دوره (بستن ادواری)', '1.0'),
+  ('sales.commission_expense',       'sales',     '{expense}',          false, 'هزینهٔ پورسانت فروش', '1.0'),
+  ('sales.commission_payable',       'sales',     '{liability}',        false, 'پورسانت پرداختنی', '1.0'),
+  ('sales.service_charge',           'sales',     '{income}',           false, 'حق سرویس (رستوران)', '1.0'),
+  ('treasury.cheque_bounced',        'treasury',  '{asset}',            false, 'چک‌های برگشتی', '1.0'),
+  ('treasury.cheque_receivable_lt',  'treasury',  '{asset}',            false, 'اسناد دریافتنی بلندمدت', '1.0'),
+  ('treasury.cheque_payable_lt',     'treasury',  '{liability}',        false, 'اسناد پرداختنی بلندمدت', '1.0'),
+  ('treasury.cheque_protest_cost',   'treasury',  '{expense,asset}',    false, 'هزینهٔ گواهی عدم پرداخت / واخواست', '1.0'),
+  ('treasury.gateway_clearing',      'treasury',  '{asset}',            false, 'واسط درگاه پرداخت اینترنتی', '1.0'),
+  ('treasury.cash_in_transit',       'treasury',  '{asset}',            false, 'وجوه در راه', '1.0'),
+  ('treasury.cash_over_short',       'treasury',  '{expense,income}',   false, 'کسری و اضافهٔ صندوق', '1.0'),
+  ('treasury.bank_interest_income',  'treasury',  '{income}',           false, 'سود سپردهٔ بانکی', '1.0'),
+  ('treasury.unidentified_receipt',  'treasury',  '{liability}',        false, 'واریزهای نامشخص', '1.0'),
+  ('pos.tips_payable',               'pos',       '{liability}',        false, 'انعام پرداختنی به کارکنان', '1.0'),
+  ('tax.vat_settlement',             'tax',       '{liability,asset}',  false, 'تسویهٔ مالیات بر ارزش افزوده', '1.0'),
+  ('tax.other_tax_payable',          'tax',       '{liability}',        false, 'سایر مالیات‌ها و عوارض پرداختنی', '1.0'),
+  ('tax.levy_payable',               'tax',       '{liability}',        false, 'سایر وجوه قانونی پرداختنی', '1.0'),
+  ('tax.vat_input_nondeductible',    'tax',       '{expense}',          false, 'ارزش افزودهٔ خرید غیرقابل‌کسر', '1.0'),
+  ('payroll.unemployment_insurance_expense','payroll', '{expense}',     false, 'بیمهٔ بیکاری سهم کارفرما', '1.0'),
+  ('payroll.eidi_expense',           'payroll',   '{expense}',          false, 'هزینهٔ عیدی و پاداش', '1.0'),
+  ('payroll.eidi_provision',         'payroll',   '{liability}',        false, 'ذخیرهٔ عیدی و پاداش', '1.0'),
+  ('payroll.severance_expense',      'payroll',   '{expense}',          false, 'هزینهٔ مزایای پایان خدمت', '1.0'),
+  ('payroll.severance_provision',    'payroll',   '{liability}',        false, 'ذخیرهٔ مزایای پایان خدمت', '1.0'),
+  ('payroll.leave_expense',          'payroll',   '{expense}',          false, 'هزینهٔ مرخصی ذخیره', '1.0'),
+  ('payroll.leave_provision',        'payroll',   '{liability}',        false, 'ذخیرهٔ مرخصی', '1.0'),
+  ('payroll.employee_loan',          'payroll',   '{asset}',            false, 'وام کارکنان', '1.0'),
+  ('payroll.employee_advance',       'payroll',   '{asset}',            false, 'مساعدهٔ کارکنان', '1.0'),
+  ('payroll.other_deduction_payable','payroll',   '{liability}',        false, 'سایر کسورات پرداختنی', '1.0'),
+  ('assets.acquisition_clearing',    'assets',    '{asset,liability}',  false, 'واسط تحصیل دارایی ثابت', '1.0'),
+  ('assets.disposal_clearing',       'assets',    '{asset,liability}',  false, 'واسط فروش دارایی ثابت', '1.0'),
+  ('assets.disposal_gain',           'assets',    '{income}',           false, 'سود فروش دارایی ثابت', '1.0'),
+  ('assets.disposal_loss',           'assets',    '{expense}',          false, 'زیان واگذاری دارایی ثابت', '1.0')
 ON CONFLICT (key) DO NOTHING;
 
 -- ---------- قالب کدینگ عمومی (نمونهٔ v1؛ پیش از انتشار تولیدی باید حسابدار رسمی بازبینی کند) ----------
@@ -2632,16 +3193,23 @@ FROM (VALUES
   ('11',   '1',  2, 'موجودی نقد',                     'group',   'asset', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('1101', '11', 3, 'صندوق',                          'posting', 'asset', 'debit', 'CASH', '{bs.ca.cash}', 'open', '{}', NULL, 'any', true, '{"cash_box":"required"}'),
   ('1102', '11', 3, 'بانک‌ها',                         'posting', 'asset', 'debit', 'BANK', '{bs.ca.cash}', 'open', '{}', NULL, 'any', true, '{"bank_account":"required"}'),
+  ('1104', '11', 3, 'وجوه در راه',                    'posting', 'asset', 'debit', 'CASH_IN_TRANSIT', '{bs.ca.cash}', 'open', '{}', NULL, 'base_only', false, '{"cash_box":"optional","bank_account":"optional"}'),
   ('1103', '11', 3, 'تنخواه‌گردان',                    'posting', 'asset', 'debit', 'PETTY_CASH', '{bs.ca.cash}', 'open', '{}', NULL, 'base_only', false, '{"petty_cash":"required"}'),
   ('12',   '1',  2, 'دریافتنی‌های تجاری',              'group',   'asset', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('1201', '12', 3, 'حساب‌های دریافتنی تجاری',         'posting', 'asset', 'debit', 'AR_TRADE', '{bs.ca.trade_receivables}', 'open', '{}', 'party', 'any', true, '{"party":"required","project":"optional"}'),
   ('1202', '12', 3, 'اسناد دریافتنی',                  'posting', 'asset', 'debit', 'NOTES_RECEIVABLE', '{bs.ca.trade_receivables}', 'subledger_only', '{treasury,migration}', 'cheque_receivable', 'base_only', false, '{"party":"required"}'),
   ('1203', '12', 3, 'چک‌های در جریان وصول',            'posting', 'asset', 'debit', 'CHEQUES_IN_COLLECTION', '{bs.ca.trade_receivables}', 'subledger_only', '{treasury,migration}', 'cheque_receivable', 'base_only', false, '{"bank_account":"required"}'),
+  ('1204', '12', 3, 'چک‌های برگشتی',                   'posting', 'asset', 'debit', 'CHEQUES_BOUNCED', '{bs.ca.trade_receivables}', 'subledger_only', '{treasury,migration}', 'cheque_receivable', 'base_only', false, '{"party":"required"}'),
   ('13',   '1',  2, 'سایر دریافتنی‌ها',                'group',   'asset', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('1301', '13', 3, 'سایر حساب‌های دریافتنی',          'posting', 'asset', 'debit', NULL, '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{"party":"required"}'),
   ('1302', '13', 3, 'مالیات بر ارزش افزودهٔ خرید',     'posting', 'asset', 'debit', 'VAT_RECEIVABLE', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('1303', '13', 3, 'حساب واسط کارتخوان',             'posting', 'asset', 'debit', 'CARD_CLEARING', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{"pos_terminal":"required"}'),
   ('1304', '13', 3, 'حساب تراز افتتاحیه',             'posting', 'asset', 'none',  'OPENING_BALANCE_CLEARING', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('1305', '13', 3, 'حساب معلق',                       'posting', 'asset', 'none',  'SUSPENSE', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('1306', '13', 3, 'واسط فروش دارایی ثابت',           'posting', 'asset', 'none',  'ASSET_DISPOSAL_CLEARING', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{"fixed_asset":"optional"}'),
+  ('1307', '13', 3, 'مساعدهٔ کارکنان',                  'posting', 'asset', 'debit', 'EMPLOYEE_ADVANCES', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{"party":"required"}'),
+  ('1308', '13', 3, 'وام کارکنان',                     'posting', 'asset', 'debit', 'EMPLOYEE_LOANS', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{"party":"required"}'),
+  ('1309', '13', 3, 'واسط درگاه پرداخت اینترنتی',      'posting', 'asset', 'debit', 'GATEWAY_CLEARING', '{bs.ca.other_receivables}', 'open', '{}', NULL, 'base_only', false, '{"payment_gateway":"required"}'),
   ('14',   '1',  2, 'موجودی مواد و کالا',              'group',   'asset', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('1401', '14', 3, 'موجودی کالا',                    'posting', 'asset', 'debit', 'INVENTORY', '{bs.ca.inventory}', 'subledger_only', '{inventory,migration}', 'inventory', 'base_only', false, '{}'),
   ('1402', '14', 3, 'کالای در راه',                   'posting', 'asset', 'debit', 'GOODS_IN_TRANSIT', '{bs.ca.inventory}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
@@ -2657,16 +3225,30 @@ FROM (VALUES
   ('2201', '22', 3, 'سرقفلی و حق کسب و پیشه',          'posting', 'asset', 'debit', NULL, '{bs.nca.intangible}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('23',   '2',  2, 'سرمایه‌گذاری‌های بلندمدت',         'group',   'asset', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('2301', '23', 3, 'سرمایه‌گذاری‌های بلندمدت',         'posting', 'asset', 'debit', NULL, '{bs.nca.investments}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('25',   '2',  2, 'سایر دارایی‌های غیرجاری',           'group',   'asset', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('2501', '25', 3, 'اسناد دریافتنی بلندمدت',          'posting', 'asset', 'debit', 'NOTES_RECEIVABLE_LT', '{bs.nca.other}', 'subledger_only', '{treasury,migration}', 'cheque_receivable', 'base_only', false, '{"party":"required"}'),
   ('3',    NULL, 1, 'بدهی‌های جاری',                   'group',   'liability', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('31',   '3',  2, 'پرداختنی‌های تجاری',              'group',   'liability', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('3101', '31', 3, 'حساب‌های پرداختنی تجاری',         'posting', 'liability', 'credit', 'AP_TRADE', '{bs.cl.trade_payables}', 'open', '{}', 'party', 'any', true, '{"party":"required","project":"optional"}'),
   ('3102', '31', 3, 'اسناد پرداختنی',                  'posting', 'liability', 'credit', 'NOTES_PAYABLE', '{bs.cl.trade_payables}', 'subledger_only', '{treasury,migration}', 'cheque_payable', 'base_only', false, '{"party":"required"}'),
+  ('3103', '31', 3, 'کالای دریافتی صورتحساب‌نشده',      'posting', 'liability', 'credit', 'GRNI', '{bs.cl.trade_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('3104', '31', 3, 'واسط هزینه‌های جانبی خرید',        'posting', 'liability', 'none',   'LANDED_COST_CLEARING', '{bs.cl.trade_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
   ('32',   '3',  2, 'سایر پرداختنی‌ها',                'group',   'liability', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('3201', '32', 3, 'سایر حساب‌های پرداختنی',          'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"required"}'),
   ('3202', '32', 3, 'مالیات بر ارزش افزودهٔ فروش',     'posting', 'liability', 'credit', 'VAT_PAYABLE', '{bs.cl.tax}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('3203', '32', 3, 'مالیات حقوق پرداختنی',           'posting', 'liability', 'credit', NULL, '{bs.cl.tax}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('3204', '32', 3, 'حق بیمهٔ پرداختنی',               'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{}'),
-  ('3205', '32', 3, 'حقوق و دستمزد پرداختنی',          'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"employee":"required"}'),
+  ('3205', '32', 3, 'حقوق و دستمزد پرداختنی',          'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"required"}'),
+  ('3206', '32', 3, 'واسط تحصیل دارایی ثابت',          'posting', 'liability', 'none',   'ASSET_ACQUISITION_CLEARING', '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('3207', '32', 3, 'ذخیرهٔ عیدی و پاداش',              'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('3208', '32', 3, 'ذخیرهٔ مرخصی',                    'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('3209', '32', 3, 'سایر کسورات حقوق پرداختنی',        'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('3210', '32', 3, 'انعام پرداختنی به کارکنان',        'posting', 'liability', 'credit', 'TIPS_PAYABLE', '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('3211', '32', 3, 'پورسانت پرداختنی',                 'posting', 'liability', 'credit', NULL, '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('3212', '32', 3, 'سایر وجوه قانونی پرداختنی',        'posting', 'liability', 'credit', NULL, '{bs.cl.tax}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('3213', '32', 3, 'سایر مالیات‌ها و عوارض پرداختنی',  'posting', 'liability', 'credit', NULL, '{bs.cl.tax}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('3214', '32', 3, 'تسویهٔ مالیات بر ارزش افزوده',      'posting', 'liability', 'none',   'VAT_SETTLEMENT', '{bs.cl.tax}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('3215', '32', 3, 'واریزهای نامشخص',                 'posting', 'liability', 'credit', 'UNIDENTIFIED_RECEIPTS', '{bs.cl.other_payables}', 'open', '{}', NULL, 'base_only', false, '{"bank_account":"optional"}'),
   ('33',   '3',  2, 'پیش‌دریافت‌ها',                    'group',   'liability', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('3301', '33', 3, 'پیش‌دریافت فروش',                 'posting', 'liability', 'credit', 'CUSTOMER_ADVANCES', '{bs.cl.advances}', 'open', '{}', NULL, 'any', true, '{"party":"required"}'),
   ('34',   '3',  2, 'ذخایر و تسهیلات جاری',            'group',   'liability', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
@@ -2675,7 +3257,8 @@ FROM (VALUES
   ('4',    NULL, 1, 'بدهی‌های غیرجاری',                'group',   'liability', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('41',   '4',  2, 'بدهی‌های بلندمدت',                'group',   'liability', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('4101', '41', 3, 'تسهیلات مالی بلندمدت',            'posting', 'liability', 'credit', 'LOANS', '{bs.ncl.loans}', 'open', '{}', NULL, 'base_only', false, '{"bank_account":"optional"}'),
-  ('4102', '41', 3, 'ذخیرهٔ مزایای پایان خدمت کارکنان', 'posting', 'liability', 'credit', NULL, '{bs.ncl.provisions}', 'open', '{}', NULL, 'base_only', false, '{"employee":"optional"}'),
+  ('4102', '41', 3, 'ذخیرهٔ مزایای پایان خدمت کارکنان', 'posting', 'liability', 'credit', NULL, '{bs.ncl.provisions}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
+  ('4103', '41', 3, 'اسناد پرداختنی بلندمدت',          'posting', 'liability', 'credit', 'NOTES_PAYABLE_LT', '{bs.ncl.other}', 'subledger_only', '{treasury,migration}', 'cheque_payable', 'base_only', false, '{"party":"required"}'),
   ('5',    NULL, 1, 'حقوق مالکانه',                    'group',   'equity', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('51',   '5',  2, 'سرمایه',                          'group',   'equity', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('5101', '51', 3, 'سرمایه',                          'posting', 'equity', 'credit', 'CAPITAL', '{bs.eq.capital}', 'open', '{}', NULL, 'base_only', false, '{"party":"optional"}'),
@@ -2692,13 +3275,22 @@ FROM (VALUES
   ('6102', '61', 3, 'فروش خدمات',                      'posting', 'income', 'credit', 'SALES', '{pl.revenue}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional","project":"optional"}'),
   ('6103', '61', 3, 'برگشت از فروش',                   'posting', 'income', 'debit',  'SALES_RETURNS', '{pl.revenue_deductions}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
   ('6104', '61', 3, 'تخفیفات فروش',                    'posting', 'income', 'debit',  'SALES_DISCOUNTS', '{pl.revenue_deductions}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
+  ('6105', '61', 3, 'درآمد حق سرویس',                  'posting', 'income', 'credit', 'SALES', '{pl.revenue}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
   ('62',   '6',  2, 'سایر درآمدها',                     'group',   'income', 'credit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('6201', '62', 3, 'سود تسعیر ارز',                   'posting', 'income', 'credit', 'FX_GAIN', '{pl.other_nonop}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('6202', '62', 3, 'سایر درآمدهای غیرعملیاتی',        'posting', 'income', 'credit', 'OTHER_INCOME', '{pl.other_nonop}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('6203', '62', 3, 'سود فروش دارایی ثابت',            'posting', 'income', 'credit', 'ASSET_DISPOSAL_GAIN', '{pl.other_nonop}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('6204', '62', 3, 'سود سپردهٔ بانکی',                'posting', 'income', 'credit', 'BANK_INTEREST_INCOME', '{pl.other_nonop}', 'open', '{}', NULL, 'base_only', false, '{"bank_account":"optional"}'),
   ('7',    NULL, 1, 'بهای تمام‌شده و هزینه‌ها',         'group',   'expense', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('71',   '7',  2, 'بهای تمام‌شدهٔ کالای فروش‌رفته',    'group',   'expense', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('7101', '71', 3, 'بهای تمام‌شدهٔ کالای فروش‌رفته',    'posting', 'expense', 'debit', 'COGS', '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
   ('7102', '71', 3, 'کسری و اضافی انبار',              'posting', 'expense', 'none',  NULL, '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
+  ('7103', '71', 3, 'موجودی ابتدای دوره',              'posting', 'expense', 'debit', NULL, '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('7104', '71', 3, 'ضایعات کالا',                     'posting', 'expense', 'debit', NULL, '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
+  ('7105', '71', 3, 'خرید کالا',                       'posting', 'expense', 'debit', 'PURCHASES', '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
+  ('7106', '71', 3, 'برگشت از خرید',                   'posting', 'expense', 'credit', 'PURCHASE_RETURNS', '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('7107', '71', 3, 'تخفیفات خرید',                    'posting', 'expense', 'credit', 'PURCHASE_DISCOUNTS', '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('7108', '71', 3, 'تفاوت قیمت خرید',                 'posting', 'expense', 'none',  NULL, '{pl.cogs}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('72',   '7',  2, 'هزینه‌های عمومی، اداری و فروش',     'group',   'expense', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('7201', '72', 3, 'حقوق و دستمزد',                   'posting', 'expense', 'debit', 'EXPENSE_PAYROLL', '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional","project":"optional"}'),
   ('7202', '72', 3, 'اجاره',                           'posting', 'expense', 'debit', 'EXPENSE_RENT', '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
@@ -2706,11 +3298,16 @@ FROM (VALUES
   ('7204', '72', 3, 'هزینهٔ استهلاک',                   'posting', 'expense', 'debit', 'EXPENSE_DEPRECIATION', '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
   ('7205', '72', 3, 'کارمزد بانکی',                    'posting', 'expense', 'debit', 'EXPENSE_BANK', '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('7206', '72', 3, 'سایر هزینه‌ها',                    'posting', 'expense', 'debit', NULL, '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional","project":"optional"}'),
+  ('7207', '72', 3, 'مصرف داخلی کالا',                 'posting', 'expense', 'debit', NULL, '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
+  ('7208', '72', 3, 'هزینهٔ پورسانت فروش',              'posting', 'expense', 'debit', NULL, '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{"cost_center":"optional"}'),
+  ('7209', '72', 3, 'ارزش افزودهٔ خرید غیرقابل‌کسر',     'posting', 'expense', 'debit', NULL, '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('7210', '72', 3, 'کسری و اضافهٔ صندوق',              'posting', 'expense', 'none',  'CASH_OVER_SHORT', '{pl.opex}', 'open', '{}', NULL, 'base_only', false, '{"cash_box":"optional"}'),
   ('73',   '7',  2, 'هزینه‌های مالی و غیرعملیاتی',       'group',   'expense', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('7301', '73', 3, 'هزینه‌های مالی',                   'posting', 'expense', 'debit', 'EXPENSE_FINANCE', '{pl.finance_costs}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('7302', '73', 3, 'زیان تسعیر ارز',                  'posting', 'expense', 'debit', 'FX_LOSS', '{pl.other_nonop}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('7303', '73', 3, 'تفاوت گرد کردن',                  'posting', 'expense', 'none',  'ROUNDING', '{pl.other_nonop}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('7304', '73', 3, 'هزینهٔ مالیات بر درآمد',           'posting', 'expense', 'debit', 'INCOME_TAX', '{pl.income_tax}', 'open', '{}', NULL, 'base_only', false, '{}'),
+  ('7305', '73', 3, 'زیان واگذاری دارایی ثابت',        'posting', 'expense', 'debit', 'ASSET_DISPOSAL_LOSS', '{pl.other_nonop}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('8',    NULL, 1, 'حساب‌های انتظامی',                 'group',   'memo', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('81',   '8',  2, 'حساب‌های انتظامی',                 'group',   'memo', 'debit', NULL, '{}', 'open', '{}', NULL, 'base_only', false, '{}'),
   ('8101', '81', 3, 'اسناد تضمینی دریافتی',            'posting', 'memo', 'debit',  'MEMO_GUARANTEE_RECEIVED', '{}', 'subledger_only', '{treasury,migration}', 'guarantee_received', 'base_only', false, '{"party":"required"}'),
@@ -2744,7 +3341,36 @@ INSERT INTO ledger.coa_template_posting_rule (template_code, template_version, p
   ('ir.general', 1, 'assets.depreciation_expense', '7204'),
   ('ir.general', 1, 'payroll.salary_expense', '7201'), ('ir.general', 1, 'payroll.salary_payable', '3205'),
   ('ir.general', 1, 'payroll.insurance_payable', '3204'), ('ir.general', 1, 'payroll.tax_payable', '3203'),
-  ('ir.general', 1, 'payroll.employer_insurance_expense', '7201')
+  ('ir.general', 1, 'payroll.employer_insurance_expense', '7201'),
+  -- RV-IT2-03 / CR-T02 / CR-T07 / CR-CMP-03: هر کلید کاتالوگ قاعدهٔ بی‌شرط دارد (دروازهٔ posting_key_coverage)
+  ('ir.general', 1, 'ledger.suspense', '1305'),
+  ('ir.general', 1, 'purchase.grni', '3103'), ('ir.general', 1, 'purchase.price_difference', '7108'),
+  ('ir.general', 1, 'purchase.purchases', '7105'), ('ir.general', 1, 'purchase.returns', '7106'),
+  ('ir.general', 1, 'purchase.discount', '7107'), ('ir.general', 1, 'purchase.landed_cost_clearing', '3104'),
+  ('ir.general', 1, 'inventory.waste', '7104'), ('ir.general', 1, 'inventory.internal_consumption', '7207'),
+  ('ir.general', 1, 'inventory.opening_stock', '7103'),
+  ('ir.general', 1, 'sales.commission_expense', '7208'), ('ir.general', 1, 'sales.commission_payable', '3211'),
+  ('ir.general', 1, 'sales.service_charge', '6105'),
+  ('ir.general', 1, 'treasury.cheque_bounced', '1204'), ('ir.general', 1, 'treasury.cheque_receivable_lt', '2501'),
+  ('ir.general', 1, 'treasury.cheque_payable_lt', '4103'), ('ir.general', 1, 'treasury.cheque_protest_cost', '7205'),
+  ('ir.general', 1, 'treasury.gateway_clearing', '1309'), ('ir.general', 1, 'treasury.cash_in_transit', '1104'),
+  ('ir.general', 1, 'treasury.cash_over_short', '7210'), ('ir.general', 1, 'treasury.bank_interest_income', '6204'),
+  ('ir.general', 1, 'treasury.unidentified_receipt', '3215'), ('ir.general', 1, 'pos.tips_payable', '3210'),
+  ('ir.general', 1, 'tax.vat_settlement', '3214'), ('ir.general', 1, 'tax.other_tax_payable', '3213'),
+  ('ir.general', 1, 'tax.levy_payable', '3212'), ('ir.general', 1, 'tax.vat_input_nondeductible', '7209'),
+  ('ir.general', 1, 'payroll.unemployment_insurance_expense', '7201'), ('ir.general', 1, 'payroll.eidi_expense', '7201'),
+  ('ir.general', 1, 'payroll.eidi_provision', '3207'), ('ir.general', 1, 'payroll.severance_expense', '7201'),
+  ('ir.general', 1, 'payroll.severance_provision', '4102'), ('ir.general', 1, 'payroll.leave_expense', '7201'),
+  ('ir.general', 1, 'payroll.leave_provision', '3208'), ('ir.general', 1, 'payroll.employee_loan', '1308'),
+  ('ir.general', 1, 'payroll.employee_advance', '1307'), ('ir.general', 1, 'payroll.other_deduction_payable', '3209'),
+  ('ir.general', 1, 'assets.acquisition_clearing', '3206'), ('ir.general', 1, 'assets.disposal_clearing', '1306'),
+  ('ir.general', 1, 'assets.disposal_gain', '6203'), ('ir.general', 1, 'assets.disposal_loss', '7305')
+ON CONFLICT DO NOTHING;
+
+-- شرط‌های پیش‌فرض قالب (CR-T02): طرف حساب «سایر» (party_role=other) به دریافتنی/پرداختنی غیرتجاری می‌رود
+INSERT INTO ledger.coa_template_posting_rule (template_code, template_version, posting_key, priority, conditions, account_code) VALUES
+  ('ir.general', 1, 'sales.receivable', 50, '{"attr:party_role":"other"}', '1301'),
+  ('ir.general', 1, 'purchase.payable', 50, '{"attr:party_role":"other"}', '3201')
 ON CONFLICT DO NOTHING;
 
 -- ---------- قالب‌های صورت مالی (استانداردهای حسابداری ایران؛ اسکلت نسخه‌دار، نیازمند بازبینی) ----------
@@ -2762,7 +3388,8 @@ FROM (VALUES
   ('ir.bs','NCA_PPE',       20, 2, 'دارایی‌های ثابت مشهود',             'accounts', '{"tags_any":["bs.nca.ppe_cost","bs.nca.ppe_accdep"]}', 'closing', 1, NULL, false),
   ('ir.bs','NCA_INTANG',    30, 2, 'دارایی‌های نامشهود',                'accounts', '{"tags_any":["bs.nca.intangible"]}', 'closing', 1, NULL, false),
   ('ir.bs','NCA_INV',       40, 2, 'سرمایه‌گذاری‌های بلندمدت',          'accounts', '{"tags_any":["bs.nca.investments"]}', 'closing', 1, NULL, false),
-  ('ir.bs','NCA_TOTAL',     50, 1, 'جمع دارایی‌های غیرجاری',            'formula',  NULL, NULL, 1, 'NCA_PPE + NCA_INTANG + NCA_INV', false),
+  ('ir.bs','NCA_OTHER',     45, 2, 'سایر دارایی‌های غیرجاری',           'accounts', '{"tags_any":["bs.nca.other"]}', 'closing', 1, NULL, false),
+  ('ir.bs','NCA_TOTAL',     50, 1, 'جمع دارایی‌های غیرجاری',            'formula',  NULL, NULL, 1, 'NCA_PPE + NCA_INTANG + NCA_INV + NCA_OTHER', false),
   ('ir.bs','CA_PREPAY',     60, 2, 'پیش‌پرداخت‌ها',                     'accounts', '{"tags_any":["bs.ca.prepayments"]}', 'closing', 1, NULL, false),
   ('ir.bs','CA_INVENTORY',  70, 2, 'موجودی مواد و کالا',               'accounts', '{"tags_any":["bs.ca.inventory"]}', 'closing', 1, NULL, false),
   ('ir.bs','CA_TRADE_REC',  80, 2, 'دریافتنی‌های تجاری',               'accounts', '{"tags_any":["bs.ca.trade_receivables"]}', 'closing', 1, NULL, false),
@@ -2778,7 +3405,8 @@ FROM (VALUES
   ('ir.bs','EQ_TOTAL',     180, 1, 'جمع حقوق مالکانه',                  'formula',  NULL, NULL, 1, 'EQ_CAPITAL + EQ_RESERVES + EQ_RETAINED + EQ_CURRENT', false),
   ('ir.bs','NCL_LOANS',    190, 2, 'تسهیلات مالی بلندمدت',              'accounts', '{"tags_any":["bs.ncl.loans"]}', 'closing', -1, NULL, false),
   ('ir.bs','NCL_PROV',     200, 2, 'ذخیرهٔ مزایای پایان خدمت',           'accounts', '{"tags_any":["bs.ncl.provisions"]}', 'closing', -1, NULL, false),
-  ('ir.bs','NCL_TOTAL',    210, 1, 'جمع بدهی‌های غیرجاری',               'formula',  NULL, NULL, 1, 'NCL_LOANS + NCL_PROV', false),
+  ('ir.bs','NCL_OTHER',    205, 2, 'سایر بدهی‌های غیرجاری',              'accounts', '{"tags_any":["bs.ncl.other"]}', 'closing', -1, NULL, false),
+  ('ir.bs','NCL_TOTAL',    210, 1, 'جمع بدهی‌های غیرجاری',               'formula',  NULL, NULL, 1, 'NCL_LOANS + NCL_PROV + NCL_OTHER', false),
   ('ir.bs','CL_TRADE_PAY', 220, 2, 'پرداختنی‌های تجاری',                'accounts', '{"tags_any":["bs.cl.trade_payables"]}', 'closing', -1, NULL, false),
   ('ir.bs','CL_OTHER_PAY', 230, 2, 'سایر پرداختنی‌ها',                  'accounts', '{"tags_any":["bs.cl.other_payables"]}', 'closing', -1, NULL, false),
   ('ir.bs','CL_TAX',       240, 2, 'مالیات پرداختنی',                   'accounts', '{"tags_any":["bs.cl.tax"]}', 'closing', -1, NULL, false),
@@ -2806,10 +3434,10 @@ FROM (VALUES
 
   ('ir.cf','CF_PROFIT',     10, 1, 'سود (زیان) خالص',                      'pl_result', NULL, 'period_net', -1, NULL, false),
   ('ir.cf','CF_DEP',        20, 1, 'استهلاک (تغییر استهلاک انباشته)',       'accounts', '{"tags_any":["bs.nca.ppe_accdep"]}', 'change', -1, NULL, false),
-  ('ir.cf','CF_WC_REC',     30, 1, 'تغییر دریافتنی‌ها',                     'accounts', '{"tags_any":["bs.ca.trade_receivables","bs.ca.other_receivables"]}', 'change', -1, NULL, false),
+  ('ir.cf','CF_WC_REC',     30, 1, 'تغییر دریافتنی‌ها',                     'accounts', '{"tags_any":["bs.ca.trade_receivables","bs.ca.other_receivables","bs.nca.other"]}', 'change', -1, NULL, false),
   ('ir.cf','CF_WC_INV',     40, 1, 'تغییر موجودی‌ها',                        'accounts', '{"tags_any":["bs.ca.inventory"]}', 'change', -1, NULL, false),
   ('ir.cf','CF_WC_PRE',     50, 1, 'تغییر پیش‌پرداخت‌ها',                    'accounts', '{"tags_any":["bs.ca.prepayments"]}', 'change', -1, NULL, false),
-  ('ir.cf','CF_WC_PAY',     60, 1, 'تغییر پرداختنی‌ها، مالیات و پیش‌دریافت‌ها', 'accounts', '{"tags_any":["bs.cl.trade_payables","bs.cl.other_payables","bs.cl.tax","bs.cl.advances","bs.ncl.provisions"]}', 'change', -1, NULL, false),
+  ('ir.cf','CF_WC_PAY',     60, 1, 'تغییر پرداختنی‌ها، مالیات و پیش‌دریافت‌ها', 'accounts', '{"tags_any":["bs.cl.trade_payables","bs.cl.other_payables","bs.cl.tax","bs.cl.advances","bs.ncl.provisions","bs.ncl.other"]}', 'change', -1, NULL, false),
   ('ir.cf','CF_OPERATING',  70, 0, 'جریان خالص نقد از فعالیت‌های عملیاتی',   'formula',  NULL, NULL, 1, 'CF_PROFIT + CF_DEP + CF_WC_REC + CF_WC_INV + CF_WC_PRE + CF_WC_PAY', false),
   ('ir.cf','CF_INVESTING',  80, 1, 'خرید و فروش دارایی‌های بلندمدت',        'accounts', '{"tags_any":["bs.nca.ppe_cost","bs.nca.intangible","bs.nca.investments"]}', 'change', -1, NULL, false),
   ('ir.cf','CF_INV_TOTAL',  90, 0, 'جریان خالص نقد از فعالیت‌های سرمایه‌گذاری', 'formula', NULL, NULL, 1, 'CF_INVESTING', false),
@@ -2854,7 +3482,21 @@ BEGIN
       ('ledger','fx_revaluation_run',     'ledger', 'rows', 348, NULL),
       ('ledger','eledger_export',         'ledger', 'rows', 350, NULL),
       ('ledger','integrity_run',          'ledger', 'rows', 352, NULL),
-      ('ledger','report_account_map',     'ledger', 'rows', 354, NULL)
+      ('ledger','report_account_map',     'ledger', 'rows', 354, NULL),
+      ('ledger','coa_extension_applied',  'ledger', 'rows', 305, NULL)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  -- مشترک رویدادهای اشخاص (RV-MD-08، RV-X1-03؛ D-M04، CR-04): بُعد شخص با ensure_value (created)، rename (renamed) و
+  -- merge (merged؛ بازنده و هر مقدار زنجیرهٔ آن به برنده، INV-LED-39). همهٔ گرداننده‌ها idempotent با party_id / merge_id.
+  -- post هم ensure_value را تنبل در همان تراکنش صدا می‌زند، پس ترتیب تحویل رویداد بر ثبت اثر ندارد.
+  IF to_regclass('core.event_subscriber') IS NOT NULL THEN
+    INSERT INTO core.event_subscriber (subscriber, ordered, max_attempts, requires_webhook_endpoint, introduced_in)
+    VALUES ('ledger.party_dimension', true, 25, false, '1.0')
+    ON CONFLICT DO NOTHING;
+    INSERT INTO core.event_subscription (event_type, subscriber) VALUES
+      ('parties.party.created', 'ledger.party_dimension'),
+      ('parties.party.renamed', 'ledger.party_dimension'),
+      ('parties.party.merged',  'ledger.party_dimension')
     ON CONFLICT DO NOTHING;
   END IF;
   IF to_regclass('core.permission') IS NOT NULL THEN
