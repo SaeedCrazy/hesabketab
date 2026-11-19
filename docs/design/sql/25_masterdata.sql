@@ -4,9 +4,10 @@
 -- (ref: کشور، استان، شهر، بانک، کد شبا، BIN کارت، واحدهای مؤدیان، snapshot شناسهٔ کالا)
 -- و توابع اعتبارسنجی شناسه‌های ایرانی (ref.is_valid_*) با همتای پایتون و بردار آزمون مشترک.
 --
--- پیش‌نیاز اعتبارسنجی مستقل: فقط 00_foundation.sql. در پایگاه یکپارچه، 10_core.sql پیش از این
--- فایل اجرا می‌شود؛ توابع نرمال‌سازی core.fa_* مال 10_core است و این فایل فقط اگر نبودند
--- همان متن fa-norm-v1 را می‌سازد (shim محافظت‌شده؛ سند §۱۳ CR-03).
+-- ترتیب (R-ORDER): 00 → 10 → 25. 10_core پیش‌نیاز رسمی است؛ ثبت در کاتالوگ‌های core (رجیستری صدور، مجوز،
+-- محافظ فیلد، قالب نقش، تنظیمات، فیلد سفارشی، مشترک رویداد) در بخش ۱۲ همین فایل انجام می‌شود. تا هارنس زنجیرهٔ
+-- مستقل این بخش را از «00 → 25» به «00 → 10 → 25» عوض کند، فایل روی 00 → 25 هم اعمال می‌شود: بلوک‌های بخش ۱۲ با
+-- to_regclass محافظت شده‌اند و shim زیر توابع core.fa_* را فقط اگر 10_core نیامده باشد می‌سازد (سند §۱۳ CR-03).
 -- قواعد: PK = id uuid DEFAULT uuidv7()؛ هر جدول مستأجری tenant_id NOT NULL، UNIQUE (tenant_id, id)
 -- و core.enable_tenant_rls؛ ارجاع بین جدول‌های مستأجری همیشه FK ترکیبی (tenant_id, x_id)؛
 -- FK به ref تک‌ستونی. ویوها WITH (security_invoker = true). خطاها: 'HK_<CODE>: پیام' با ERRCODE P0001.
@@ -496,7 +497,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS party_national_id_uq ON parties.party (tenant_
   WHERE national_id IS NOT NULL AND status <> 'merged';
 CREATE INDEX IF NOT EXISTS party_economic_code_idx ON parties.party (tenant_id, economic_code) WHERE economic_code IS NOT NULL;
 CREATE INDEX IF NOT EXISTS party_name_search_trgm ON parties.party USING gin (name_search gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS party_name_key_trgm ON parties.party USING gin (name_key gin_trgm_ops);
+-- RV-MD-12: نزدیک‌ترین نام‌ها درون مستأجر (KNN با <->)؛ GiST چندستونی (btree_gist برای uuid + gist_trgm_ops) برابری
+-- مستأجر و ترتیب فاصله را در یک پیمایش ایندکس می‌دهد (GIN تک‌ستونی پیشین هرگز استفاده نمی‌شد).
+DROP INDEX IF EXISTS parties.party_name_key_trgm;
+CREATE INDEX IF NOT EXISTS party_name_key_trgm_gist ON parties.party USING gist (tenant_id, name_key gist_trgm_ops);
 CREATE INDEX IF NOT EXISTS party_merged_into_idx ON parties.party (tenant_id, merged_into_id) WHERE merged_into_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS party_status_idx ON parties.party (tenant_id, status);
 
@@ -685,8 +689,18 @@ CREATE TABLE IF NOT EXISTS parties.party_hold (
 SELECT core.enable_tenant_rls('parties.party_hold');
 CREATE UNIQUE INDEX IF NOT EXISTS party_hold_one_active ON parties.party_hold (tenant_id, party_id, scope, source) WHERE released_at IS NULL;
 
--- کد(های) قدیمی از نرم‌افزار مبدأ؛ پس از ادغام به برنده منتقل می‌شود. migration_run_id ارجاع نرم است
--- (migration در DAG بالادست است؛ FK خلاف جهت ممنوع).
+-- کد(های) قدیمی از نرم‌افزار مبدأ؛ پس از ادغام به برنده منتقل می‌شود. migration_job_id ارجاع نرم است
+-- (migration در DAG بالادست است؛ FK خلاف جهت ممنوع). source_scope همان «source_db» بخش ۰۸ است (Holoo1، Sepidar01/1405).
+-- پایگاه‌های پیش از CR-MG09 ستون migration_run_id داشتند؛ تغییر نام idempotent:
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('parties.party_legacy_code') AND attname = 'migration_run_id' AND NOT attisdropped) THEN
+    ALTER TABLE parties.party_legacy_code RENAME COLUMN migration_run_id TO migration_job_id;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('catalog.item_legacy_code') AND attname = 'migration_run_id' AND NOT attisdropped) THEN
+    ALTER TABLE catalog.item_legacy_code RENAME COLUMN migration_run_id TO migration_job_id;
+  END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS parties.party_legacy_code (
   tenant_id         uuid NOT NULL REFERENCES core.tenant(id),
   id                uuid NOT NULL DEFAULT uuidv7(),
@@ -696,7 +710,7 @@ CREATE TABLE IF NOT EXISTS parties.party_legacy_code (
   legacy_code       text NOT NULL CHECK (legacy_code = core.fa_normalize_ident(legacy_code) AND char_length(legacy_code) BETWEEN 1 AND 100),
   legacy_name       text,
   legacy_kind       text CHECK (char_length(legacy_kind) <= 40),
-  migration_run_id  uuid,
+  migration_job_id  uuid,                 -- ارجاع نرم به migration.job (08:CR-MG09)
   created_at        timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
@@ -790,10 +804,14 @@ SELECT core.enable_tenant_rls('parties.code_series');
 -- =====================================================================
 -- ۵. parties — تریگرها
 -- =====================================================================
--- شخص: ماشین حالت، تغییرناپذیری ردیف ادغام‌شده، «merged» فقط از مسیر parties.merge_parties
+-- شخص: ماشین حالت، تغییرناپذیری ردیف ادغام‌شده، و پس‌شرط‌های ادغام (RV-MD-11).
+-- «merged» به GUC یا مسیر خاصی بسته نیست؛ پایگاه داده نتیجه را می‌سنجد: ردیف `party_merge` همین (برنده، بازنده)
+-- باید پیش‌تر در همین یا تراکنشی قبلی ثبت شده باشد و بازنده هیچ فرزند زنده‌ای نداشته باشد (نقش، ارتباط، نشانی و حساب
+-- فعال، توقیف آزادنشده، رابطه، کد قدیمی، «رد تکراری»). پس هیچ set_config یا UPDATE دستی نمی‌تواند ادغام ناقص بسازد.
+-- قفل: پیش از سنجش، ردیف با FOR UPDATE قفل می‌شود تا با FOR KEY SHARE نگهبان‌های فرزند (درج هم‌زمان) سریال شود.
 CREATE OR REPLACE FUNCTION parties.party_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_target_status text;
+DECLARE v_target_status text; v_live text;
 BEGIN
   IF TG_OP = 'INSERT' THEN
     IF NEW.status = 'merged' THEN
@@ -812,14 +830,49 @@ BEGIN
     RAISE EXCEPTION 'HK_PARTY_IMMUTABLE_FIELD: tenant_id/id are immutable' USING ERRCODE = 'P0001';
   END IF;
   IF OLD.status = 'merged' THEN
-    -- فقط فشرده‌سازی مسیر: merged_into_id به برندهٔ تازه
+    -- ردیف ادغام‌شده فقط‌خواندنی است، جز فشرده‌سازی مسیر: merged_into_id فقط به جانشینِ هدف فعلی (هدفی که خودش
+    -- ادغام شده) می‌رود؛ هر نشانه‌گیری دیگر رد می‌شود (RV-MD-06، INV-PTY-15).
     IF (to_jsonb(NEW) - ARRAY['merged_into_id','updated_at','row_version','name_search','name_key'])
        IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['merged_into_id','updated_at','row_version','name_search','name_key']) THEN
       RAISE EXCEPTION 'HK_PARTY_MERGED_IMMUTABLE: merged party % is read-only', OLD.id USING ERRCODE = 'P0001';
     END IF;
+    IF NEW.merged_into_id IS DISTINCT FROM OLD.merged_into_id AND NOT EXISTS (
+         SELECT 1 FROM parties.party t
+          WHERE t.tenant_id = NEW.tenant_id AND t.id = OLD.merged_into_id
+            AND t.status = 'merged' AND t.merged_into_id = NEW.merged_into_id) THEN
+      RAISE EXCEPTION 'HK_PARTY_MERGE_REPOINT: merged party % may only be re-pointed to the successor of its target (path compression)', OLD.id
+        USING ERRCODE = 'P0001';
+    END IF;
   ELSIF NEW.status = 'merged' THEN
-    IF coalesce(current_setting('hk.parties_merge', true), '') <> NEW.id::text THEN
-      RAISE EXCEPTION 'HK_PARTY_MERGED_ONLY_VIA_MERGE: status merged can only be set by parties.merge_parties' USING ERRCODE = 'P0001';
+    PERFORM 1 FROM parties.party x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.id FOR UPDATE;
+    IF NOT EXISTS (SELECT 1 FROM parties.party_merge m
+                    WHERE m.tenant_id = NEW.tenant_id AND m.loser_party_id = NEW.id AND m.winner_party_id = NEW.merged_into_id) THEN
+      RAISE EXCEPTION 'HK_PARTY_MERGED_ONLY_VIA_MERGE: status merged needs a party_merge record (use parties.merge_parties)'
+        USING ERRCODE = 'P0001';
+    END IF;
+    v_live := CASE
+      WHEN EXISTS (SELECT 1 FROM parties.party_role c WHERE c.tenant_id = NEW.tenant_id AND c.party_id = NEW.id AND c.is_active) THEN 'party_role'
+      WHEN EXISTS (SELECT 1 FROM parties.party_contact c WHERE c.tenant_id = NEW.tenant_id AND c.party_id = NEW.id AND c.is_active) THEN 'party_contact'
+      WHEN EXISTS (SELECT 1 FROM parties.party_address c WHERE c.tenant_id = NEW.tenant_id AND c.party_id = NEW.id AND c.is_active) THEN 'party_address'
+      WHEN EXISTS (SELECT 1 FROM parties.party_bank_account c WHERE c.tenant_id = NEW.tenant_id AND c.party_id = NEW.id AND c.is_active) THEN 'party_bank_account'
+      WHEN EXISTS (SELECT 1 FROM parties.party_hold c WHERE c.tenant_id = NEW.tenant_id AND c.party_id = NEW.id AND c.released_at IS NULL) THEN 'party_hold'
+      WHEN EXISTS (SELECT 1 FROM parties.party_relation c WHERE c.tenant_id = NEW.tenant_id AND NEW.id IN (c.party_id, c.related_party_id)) THEN 'party_relation'
+      WHEN EXISTS (SELECT 1 FROM parties.party_legacy_code c WHERE c.tenant_id = NEW.tenant_id AND c.party_id = NEW.id) THEN 'party_legacy_code'
+      WHEN EXISTS (SELECT 1 FROM parties.duplicate_dismissal c WHERE c.tenant_id = NEW.tenant_id AND NEW.id IN (c.party_a_id, c.party_b_id)) THEN 'duplicate_dismissal'
+      WHEN EXISTS (SELECT 1 FROM parties.party_role c WHERE c.tenant_id = NEW.tenant_id AND c.default_agent_party_id = NEW.id) THEN 'party_role.default_agent'
+    END;
+    IF v_live IS NOT NULL THEN
+      RAISE EXCEPTION 'HK_PARTY_MERGE_INCOMPLETE: loser % still has live % rows (moves are done by parties.merge_parties)', NEW.id, v_live
+        USING ERRCODE = 'P0001';
+    END IF;
+  END IF;
+  -- محدودیت شرکت (INV-PTY-07، RV-MD-14): تنگ کردن محدودهٔ دید وقتی ردیف نقشِ شرکت دیگری هست رد می‌شود
+  IF NEW.company_id IS NOT NULL AND NEW.company_id IS DISTINCT FROM OLD.company_id THEN
+    PERFORM 1 FROM parties.party x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.id FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM parties.party_role r WHERE r.tenant_id = NEW.tenant_id AND r.party_id = NEW.id
+                  AND r.company_id IS NOT NULL AND r.company_id <> NEW.company_id) THEN
+      RAISE EXCEPTION 'HK_PARTY_ROLE_COMPANY_SCOPE: party % has role rows for another company; remove them before restricting it to company %',
+        NEW.id, NEW.company_id USING ERRCODE = 'P0001';
     END IF;
   END IF;
   IF NEW.merged_into_id IS NOT NULL AND NEW.merged_into_id IS DISTINCT FROM OLD.merged_into_id THEN
@@ -834,14 +887,28 @@ DROP TRIGGER IF EXISTS trg_party_guard ON parties.party;
 CREATE TRIGGER trg_party_guard BEFORE INSERT OR UPDATE OR DELETE ON parties.party
   FOR EACH ROW EXECUTE FUNCTION parties.party_guard();
 
--- ردیف‌های فرزند: شخص ادغام‌شده فرزند تازه یا تغییر نمی‌پذیرد (ادغام پیش از برگرداندن وضعیت فرزندان را منتقل می‌کند)
+-- ارجاع به شخص (عمومی؛ ماژول‌های دیگر هم روی ستون‌های شخص جدول‌های تغییرپذیرشان می‌گذارند، CR-06):
+--   * درج، یا تغییر ستون شخص: شخص مقصد نباید ادغام‌شده باشد. ردیف شخص با FOR KEY SHARE (همان قفل FK) خوانده می‌شود تا
+--     با FOR UPDATE ادغام سریال شود: درج هم‌زمان منتظر commit ادغام می‌ماند و وضعیت تازه را می‌بیند (RV-MD-05).
+--   * ویرایش بی‌تغییر ستون شخص روی ردیفی که شخصش ادغام شده: فقط «بازنشسته کردن» مجاز است — غیرفعال کردن
+--     (is_active = false) یا آزاد کردن توقیف — تا ردیف کهنه را بتوان کنار گذاشت ولی دوباره زنده نشود (RV-MD-09).
 CREATE OR REPLACE FUNCTION parties.child_party_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_status text; v_party uuid; v_col text := coalesce(TG_ARGV[0], 'party_id');
+DECLARE v_status text; v_party uuid; v_col text := coalesce(TG_ARGV[0], 'party_id'); v_new jsonb := to_jsonb(NEW);
 BEGIN
-  v_party := (to_jsonb(NEW) ->> v_col)::uuid;
+  v_party := (v_new ->> v_col)::uuid;
   IF v_party IS NULL THEN RETURN NEW; END IF;
-  SELECT p.status INTO v_status FROM parties.party p WHERE p.tenant_id = NEW.tenant_id AND p.id = v_party;
+  IF TG_OP = 'UPDATE' AND v_party IS NOT DISTINCT FROM (to_jsonb(OLD) ->> v_col)::uuid THEN
+    SELECT p.status INTO v_status FROM parties.party p WHERE p.tenant_id = NEW.tenant_id AND p.id = v_party;
+    IF v_status = 'merged'
+       AND (v_new ->> 'is_active') IS DISTINCT FROM 'false'
+       AND NOT (v_new ? 'released_at' AND v_new ->> 'released_at' IS NOT NULL) THEN
+      RAISE EXCEPTION 'HK_PARTY_MERGED: party % is merged; a row that still points to it may only be retired', v_party
+        USING ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+  END IF;
+  SELECT p.status INTO v_status FROM parties.party p WHERE p.tenant_id = NEW.tenant_id AND p.id = v_party FOR KEY SHARE;
   IF v_status = 'merged' THEN
     RAISE EXCEPTION 'HK_PARTY_MERGED: party % is merged; use its successor', v_party USING ERRCODE = 'P0001';
   END IF;
@@ -868,18 +935,23 @@ CREATE TRIGGER trg_child_party_guard_rel BEFORE INSERT OR UPDATE ON parties.part
 -- نقش: سازگاری با محدودیت شرکت شخص و «مشتری عمومی»
 CREATE OR REPLACE FUNCTION parties.party_role_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE p parties.party;
+DECLARE p parties.party; v_agent_status text;
 BEGIN
-  SELECT * INTO p FROM parties.party x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.party_id;
+  -- FOR KEY SHARE: با FOR UPDATE تنگ کردن محدودهٔ شرکت (party_guard) و ادغام سریال می‌شود (RV-MD-14، RV-MD-05)
+  SELECT * INTO p FROM parties.party x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.party_id FOR KEY SHARE;
   IF p.company_id IS NOT NULL AND NEW.company_id IS NOT NULL AND NEW.company_id <> p.company_id THEN
     RAISE EXCEPTION 'HK_PARTY_ROLE_COMPANY_SCOPE: party % is restricted to another company', NEW.party_id USING ERRCODE = 'P0001';
   END IF;
   IF p.is_anonymous AND (NEW.role <> 'customer' OR NEW.credit_limit IS NOT NULL) THEN
     RAISE EXCEPTION 'HK_PARTY_ANONYMOUS_ROLE: anonymous party can only be a customer without credit' USING ERRCODE = 'P0001';
   END IF;
-  IF NEW.default_agent_party_id IS NOT NULL AND EXISTS (
-       SELECT 1 FROM parties.party a WHERE a.tenant_id = NEW.tenant_id AND a.id = NEW.default_agent_party_id AND a.status = 'merged') THEN
-    RAISE EXCEPTION 'HK_PARTY_MERGED: default agent % is merged', NEW.default_agent_party_id USING ERRCODE = 'P0001';
+  IF NEW.default_agent_party_id IS NOT NULL
+     AND (TG_OP = 'INSERT' OR NEW.default_agent_party_id IS DISTINCT FROM OLD.default_agent_party_id) THEN
+    SELECT a.status INTO v_agent_status FROM parties.party a
+     WHERE a.tenant_id = NEW.tenant_id AND a.id = NEW.default_agent_party_id FOR KEY SHARE;
+    IF v_agent_status = 'merged' THEN
+      RAISE EXCEPTION 'HK_PARTY_MERGED: default agent % is merged', NEW.default_agent_party_id USING ERRCODE = 'P0001';
+    END IF;
   END IF;
   RETURN NEW;
 END $$;
@@ -1021,7 +1093,7 @@ DECLARE
   w parties.party; l parties.party;
   v_merge_id uuid := uuidv7();
   v_moved jsonb := '{}'::jsonb;
-  n int;
+  n int; n2 int;
 BEGIN
   IF v_tenant IS NULL THEN
     RAISE EXCEPTION 'HK_TENANT_CONTEXT_MISSING: app.tenant_id is not set' USING ERRCODE = 'P0001';
@@ -1055,16 +1127,19 @@ BEGIN
     RAISE EXCEPTION 'HK_PARTY_MERGE_COMPANY_SCOPE: widen the winner''s company scope first' USING ERRCODE = 'P0001';
   END IF;
 
-  -- نقش‌ها: انتقال آن‌هایی که برنده برای همان (نقش، شرکت) ندارد؛ بقیه روی بازنده غیرفعال
-  WITH m AS (UPDATE parties.party_role r SET party_id = p_winner
+  -- نقش‌ها: انتقال آن‌هایی که برنده برای همان (نقش، شرکت) ندارد؛ بقیه روی بازنده غیرفعال. بازاریابِ ردیف منتقل‌شده اگر
+  -- خود برنده باشد پاک می‌شود (همان شخص دو بار ثبت شده بود؛ قید party_role_agent؛ RV-MD-21).
+  WITH m AS (UPDATE parties.party_role r SET party_id = p_winner,
+                    default_agent_party_id = CASE WHEN r.default_agent_party_id = p_winner THEN NULL ELSE r.default_agent_party_id END
               WHERE r.tenant_id = v_tenant AND r.party_id = p_loser
                 AND NOT EXISTS (SELECT 1 FROM parties.party_role x WHERE x.tenant_id = v_tenant AND x.party_id = p_winner
                                   AND x.role = r.role AND x.company_id IS NOT DISTINCT FROM r.company_id)
-              RETURNING 1) SELECT count(*) INTO n FROM m;
-  v_moved := v_moved || jsonb_build_object('party_role', n);
+              RETURNING (OLD.default_agent_party_id IS NOT DISTINCT FROM p_winner) AS agent_cleared)
+  SELECT count(*), count(*) FILTER (WHERE agent_cleared) INTO n, n2 FROM m;
+  v_moved := v_moved || jsonb_build_object('party_role', n, 'party_role_agent_cleared', n2);
   UPDATE parties.party_role SET is_active = false WHERE tenant_id = v_tenant AND party_id = p_loser AND is_active;
   WITH m AS (UPDATE parties.party_role SET default_agent_party_id = p_winner
-              WHERE tenant_id = v_tenant AND default_agent_party_id = p_loser AND party_id <> p_winner RETURNING 1)
+              WHERE tenant_id = v_tenant AND default_agent_party_id = p_loser AND party_id NOT IN (p_winner, p_loser) RETURNING 1)
   SELECT count(*) INTO n FROM m;
   v_moved := v_moved || jsonb_build_object('party_role_agent', n);
   UPDATE parties.party_role SET default_agent_party_id = NULL WHERE tenant_id = v_tenant AND default_agent_party_id = p_loser;
@@ -1116,14 +1191,19 @@ BEGIN
   v_moved := v_moved || jsonb_build_object('party_relation', n);
   DELETE FROM parties.party_relation WHERE tenant_id = v_tenant AND (party_id = p_loser OR related_party_id = p_loser);
 
-  -- توقیف‌های فعال: منتقل اگر برنده هم‌ارز ندارد؛ وگرنه آزاد با یادداشت
-  WITH m AS (UPDATE parties.party_hold h SET party_id = p_winner
+  -- توقیف‌های فعال (RV-MD-02): توقیف تغییرناپذیر است (فقط آزاد می‌شود)، پس «انتقال» = توقیف هم‌ارز تازه روی برنده با همان
+  -- دامنه، منبع، دلیل و زمان گذاشتن، و آزاد کردن توقیف بازنده با یادداشت. اگر برنده توقیف هم‌ارز فعال دارد فقط آزاد می‌شود.
+  -- هیچ توقیف فعالی گم نمی‌شود (INV-PTY-16) و سابقهٔ بازنده می‌ماند.
+  WITH m AS (INSERT INTO parties.party_hold (tenant_id, party_id, scope, source, reason, placed_by, placed_at)
+             SELECT h.tenant_id, p_winner, h.scope, h.source, h.reason, h.placed_by, h.placed_at
+               FROM parties.party_hold h
               WHERE h.tenant_id = v_tenant AND h.party_id = p_loser AND h.released_at IS NULL
                 AND NOT EXISTS (SELECT 1 FROM parties.party_hold x WHERE x.tenant_id = v_tenant AND x.party_id = p_winner
                                   AND x.scope = h.scope AND x.source = h.source AND x.released_at IS NULL)
-              RETURNING 1) SELECT count(*) INTO n FROM m;
+             RETURNING 1) SELECT count(*) INTO n FROM m;
   v_moved := v_moved || jsonb_build_object('party_hold', n);
-  UPDATE parties.party_hold SET released_at = now(), released_by = p_actor, release_note = 'آزاد در ادغام (هم‌ارز روی برنده)'
+  UPDATE parties.party_hold SET released_at = greatest(now(), placed_at), released_by = p_actor,
+         release_note = 'آزاد در ادغام؛ توقیف هم‌ارز روی جانشین ' || w.code
    WHERE tenant_id = v_tenant AND party_id = p_loser AND released_at IS NULL;
 
   -- کدهای قدیمی و کد خود بازنده
@@ -1136,15 +1216,19 @@ BEGIN
 
   DELETE FROM parties.duplicate_dismissal WHERE tenant_id = v_tenant AND (party_a_id = p_loser OR party_b_id = p_loser);
 
+  -- سابقهٔ ادغام پیش از تغییر وضعیت (پس‌شرط party_guard و قید deferred trg_party_merge_consistent)
+  SELECT count(*) INTO n FROM parties.party x WHERE x.tenant_id = v_tenant AND x.merged_into_id = p_loser AND x.id <> p_loser;
+  v_moved := v_moved || jsonb_build_object('path_compressed', n);
+  INSERT INTO parties.party_merge (tenant_id, id, winner_party_id, loser_party_id, reason, merged_by,
+                                   loser_snapshot, winner_before, moved, participants)
+  VALUES (v_tenant, v_merge_id, p_winner, p_loser, btrim(p_reason), p_actor,
+          to_jsonb(l), to_jsonb(w), v_moved, coalesce(p_participants, '[]'::jsonb));
+
   -- وضعیت بازنده و فشرده‌سازی مسیر
-  PERFORM set_config('hk.parties_merge', p_loser::text, true);
   UPDATE parties.party SET status = 'merged', merged_into_id = p_winner, merged_at = now()
    WHERE tenant_id = v_tenant AND id = p_loser;
-  PERFORM set_config('hk.parties_merge', '', true);
-  WITH m AS (UPDATE parties.party SET merged_into_id = p_winner
-              WHERE tenant_id = v_tenant AND merged_into_id = p_loser AND id <> p_loser RETURNING 1)
-  SELECT count(*) INTO n FROM m;
-  v_moved := v_moved || jsonb_build_object('path_compressed', n);
+  UPDATE parties.party SET merged_into_id = p_winner
+   WHERE tenant_id = v_tenant AND merged_into_id = p_loser AND id <> p_loser;
 
   -- برنده شناسه‌های خالی خود را از بازنده می‌گیرد
   UPDATE parties.party SET
@@ -1159,24 +1243,69 @@ BEGIN
       registration_no             = CASE WHEN person_type = l.person_type THEN coalesce(registration_no, l.registration_no) ELSE registration_no END
    WHERE tenant_id = v_tenant AND id = p_winner;
 
-  INSERT INTO parties.party_merge (tenant_id, id, winner_party_id, loser_party_id, reason, merged_by,
-                                   loser_snapshot, winner_before, moved, participants)
-  VALUES (v_tenant, v_merge_id, p_winner, p_loser, btrim(p_reason), p_actor,
-          to_jsonb(l), to_jsonb(w), v_moved, coalesce(p_participants, '[]'::jsonb));
   RETURN v_merge_id;
 END $$;
+
+-- هر ردیف party_merge در پایان تراکنش به یک ادغام واقعی اشاره می‌کند: بازنده merged است و جانشینش جانشینِ برنده است
+-- (INV-PTY-17 دوسویه؛ ردیف سابقهٔ «ساختگی» بدون ادغام رد می‌شود).
+CREATE OR REPLACE FUNCTION parties.party_merge_consistent() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (
+       SELECT 1 FROM parties.party l JOIN parties.party w ON w.tenant_id = l.tenant_id AND w.id = NEW.winner_party_id
+        WHERE l.tenant_id = NEW.tenant_id AND l.id = NEW.loser_party_id
+          AND l.status = 'merged' AND l.merged_into_id = coalesce(w.merged_into_id, w.id)) THEN
+    RAISE EXCEPTION 'HK_PARTY_MERGE_RECORD_ORPHAN: merge record % does not describe a completed merge of % into %',
+      NEW.id, NEW.loser_party_id, NEW.winner_party_id USING ERRCODE = 'P0001';
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_party_merge_consistent ON parties.party_merge;
+CREATE CONSTRAINT TRIGGER trg_party_merge_consistent AFTER INSERT ON parties.party_merge
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION parties.party_merge_consistent();
 
 -- =====================================================================
 -- ۷. parties — توابع پرس‌وجو و ویوها
 -- =====================================================================
--- نامزدهای تکراری (مرحلهٔ blocking؛ امتیازدهی نهایی در پایتون)
+-- نامزدهای تکراری (مرحلهٔ blocking؛ امتیازدهی نهایی در پایتون). RV-MD-12: نامزدها فقط از شاخه‌های ایندکس‌دار می‌آیند —
+-- شناسهٔ ملی، شمارهٔ اقتصادی، موبایل و شبا (برابری روی ایندکس)، و برای نام نزدیک‌ترین k شخص با جست‌وجوی KNN
+-- (ORDER BY name_key <-> … LIMIT k) روی ایندکس GiST (tenant_id, name_key)، با k = max(5 × p_limit, 50). دلیل‌ها و شباهت
+-- فقط روی همین مجموعهٔ کوچک حساب می‌شوند؛ هزینه با تعداد اشخاص مستأجر رشد خطی ندارد.
 CREATE OR REPLACE FUNCTION parties.find_duplicate_candidates(p_party_id uuid, p_min_similarity real DEFAULT 0.5, p_limit int DEFAULT 20)
 RETURNS TABLE (candidate_id uuid, reasons text[], name_similarity real)
-LANGUAGE sql STABLE AS $$
-  WITH me AS (SELECT * FROM parties.party WHERE id = p_party_id),
-  my_mobiles AS (SELECT c.value FROM parties.party_contact c, me WHERE c.tenant_id = me.tenant_id AND c.party_id = me.id AND c.kind = 'mobile'),
-  my_shebas AS (SELECT b.sheba FROM parties.party_bank_account b, me WHERE b.tenant_id = me.tenant_id AND b.party_id = me.id AND b.sheba IS NOT NULL),
-  cand AS (
+LANGUAGE plpgsql STABLE
+AS $$
+DECLARE me parties.party; v_k int;
+BEGIN
+  IF p_min_similarity IS NULL OR p_min_similarity < 0.1 OR p_min_similarity > 1 OR p_limit IS NULL OR p_limit < 1 THEN
+    RAISE EXCEPTION 'HK_PARTY_DUPLICATE_ARGS: similarity must be in [0.1, 1] and limit >= 1' USING ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO me FROM parties.party x WHERE x.id = p_party_id;
+  IF NOT FOUND THEN RETURN; END IF;
+  v_k := greatest(5 * p_limit, 50);
+  RETURN QUERY
+  WITH my_mobiles AS (
+    SELECT c.value FROM parties.party_contact c WHERE c.tenant_id = me.tenant_id AND c.party_id = me.id AND c.kind = 'mobile'
+  ), my_shebas AS (
+    SELECT b.sheba FROM parties.party_bank_account b WHERE b.tenant_id = me.tenant_id AND b.party_id = me.id AND b.sheba IS NOT NULL
+  ), cand_ids AS (
+    SELECT c.id FROM parties.party c
+     WHERE me.national_id IS NOT NULL AND c.tenant_id = me.tenant_id AND c.national_id = me.national_id AND c.status <> 'merged'
+    UNION
+    SELECT c.id FROM parties.party c
+     WHERE me.economic_code IS NOT NULL AND c.tenant_id = me.tenant_id AND c.economic_code = me.economic_code
+    UNION
+    SELECT x.party_id FROM parties.party_contact x
+     WHERE x.tenant_id = me.tenant_id AND x.kind = 'mobile' AND x.value IN (SELECT value FROM my_mobiles)
+    UNION
+    SELECT x.party_id FROM parties.party_bank_account x
+     WHERE x.tenant_id = me.tenant_id AND x.sheba IN (SELECT sheba FROM my_shebas)
+    UNION
+    (SELECT c.id FROM parties.party c
+      WHERE me.name_key IS NOT NULL AND c.tenant_id = me.tenant_id AND c.id <> me.id AND c.status <> 'merged' AND NOT c.is_anonymous
+      ORDER BY c.name_key <-> me.name_key
+      LIMIT v_k)
+  ), cand AS (
     SELECT c.id,
            array_remove(ARRAY[
              CASE WHEN c.national_id IS NOT NULL AND c.national_id = me.national_id THEN 'national_id' END,
@@ -1188,25 +1317,36 @@ LANGUAGE sql STABLE AS $$
              CASE WHEN similarity(coalesce(c.name_key, ''), coalesce(me.name_key, '')) >= p_min_similarity THEN 'name' END
            ], NULL) AS reasons,
            similarity(coalesce(c.name_key, ''), coalesce(me.name_key, '')) AS sim
-      FROM parties.party c, me
-     WHERE c.tenant_id = me.tenant_id AND c.id <> me.id AND c.status <> 'merged' AND NOT c.is_anonymous
+      FROM cand_ids k
+      JOIN parties.party c ON c.tenant_id = me.tenant_id AND c.id = k.id
+     WHERE c.id <> me.id AND c.status <> 'merged' AND NOT c.is_anonymous
        AND NOT EXISTS (SELECT 1 FROM parties.duplicate_dismissal d WHERE d.tenant_id = c.tenant_id
                          AND d.party_a_id = least(c.id, me.id) AND d.party_b_id = greatest(c.id, me.id)))
-  SELECT id, reasons, sim FROM cand
-   WHERE cardinality(reasons) > 0
-   ORDER BY (reasons && ARRAY['national_id','economic_code','sheba']) DESC, sim DESC, id
-   LIMIT p_limit
-$$;
+  SELECT cand.id, cand.reasons, cand.sim FROM cand
+   WHERE cardinality(cand.reasons) > 0
+   ORDER BY (cand.reasons && ARRAY['national_id','economic_code','sheba']) DESC, cand.sim DESC, cand.id
+   LIMIT p_limit;
+END $$;
 
--- تنظیمات مؤثر نقش برای یک شرکت: ردیف شرکت‌محور، وگرنه ردیف پیش‌فرض (company_id NULL)
+-- تنظیمات مؤثر نقش برای یک شرکت: ردیف شرکت‌محور، وگرنه ردیف پیش‌فرض (company_id NULL). در ردیف شرکت، ستون‌های
+-- «انتسابی» خالی (group_id، payment_term_id، default_agent_party_id) از ردیف پیش‌فرض ارث می‌برند (RV-MD-03)؛ سیاست
+-- اعتبار (سقف، ارز، کنترل، شمول چک) یک واحد است و ردیف شرکت آن را کامل بازنویسی می‌کند.
 CREATE OR REPLACE FUNCTION parties.role_settings(p_party_id uuid, p_role text, p_company_id uuid)
 RETURNS SETOF parties.party_role
 LANGUAGE sql STABLE AS $$
-  SELECT r.* FROM parties.party_role r
-   WHERE r.party_id = p_party_id AND r.role = p_role AND r.is_active
-     AND (r.company_id = p_company_id OR r.company_id IS NULL)
-   ORDER BY (r.company_id IS NULL), r.id
-   LIMIT 1
+  WITH d AS (SELECT r.* FROM parties.party_role r
+              WHERE r.party_id = p_party_id AND r.role = p_role AND r.is_active AND r.company_id IS NULL),
+       c AS (SELECT r.* FROM parties.party_role r
+              WHERE r.party_id = p_party_id AND r.role = p_role AND r.is_active
+                AND p_company_id IS NOT NULL AND r.company_id = p_company_id)
+  SELECT c.tenant_id, c.id, c.party_id, c.role, c.company_id,
+         coalesce(c.group_id, d.group_id), c.is_active, c.credit_limit, c.credit_currency, c.credit_control,
+         c.credit_includes_uncleared_cheques, coalesce(c.payment_term_id, d.payment_term_id),
+         coalesce(c.default_agent_party_id, d.default_agent_party_id), coalesce(c.bank_code, d.bank_code),
+         c.created_at, c.updated_at, c.row_version
+    FROM c LEFT JOIN d ON true
+  UNION ALL
+  SELECT d.* FROM d WHERE NOT EXISTS (SELECT 1 FROM c)
 $$;
 
 CREATE OR REPLACE VIEW parties.v_party_canonical WITH (security_invoker = true) AS
@@ -1220,9 +1360,12 @@ CREATE OR REPLACE VIEW parties.v_party_ledger_identity WITH (security_invoker = 
          coalesce(p.merged_into_id, p.id) AS canonical_party_id
     FROM parties.party p;
 
--- ویژگی‌های شرط قاعدهٔ نگاشت حساب (ledger.posting_rule.conditions) برای یک (شخص، نقش، شرکت):
--- {"<role>_group": کد گروه مؤثر, "party_person_type": نوع شخص}. شخص ادغام‌شده به جانشین ترجمه می‌شود.
--- گروه مؤثر: گروه ردیف نقش شرکت‌محور > ردیف پیش‌فرض > گروه پیش‌فرض فعال همان نقش > هیچ (کلید حذف می‌شود).
+-- ویژگی‌های شرط قاعدهٔ نگاشت حساب (ledger.posting_rule.conditions) برای یک (شخص، نقش، شرکت)، با همان کلیدهای
+-- «attr:» که PostingRequest.attributes و ledger.valid_conditions می‌پذیرند (RV-MD-19):
+-- {"attr:<role>_group": کد گروه مؤثر, "attr:party_role": نقش, "attr:party_person_type": نوع شخص}. شخص ادغام‌شده به جانشین
+-- ترجمه می‌شود. گروه مؤثر فیلدبه‌فیلد (RV-MD-03): group_id ردیف نقشِ همان شرکت، وگرنه group_id ردیف پیش‌فرض
+-- (company_id NULL)، وگرنه گروه پیش‌فرض فعال همان نقش، وگرنه کلید حذف می‌شود. ردیف شرکتی که فقط سقف اعتبار را
+-- بازنویسی کرده (group_id NULL) گروه ردیف پیش‌فرض را می‌گیرد.
 CREATE OR REPLACE FUNCTION parties.posting_attributes(p_party_id uuid, p_role text, p_company_id uuid) RETURNS jsonb
 LANGUAGE plpgsql STABLE AS $$
 DECLARE p parties.party; v_group_id uuid; v_group text;
@@ -1235,14 +1378,23 @@ BEGIN
   IF p.status = 'merged' THEN
     SELECT * INTO p FROM parties.party x WHERE x.tenant_id = p.tenant_id AND x.id = p.merged_into_id;
   END IF;
-  SELECT r.group_id INTO v_group_id FROM parties.role_settings(p.id, p_role, p_company_id) r;
+  SELECT coalesce(
+           (SELECT r.group_id FROM parties.party_role r
+             WHERE r.tenant_id = p.tenant_id AND r.party_id = p.id AND r.role = p_role AND r.is_active
+               AND p_company_id IS NOT NULL AND r.company_id = p_company_id),
+           (SELECT r.group_id FROM parties.party_role r
+             WHERE r.tenant_id = p.tenant_id AND r.party_id = p.id AND r.role = p_role AND r.is_active
+               AND r.company_id IS NULL))
+    INTO v_group_id;
   IF v_group_id IS NOT NULL THEN
     SELECT g.code INTO v_group FROM parties.party_group g WHERE g.tenant_id = p.tenant_id AND g.id = v_group_id;
   ELSE
     SELECT g.code INTO v_group FROM parties.party_group g
      WHERE g.tenant_id = p.tenant_id AND g.role = p_role AND g.is_default AND g.is_active;
   END IF;
-  RETURN jsonb_strip_nulls(jsonb_build_object(p_role || '_group', v_group, 'party_person_type', p.person_type));
+  RETURN jsonb_strip_nulls(jsonb_build_object('attr:' || p_role || '_group', v_group,
+                                              'attr:party_role', p_role,
+                                              'attr:party_person_type', p.person_type));
 END $$;
 
 -- تخصیص کد نمایشی شخص از سری مناسب (قفل ردیف سری؛ کدهای دستی موجود رد می‌شوند)
@@ -1572,7 +1724,9 @@ CREATE TABLE IF NOT EXISTS catalog.item_variant (
   CONSTRAINT variant_sstid_pair CHECK ((sstid IS NULL) = (sstid_kind IS NULL))
 );
 SELECT core.enable_tenant_rls('catalog.item_variant');
-CREATE UNIQUE INDEX IF NOT EXISTS item_variant_one_default ON catalog.item_variant (tenant_id, item_id) WHERE is_default;
+-- «یک variant پیش‌فرض» ایندکس جدا ندارد: variant_default_no_axes پیش‌فرض را بی‌محور می‌کند و یکتای NULLS NOT DISTINCT
+-- ترکیب محورها دومی را رد می‌کند (ایندکس پیشین item_variant_one_default دسترس‌ناپذیر بود؛ RV-MD-07).
+DROP INDEX IF EXISTS catalog.item_variant_one_default;
 CREATE UNIQUE INDEX IF NOT EXISTS item_variant_plu ON catalog.item_variant (tenant_id, plu_code) WHERE plu_code IS NOT NULL;
 
 -- واحدهای مجاز هر کالا: ۱ واحد = factor × واحد پایه. ردیف پایه (factor = 1) همیشه هست.
@@ -1867,7 +2021,7 @@ CREATE TABLE IF NOT EXISTS catalog.item_legacy_code (
   source_scope      text NOT NULL DEFAULT '' CHECK (char_length(source_scope) <= 100),
   legacy_code       text NOT NULL CHECK (legacy_code = core.fa_normalize_ident(legacy_code) AND char_length(legacy_code) BETWEEN 1 AND 100),
   legacy_name       text,
-  migration_run_id  uuid,
+  migration_job_id  uuid,                 -- ارجاع نرم به migration.job (08:CR-MG09)
   created_at        timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
@@ -2015,10 +2169,29 @@ DROP TRIGGER IF EXISTS trg_axis_guard ON catalog.attribute_set_member;
 CREATE TRIGGER trg_axis_guard BEFORE INSERT OR UPDATE ON catalog.attribute_set_member
   FOR EACH ROW EXECUTE FUNCTION catalog.attribute_axis_guard();
 
--- کالا: محورها، قفل پس از استفاده
+-- کالا: محورها، قفل پس از استفاده. پس از قفل (D-M18، INV-CAT-06): واحد پایه، نوع، سریال، بچ و انقضا (RV-MD-18)، و
+-- محورهای موجود ثابت‌اند و کالا حذف نمی‌شود (RV-MD-15؛ تریگر آبشاری فرزندان قفل را نمی‌بیند چون والد رفته است).
+-- عمر قفسه (shelf_life_days) فقط پیش‌فرض بچ تازه است و چون به track_expiry بسته است، روشن کردن انقضا پس از قفل ممکن نیست.
+-- شرکت گارانتی ادغام‌شده هنگام درج یا تغییر ستون رد می‌شود (INV-PTY-14)؛ ارجاع کهنه را مشترک catalog.party_merge جابه‌جا می‌کند.
 CREATE OR REPLACE FUNCTION catalog.item_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE v_status text;
 BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.usage_locked_at IS NOT NULL THEN
+      RAISE EXCEPTION 'HK_CATALOG_ITEM_LOCKED: item % is in use and cannot be deleted (deactivate it)', OLD.id USING ERRCODE = 'P0001';
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF NEW.warranty_provider_party_id IS NOT NULL
+     AND (TG_OP = 'INSERT' OR NEW.warranty_provider_party_id IS DISTINCT FROM OLD.warranty_provider_party_id) THEN
+    SELECT p.status INTO v_status FROM parties.party p
+     WHERE p.tenant_id = NEW.tenant_id AND p.id = NEW.warranty_provider_party_id FOR KEY SHARE;
+    IF v_status = 'merged' THEN
+      RAISE EXCEPTION 'HK_PARTY_MERGED: warranty provider % is merged; use its successor', NEW.warranty_provider_party_id
+        USING ERRCODE = 'P0001';
+    END IF;
+  END IF;
   IF TG_OP = 'INSERT' THEN
     IF NEW.usage_locked_at IS NOT NULL THEN
       RAISE EXCEPTION 'HK_CATALOG_ITEM_LOCK_ON_INSERT: usage lock is set by CatalogService.mark_used only' USING ERRCODE = 'P0001';
@@ -2031,19 +2204,19 @@ BEGIN
   IF OLD.usage_locked_at IS NOT NULL THEN
     IF NEW.usage_locked_at IS DISTINCT FROM OLD.usage_locked_at
        OR NEW.base_uom_id <> OLD.base_uom_id OR NEW.item_type <> OLD.item_type
-       OR NEW.track_serial <> OLD.track_serial OR NEW.track_batch <> OLD.track_batch
+       OR NEW.track_serial <> OLD.track_serial OR NEW.track_batch <> OLD.track_batch OR NEW.track_expiry <> OLD.track_expiry
        OR (OLD.has_variants AND NOT NEW.has_variants)
        OR (OLD.variant_axis1_id IS NOT NULL AND NEW.variant_axis1_id IS DISTINCT FROM OLD.variant_axis1_id)
        OR (OLD.variant_axis2_id IS NOT NULL AND NEW.variant_axis2_id IS DISTINCT FROM OLD.variant_axis2_id)
        OR (OLD.variant_axis3_id IS NOT NULL AND NEW.variant_axis3_id IS DISTINCT FROM OLD.variant_axis3_id) THEN
-      RAISE EXCEPTION 'HK_CATALOG_ITEM_LOCKED: item % is in use; base unit, type, tracking and existing axes are frozen', OLD.id
+      RAISE EXCEPTION 'HK_CATALOG_ITEM_LOCKED: item % is in use; base unit, type, tracking (serial/batch/expiry) and existing axes are frozen', OLD.id
         USING ERRCODE = 'P0001';
     END IF;
   END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_item_guard ON catalog.item;
-CREATE TRIGGER trg_item_guard BEFORE INSERT OR UPDATE ON catalog.item
+CREATE TRIGGER trg_item_guard BEFORE INSERT OR UPDATE OR DELETE ON catalog.item
   FOR EACH ROW EXECUTE FUNCTION catalog.item_guard();
 DROP TRIGGER IF EXISTS trg_item_axis_guard ON catalog.item;
 CREATE TRIGGER trg_item_axis_guard BEFORE INSERT OR UPDATE OF variant_axis1_id, variant_axis2_id, variant_axis3_id ON catalog.item
@@ -2174,7 +2347,15 @@ DROP TRIGGER IF EXISTS trg_item_attribute_value_guard ON catalog.item_attribute_
 CREATE TRIGGER trg_item_attribute_value_guard BEFORE INSERT OR UPDATE ON catalog.item_attribute_value
   FOR EACH ROW EXECUTE FUNCTION catalog.item_attribute_value_guard();
 
--- بارکد: تداخل با پیشوند الگوی ترازوی فعال ممنوع؛ هویت تغییرناپذیر
+-- بارکد: تداخل با پیشوند الگوی ترازوی فعال ممنوع؛ هویت تغییرناپذیر.
+-- INV-CAT-10 دوسویه است و هر طرف جدول دیگر را می‌خواند؛ پس هر دو تریگر پیش از سنجش قفل مشورتی تراکنشیِ همان
+-- (مستأجر، پیشوند دورقمی) را می‌گیرند تا درج بارکد و فعال‌سازی الگوی هم‌زمان سریال شوند (RV-MD-17؛ READ COMMITTED:
+-- پرس‌وجوی پس از قفل snapshot تازه دارد و ردیف commitشدهٔ طرف دیگر را می‌بیند).
+CREATE OR REPLACE FUNCTION catalog.scale_prefix_lock(p_tenant uuid, p_prefix text) RETURNS void
+LANGUAGE sql VOLATILE AS $$
+  SELECT pg_advisory_xact_lock(hashtextextended('catalog.scale_prefix:' || p_tenant::text || ':' || p_prefix, 0))
+$$;
+
 CREATE OR REPLACE FUNCTION catalog.barcode_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -2182,10 +2363,12 @@ BEGIN
                            OR NEW.uom_id <> OLD.uom_id OR NEW.symbology <> OLD.symbology OR NEW.source <> OLD.source) THEN
     RAISE EXCEPTION 'HK_CATALOG_BARCODE_IMMUTABLE: delete and re-add the barcode instead' USING ERRCODE = 'P0001';
   END IF;
-  IF NEW.code ~ '^[0-9]{13}$' AND EXISTS (
-       SELECT 1 FROM catalog.scale_barcode_pattern s
-        WHERE s.tenant_id = NEW.tenant_id AND s.is_active AND left(NEW.code, 2) = s.prefix) THEN
-    RAISE EXCEPTION 'HK_CATALOG_BARCODE_SCALE_PREFIX: % collides with an active scale barcode prefix', NEW.code USING ERRCODE = 'P0001';
+  IF TG_OP = 'INSERT' AND NEW.code ~ '^[0-9]{13}$' THEN
+    PERFORM catalog.scale_prefix_lock(NEW.tenant_id, left(NEW.code, 2));
+    IF EXISTS (SELECT 1 FROM catalog.scale_barcode_pattern s
+                WHERE s.tenant_id = NEW.tenant_id AND s.is_active AND left(NEW.code, 2) = s.prefix) THEN
+      RAISE EXCEPTION 'HK_CATALOG_BARCODE_SCALE_PREFIX: % collides with an active scale barcode prefix', NEW.code USING ERRCODE = 'P0001';
+    END IF;
   END IF;
   RETURN NEW;
 END $$;
@@ -2197,7 +2380,8 @@ CREATE OR REPLACE FUNCTION catalog.scale_pattern_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE v_n int;
 BEGIN
-  IF NEW.is_active THEN
+  IF NEW.is_active AND (TG_OP = 'INSERT' OR NOT OLD.is_active OR NEW.prefix <> OLD.prefix) THEN
+    PERFORM catalog.scale_prefix_lock(NEW.tenant_id, NEW.prefix);
     SELECT count(*) INTO v_n FROM catalog.barcode b
      WHERE b.tenant_id = NEW.tenant_id AND b.code ~ '^[0-9]{13}$' AND left(b.code, 2) = NEW.prefix;
     IF v_n > 0 THEN
@@ -2214,42 +2398,110 @@ DROP TRIGGER IF EXISTS trg_scale_pattern_guard ON catalog.scale_barcode_pattern;
 CREATE TRIGGER trg_scale_pattern_guard BEFORE INSERT OR UPDATE ON catalog.scale_barcode_pattern
   FOR EACH ROW EXECUTE FUNCTION catalog.scale_pattern_guard();
 
--- فهرست قیمت: پایه هم‌نوع و هم‌ارز؛ بدون چرخه؛ عمق ≤ ۳
+-- فهرست قیمت: پایه هم‌نوع و هم‌ارز؛ بدون چرخه؛ عمق ≤ ۳ (INV-CAT-14).
+-- RV-MD-04: «قاعدهٔ» فهرست (نوع، ارز، دقت، شمول مالیات، پایه، درصد و گرد کردن، و آغاز اعتبار) قیمتِ هر روز گذشته را
+-- تعیین می‌کند. پس وقتی «خانوادهٔ» فهرست — خودش، نیاکان پایه‌اش و فهرست‌های مشتق از آن — ردیفی با اثر آغازشده
+-- (valid_from < امروزِ مستأجر) دارد، قاعده منجمد است (HK_CATALOG_PRICE_LIST_RULE_FROZEN) و تغییر = فهرست تازه.
+-- پایان اعتبار فهرست فقط ≥ دیروز. مستقل از تاریخچه: فرزند مشتق و انتساب‌ها باید با نوع/ارز تازه سازگار بمانند و
+-- ردیف‌های موجود در دقت تازه بگنجند.
+CREATE OR REPLACE FUNCTION catalog.price_list_family_has_history(p_tenant uuid, p_list uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  WITH RECURSIVE up(id, depth) AS (
+    SELECT p_list, 0
+    UNION
+    SELECT l.base_price_list_id, up.depth + 1 FROM up JOIN catalog.price_list l ON l.tenant_id = p_tenant AND l.id = up.id
+     WHERE l.base_price_list_id IS NOT NULL AND up.depth < 4),
+  down(id, depth) AS (
+    SELECT p_list, 0
+    UNION
+    SELECT l.id, down.depth + 1 FROM down JOIN catalog.price_list l ON l.tenant_id = p_tenant AND l.base_price_list_id = down.id
+     WHERE down.depth < 4)
+  SELECT EXISTS (
+    SELECT 1 FROM catalog.price_list_item e
+     WHERE e.tenant_id = p_tenant AND e.valid_from < catalog.tenant_today(p_tenant)
+       AND e.price_list_id IN (SELECT id FROM up UNION SELECT id FROM down))
+$$;
+
 CREATE OR REPLACE FUNCTION catalog.price_list_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE b catalog.price_list; v_cur uuid := NEW.base_price_list_id; v_depth int := 0;
+DECLARE b catalog.price_list; v_cur uuid := NEW.base_price_list_id; v_depth int := 0; v_today date; v_n int;
 BEGIN
-  IF NEW.base_price_list_id IS NULL THEN RETURN NEW; END IF;
-  SELECT * INTO b FROM catalog.price_list x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.base_price_list_id;
-  IF b.kind <> NEW.kind OR b.currency <> NEW.currency THEN
-    RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_BASE_MISMATCH: base list must have the same kind and currency' USING ERRCODE = 'P0001';
+  IF NEW.base_price_list_id IS NOT NULL THEN
+    SELECT * INTO b FROM catalog.price_list x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.base_price_list_id;
+    IF b.kind <> NEW.kind OR b.currency <> NEW.currency THEN
+      RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_BASE_MISMATCH: base list must have the same kind and currency' USING ERRCODE = 'P0001';
+    END IF;
+    WHILE v_cur IS NOT NULL LOOP
+      IF v_cur = NEW.id THEN
+        RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_CYCLE: derived price lists form a cycle' USING ERRCODE = 'P0001';
+      END IF;
+      v_depth := v_depth + 1;
+      IF v_depth > 3 THEN
+        RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_TOO_DEEP: derivation depth exceeds 3' USING ERRCODE = 'P0001';
+      END IF;
+      SELECT x.base_price_list_id INTO v_cur FROM catalog.price_list x WHERE x.tenant_id = NEW.tenant_id AND x.id = v_cur;
+    END LOOP;
   END IF;
-  WHILE v_cur IS NOT NULL LOOP
-    IF v_cur = NEW.id THEN
-      RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_CYCLE: derived price lists form a cycle' USING ERRCODE = 'P0001';
+  IF TG_OP = 'INSERT' THEN RETURN NEW; END IF;
+  IF NEW.tenant_id <> OLD.tenant_id OR NEW.id <> OLD.id THEN
+    RAISE EXCEPTION 'HK_CATALOG_IMMUTABLE_FIELD: tenant_id/id are immutable' USING ERRCODE = 'P0001';
+  END IF;
+  -- سازگاری فرزندان مشتق و انتساب‌ها با نوع/ارز تازه
+  IF (NEW.kind <> OLD.kind OR NEW.currency <> OLD.currency) AND EXISTS (
+       SELECT 1 FROM catalog.price_list d WHERE d.tenant_id = NEW.tenant_id AND d.base_price_list_id = NEW.id
+          AND (d.kind <> NEW.kind OR d.currency <> NEW.currency)) THEN
+    RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_BASE_MISMATCH: lists derived from % would no longer share its kind and currency', NEW.code
+      USING ERRCODE = 'P0001';
+  END IF;
+  IF NEW.kind <> OLD.kind AND EXISTS (
+       SELECT 1 FROM catalog.price_list_assignment a JOIN parties.party_group g ON g.tenant_id = a.tenant_id AND g.id = a.party_group_id
+        WHERE a.tenant_id = NEW.tenant_id AND a.price_list_id = NEW.id
+          AND g.role <> CASE NEW.kind WHEN 'sales' THEN 'customer' ELSE 'supplier' END) THEN
+    RAISE EXCEPTION 'HK_CATALOG_ASSIGNMENT_GROUP_ROLE: % list would stay assigned to a party group of another role', NEW.kind
+      USING ERRCODE = 'P0001';
+  END IF;
+  IF NEW.price_precision < OLD.price_precision THEN
+    SELECT count(*) INTO v_n FROM catalog.price_list_item e
+     WHERE e.tenant_id = NEW.tenant_id AND e.price_list_id = NEW.id AND e.price <> round(e.price, NEW.price_precision);
+    IF v_n > 0 THEN
+      RAISE EXCEPTION 'HK_CATALOG_PRICE_PRECISION: % entr(y/ies) of list % exceed the new precision %', v_n, NEW.code, NEW.price_precision
+        USING ERRCODE = 'P0001';
     END IF;
-    v_depth := v_depth + 1;
-    IF v_depth > 3 THEN
-      RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_TOO_DEEP: derivation depth exceeds 3' USING ERRCODE = 'P0001';
+  END IF;
+  -- انجماد قاعده پس از آغاز اثر
+  IF (NEW.kind, NEW.currency, NEW.price_precision, NEW.prices_include_tax, NEW.base_price_list_id, NEW.base_adjust_percent,
+      NEW.rounding_increment, NEW.rounding_mode, NEW.valid_from)
+     IS DISTINCT FROM
+     (OLD.kind, OLD.currency, OLD.price_precision, OLD.prices_include_tax, OLD.base_price_list_id, OLD.base_adjust_percent,
+      OLD.rounding_increment, OLD.rounding_mode, OLD.valid_from)
+     AND catalog.price_list_family_has_history(NEW.tenant_id, NEW.id) THEN
+    RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_RULE_FROZEN: list % (or a list it derives from / feeds) already has effective prices; create a new list instead', NEW.code
+      USING ERRCODE = 'P0001';
+  END IF;
+  IF NEW.valid_to IS DISTINCT FROM OLD.valid_to AND NEW.valid_to IS NOT NULL THEN
+    v_today := catalog.tenant_today(NEW.tenant_id);
+    IF NEW.valid_to < v_today - 1 AND catalog.price_list_family_has_history(NEW.tenant_id, NEW.id) THEN
+      RAISE EXCEPTION 'HK_CATALOG_PRICE_LIST_RULE_FROZEN: list % can only be closed from yesterday on', NEW.code USING ERRCODE = 'P0001';
     END IF;
-    SELECT x.base_price_list_id INTO v_cur FROM catalog.price_list x WHERE x.tenant_id = NEW.tenant_id AND x.id = v_cur;
-  END LOOP;
+  END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_price_list_guard ON catalog.price_list;
 CREATE TRIGGER trg_price_list_guard BEFORE INSERT OR UPDATE ON catalog.price_list
   FOR EACH ROW EXECUTE FUNCTION catalog.price_list_guard();
 
--- سطر قیمت: دقت مبلغ؛ اثر روی روزهای گذشته تغییرناپذیر (جز با پرچم پس‌تاریخ در UoW مهاجرت)
+-- سطر قیمت: دقت مبلغ؛ اثر روی روزهای گذشته تغییرناپذیر (INV-CAT-13).
+-- پرچم پس‌تاریخ (hk.catalog_allow_backdate، فقط UoW مهاجرت با مجوز catalog.price.backdate) فقط «درج» سطر تاریخچه را
+-- مجاز می‌کند (RV-MD-11): ویرایش یا حذف سطری که اثرش آغاز شده با هیچ پرچمی ممکن نیست، و سطر آینده هم با ویرایش به گذشته
+-- نمی‌رود. درج پس‌تاریخ با EXCLUDE فقط شکاف تاریخچه را پر می‌کند و در ممیزی core ثبت می‌شود.
 CREATE OR REPLACE FUNCTION catalog.price_list_item_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_prec smallint; v_today date; v_backdate boolean := coalesce(current_setting('hk.catalog_allow_backdate', true), '') = 'on';
-        r record;
+DECLARE v_prec smallint; v_today date; r record;
 BEGIN
   r := CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
   v_today := catalog.tenant_today(r.tenant_id);
   IF TG_OP = 'DELETE' THEN
-    IF OLD.valid_from < v_today AND NOT v_backdate THEN
+    IF OLD.valid_from < v_today THEN
       RAISE EXCEPTION 'HK_CATALOG_PRICE_PAST_IMMUTABLE: an entry already effective cannot be deleted (close it instead)' USING ERRCODE = 'P0001';
     END IF;
     RETURN OLD;
@@ -2259,7 +2511,7 @@ BEGIN
     RAISE EXCEPTION 'HK_CATALOG_PRICE_PRECISION: price % exceeds list precision %', NEW.price, v_prec USING ERRCODE = 'P0001';
   END IF;
   IF TG_OP = 'INSERT' THEN
-    IF NEW.valid_from < v_today AND NOT v_backdate THEN
+    IF NEW.valid_from < v_today AND coalesce(current_setting('hk.catalog_allow_backdate', true), '') <> 'on' THEN
       RAISE EXCEPTION 'HK_CATALOG_PRICE_BACKDATED: valid_from % is before today %', NEW.valid_from, v_today USING ERRCODE = 'P0001';
     END IF;
     RETURN NEW;
@@ -2269,8 +2521,8 @@ BEGIN
      OR NEW.uom_id <> OLD.uom_id OR NEW.min_qty <> OLD.min_qty THEN
     RAISE EXCEPTION 'HK_CATALOG_PRICE_IDENTITY_IMMUTABLE: add a new entry instead' USING ERRCODE = 'P0001';
   END IF;
-  IF v_backdate OR OLD.valid_from >= v_today THEN
-    IF NEW.valid_from < v_today AND NOT v_backdate THEN
+  IF OLD.valid_from >= v_today THEN
+    IF NEW.valid_from < v_today THEN
       RAISE EXCEPTION 'HK_CATALOG_PRICE_BACKDATED: valid_from % is before today %', NEW.valid_from, v_today USING ERRCODE = 'P0001';
     END IF;
     RETURN NEW;
@@ -2288,6 +2540,29 @@ DROP TRIGGER IF EXISTS trg_price_list_item_guard ON catalog.price_list_item;
 CREATE TRIGGER trg_price_list_item_guard BEFORE INSERT OR UPDATE OR DELETE ON catalog.price_list_item
   FOR EACH ROW EXECUTE FUNCTION catalog.price_list_item_guard();
 
+-- ارجاع catalog به شخص (INV-PTY-14 و RV-MD-05/09): درج یا تغییر ستون شخص ← شخص ادغام‌شده رد می‌شود (خواندن با
+-- FOR KEY SHARE، سریال با ادغام). ردیف کهنه‌ای که هنوز به بازنده اشاره دارد فقط غیرفعال می‌شود؛ جابه‌جایی‌اش به جانشین
+-- کار catalog.rewire_merged_party (مشترک رویداد catalog.party_merge) است.
+CREATE OR REPLACE FUNCTION catalog.party_ref_check(p_tenant uuid, p_party uuid, p_old_party uuid, p_is_update boolean, p_is_active boolean)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE v_status text;
+BEGIN
+  IF p_party IS NULL THEN RETURN; END IF;
+  IF p_is_update AND p_party IS NOT DISTINCT FROM p_old_party THEN
+    SELECT p.status INTO v_status FROM parties.party p WHERE p.tenant_id = p_tenant AND p.id = p_party;
+    IF v_status = 'merged' AND p_is_active THEN
+      RAISE EXCEPTION 'HK_PARTY_MERGED: party % is merged; a row that still points to it may only be deactivated', p_party
+        USING ERRCODE = 'P0001';
+    END IF;
+    RETURN;
+  END IF;
+  SELECT p.status INTO v_status FROM parties.party p WHERE p.tenant_id = p_tenant AND p.id = p_party FOR KEY SHARE;
+  IF v_status = 'merged' THEN
+    RAISE EXCEPTION 'HK_PARTY_MERGED: party % is merged; use its successor', p_party USING ERRCODE = 'P0001';
+  END IF;
+END $$;
+
 -- انتساب فهرست قیمت: گروه شخص با نوع فهرست سازگار؛ شخص ادغام‌شده ممنوع
 CREATE OR REPLACE FUNCTION catalog.price_list_assignment_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -2300,10 +2575,8 @@ BEGIN
       RAISE EXCEPTION 'HK_CATALOG_ASSIGNMENT_GROUP_ROLE: % list cannot be assigned to a % group', v_kind, v_role USING ERRCODE = 'P0001';
     END IF;
   END IF;
-  IF NEW.party_id IS NOT NULL AND EXISTS (SELECT 1 FROM parties.party p WHERE p.tenant_id = NEW.tenant_id
-                                            AND p.id = NEW.party_id AND p.status = 'merged') THEN
-    RAISE EXCEPTION 'HK_PARTY_MERGED: party % is merged', NEW.party_id USING ERRCODE = 'P0001';
-  END IF;
+  PERFORM catalog.party_ref_check(NEW.tenant_id, NEW.party_id, CASE WHEN TG_OP = 'UPDATE' THEN OLD.party_id END,
+                                  TG_OP = 'UPDATE', NEW.is_active);
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_price_list_assignment_guard ON catalog.price_list_assignment;
@@ -2313,9 +2586,8 @@ CREATE TRIGGER trg_price_list_assignment_guard BEFORE INSERT OR UPDATE ON catalo
 CREATE OR REPLACE FUNCTION catalog.item_supplier_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM parties.party p WHERE p.tenant_id = NEW.tenant_id AND p.id = NEW.supplier_party_id AND p.status = 'merged') THEN
-    RAISE EXCEPTION 'HK_PARTY_MERGED: supplier % is merged', NEW.supplier_party_id USING ERRCODE = 'P0001';
-  END IF;
+  PERFORM catalog.party_ref_check(NEW.tenant_id, NEW.supplier_party_id, CASE WHEN TG_OP = 'UPDATE' THEN OLD.supplier_party_id END,
+                                  TG_OP = 'UPDATE', NEW.is_active);
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_item_supplier_guard ON catalog.item_supplier;
@@ -2336,9 +2608,12 @@ LANGUAGE sql STABLE AS $$
   SELECT EXISTS (SELECT 1 FROM walk WHERE item_id = p_target_item)
 $$;
 
+-- BOM (D-M16، INV-CAT-17). RV-MD-16: دستور در حال اجرای گذشته جابه‌جا نمی‌شود — فعال‌سازی فقط از امروزِ مستأجر به بعد
+-- (valid_from ≥ امروز؛ پس‌تاریخ فقط با پرچم مهاجرت hk.catalog_allow_backdate، مثل درج تاریخچهٔ قیمت) و بستن نسخهٔ فعال
+-- یا بایگانی فقط با valid_to ≥ دیروز (همان قاعدهٔ سطر قیمت).
 CREATE OR REPLACE FUNCTION catalog.bom_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE i catalog.item; v_lines int;
+DECLARE i catalog.item; v_lines int; v_today date;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     IF OLD.status <> 'draft' THEN
@@ -2363,10 +2638,15 @@ BEGIN
      OR NEW.version_no <> OLD.version_no THEN
     RAISE EXCEPTION 'HK_CATALOG_BOM_IDENTITY_IMMUTABLE: item/variant/kind/version are immutable' USING ERRCODE = 'P0001';
   END IF;
+  v_today := catalog.tenant_today(NEW.tenant_id);
   IF OLD.status = 'draft' AND NEW.status = 'active' THEN
     SELECT count(*) INTO v_lines FROM catalog.bom_line l WHERE l.tenant_id = NEW.tenant_id AND l.bom_id = NEW.id;
     IF v_lines = 0 THEN
       RAISE EXCEPTION 'HK_CATALOG_BOM_EMPTY: a BOM needs at least one line to be activated' USING ERRCODE = 'P0001';
+    END IF;
+    IF NEW.valid_from < v_today AND coalesce(current_setting('hk.catalog_allow_backdate', true), '') <> 'on' THEN
+      RAISE EXCEPTION 'HK_CATALOG_BOM_BACKDATED: a BOM is activated from today (%) on, not from %', v_today, NEW.valid_from
+        USING ERRCODE = 'P0001';
     END IF;
   ELSIF OLD.status = 'active' AND NEW.status = 'active' THEN
     IF (to_jsonb(NEW) - ARRAY['valid_to','updated_at','row_version']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['valid_to','updated_at','row_version']) THEN
@@ -2379,6 +2659,11 @@ BEGIN
     END IF;
   ELSIF NOT (OLD.status = 'draft' AND NEW.status = 'draft') THEN
     RAISE EXCEPTION 'HK_CATALOG_BOM_TRANSITION: % -> % is not allowed', OLD.status, NEW.status USING ERRCODE = 'P0001';
+  END IF;
+  IF OLD.status = 'active' AND NEW.valid_to IS DISTINCT FROM OLD.valid_to
+     AND ((NEW.valid_to IS NOT NULL AND NEW.valid_to < v_today - 1) OR (OLD.valid_to IS NOT NULL AND OLD.valid_to < v_today - 1)) THEN
+    RAISE EXCEPTION 'HK_CATALOG_BOM_PAST_IMMUTABLE: an active BOM can only be closed from yesterday on (valid_to %, today %)', NEW.valid_to, v_today
+      USING ERRCODE = 'P0001';
   END IF;
   RETURN NEW;
 END $$;
@@ -2484,7 +2769,8 @@ LANGUAGE sql STABLE AS $$
    WHERE f.item_id = p_item_id AND f.uom_id = p_from_uom AND t.item_id = p_item_id AND t.uom_id = p_to_uom
 $$;
 
--- قیمت‌یابی از یک فهرست (بدون تخفیف؛ موتور تخفیف در بخش فروش). ترجیح: واحد دقیق > واحد پایه × ضریب؛
+-- قیمت‌یابی از یک فهرست (بدون تخفیف؛ موتور تخفیف در بخش فروش). خروجی price «قیمت واحدِ واحد درخواستی» است: برای واحد
+-- دقیق همان مبلغ ردیف (در دقت فهرست)، و برای واحد تبدیل‌شده ضرب دقیق بدون گرد کردن (مقیاس ۱۲). ترجیح: واحد دقیق > واحد پایه × ضریب؛
 -- سپس variant مشخص > سطح کالا؛ سپس بزرگ‌ترین شکست مقداری ≤ مقدار (مقایسه به واحد پایه).
 -- اگر فهرست سطری نداشت و مشتق است، از فهرست پایه با درصد و گرد کردن (از درون به بیرون).
 CREATE OR REPLACE FUNCTION catalog.resolve_price(p_price_list_id uuid, p_variant_id uuid, p_uom_id uuid, p_qty numeric, p_on date)
@@ -2517,8 +2803,9 @@ BEGIN
      ORDER BY (x.uom_id = p_uom_id) DESC, (x.variant_id IS NOT NULL) DESC, x.min_qty * u.factor DESC
      LIMIT 1;
     IF FOUND THEN
-      v_price := CASE WHEN e.uom_id = p_uom_id THEN e.price ELSE round(e.price * v_req_factor, v_list.price_precision) END;
-      -- اعمال قواعد فهرست‌های مشتق از درونی‌ترین به بیرونی‌ترین
+      v_price := e.price;
+      -- اعمال قواعد فهرست‌های مشتق از درونی‌ترین به بیرونی‌ترین، روی قیمتِ واحدِ خود ردیف (گرد کردن فهرست مشتق برای
+      -- واحدی است که قیمت در آن تعریف شده، نه برای واحد کوچک‌تر درخواستی)
       FOR k IN REVERSE coalesce(array_length(v_chain, 1), 0) .. 1 LOOP
         v_price := v_price * (1 + v_chain[k].base_adjust_percent / 100);
         IF v_chain[k].rounding_increment IS NOT NULL THEN
@@ -2529,6 +2816,11 @@ BEGIN
         END IF;
         v_price := round(v_price, v_chain[k].price_precision);
       END LOOP;
+      -- RV-MD-22: تبدیل از واحد پایه به واحد درخواستی گرد نمی‌شود (مقیاس core.rate = ۱۲ رقم اعشار)، تا خطای گرد کردن با
+      -- مقدار بزرگ نشود. مصرف‌کننده مبلغ سطر را round(qty × price, دقت فهرست) حساب می‌کند.
+      IF e.uom_id <> p_uom_id THEN
+        v_price := round(v_price * v_req_factor, 12);
+      END IF;
       price := v_price; source_price_list_id := v_list.id; entry_id := e.id;
       via := CASE WHEN array_length(v_chain, 1) > 0 THEN 'derived' WHEN e.uom_id <> p_uom_id THEN 'base_uom' ELSE 'direct' END;
       RETURN NEXT; RETURN;
@@ -2542,7 +2834,32 @@ BEGIN
   RETURN;
 END $$;
 
--- دستهٔ مؤثر: مسیر درخت و پیش‌فرض‌های ارث‌برده از نزدیک‌ترین نیا (گروه ثبت، دستهٔ مالیاتی، واحد، قالب ویژگی).
+-- RV-MD-13: پیمایش رو به بالا از دستهٔ خودِ کالا (عمق ≤ ۱۰، هر گام یک جست‌وجوی کلید) به‌جای ساختن کل درخت مستأجر.
+-- v_sku، posting_attributes و next_item_code از این دو تابع استفاده می‌کنند؛ v_category_effective فقط برای نمای درخت (UI) است.
+CREATE OR REPLACE FUNCTION catalog.category_path(p_tenant uuid, p_category uuid) RETURNS uuid[]
+LANGUAGE sql STABLE AS $$
+  WITH RECURSIVE up(id, parent_id, depth) AS (
+    SELECT c.id, c.parent_id, 1 FROM catalog.item_category c WHERE c.tenant_id = p_tenant AND c.id = p_category
+    UNION ALL
+    SELECT c.id, c.parent_id, up.depth + 1
+      FROM up JOIN catalog.item_category c ON c.tenant_id = p_tenant AND c.id = up.parent_id
+     WHERE up.depth < 10)
+  SELECT array_agg(id ORDER BY depth DESC) FROM up        -- ریشه اول، خود دسته آخر
+$$;
+
+CREATE OR REPLACE FUNCTION catalog.category_posting_group(p_tenant uuid, p_category uuid) RETURNS uuid
+LANGUAGE sql STABLE AS $$
+  WITH RECURSIVE up(id, parent_id, grp, depth) AS (
+    SELECT c.id, c.parent_id, c.default_posting_group_id, 1 FROM catalog.item_category c
+     WHERE c.tenant_id = p_tenant AND c.id = p_category
+    UNION ALL
+    SELECT c.id, c.parent_id, c.default_posting_group_id, up.depth + 1
+      FROM up JOIN catalog.item_category c ON c.tenant_id = p_tenant AND c.id = up.parent_id
+     WHERE up.grp IS NULL AND up.depth < 10)
+  SELECT grp FROM up WHERE grp IS NOT NULL ORDER BY depth LIMIT 1
+$$;
+
+-- دستهٔ مؤثر (نمای درخت برای UI): مسیر و پیش‌فرض‌های ارث‌برده از نزدیک‌ترین نیا (گروه ثبت، دستهٔ مالیاتی، واحد، قالب ویژگی).
 -- فقط posting_group در زمان اجرا ارث برده می‌شود؛ بقیه پیش‌پرکردن فرم کالای تازه‌اند (سرویس).
 CREATE OR REPLACE VIEW catalog.v_category_effective WITH (security_invoker = true) AS
   WITH RECURSIVE t AS (
@@ -2562,28 +2879,31 @@ CREATE OR REPLACE VIEW catalog.v_category_effective WITH (security_invoker = tru
          uom_id AS effective_uom_id, attribute_set_id AS effective_attribute_set_id
     FROM t;
 
+-- SKU (05:CR-C08: warranty_days و warranty_provider_party_id برای گارانتی سریال در فروش)
 CREATE OR REPLACE VIEW catalog.v_sku WITH (security_invoker = true) AS
   SELECT v.tenant_id, v.id AS variant_id, v.item_id, v.code AS sku_code, i.code AS item_code,
          CASE WHEN v.name_suffix IS NULL THEN i.name ELSE i.name || ' — ' || v.name_suffix END AS display_name,
          i.item_type, i.base_uom_id, i.category_id, i.brand_id,
-         coalesce(i.posting_group_id, c.effective_posting_group_id) AS posting_group_id,
+         coalesce(i.posting_group_id, CASE WHEN i.category_id IS NOT NULL THEN catalog.category_posting_group(i.tenant_id, i.category_id) END)
+           AS posting_group_id,
          i.track_serial, i.track_batch, i.track_expiry,
          coalesce(v.sstid, i.sstid) AS sstid, CASE WHEN v.sstid IS NOT NULL THEN v.sstid_kind ELSE i.sstid_kind END AS sstid_kind,
          i.tax_category_code, i.other_tax_category_code,
          i.is_sellable, i.is_purchasable, i.allow_discount, i.allow_price_override,
          (i.status = 'active' AND v.status = 'active') AS is_active,
-         v.is_default, v.axis1_value_id, v.axis2_value_id, v.axis3_value_id, v.plu_code, i.company_id
+         v.is_default, v.axis1_value_id, v.axis2_value_id, v.axis3_value_id, v.plu_code, i.company_id,
+         i.warranty_days, i.warranty_provider_party_id
     FROM catalog.item_variant v
-    JOIN catalog.item i ON i.tenant_id = v.tenant_id AND i.id = v.item_id
-    LEFT JOIN catalog.v_category_effective c ON c.tenant_id = i.tenant_id AND c.category_id = i.category_id;
+    JOIN catalog.item i ON i.tenant_id = v.tenant_id AND i.id = v.item_id;
 
--- ویژگی‌های شرط قاعدهٔ نگاشت حساب برای یک SKU: item_posting_group (مؤثر)، item_type و item_category (کد دستهٔ مستقیم).
+-- ویژگی‌های شرط قاعدهٔ نگاشت حساب برای یک SKU با کلیدهای «attr:» دستور شرط ledger (RV-MD-19):
+-- attr:item_posting_group (مؤثر)، attr:item_type و attr:item_category (کد دستهٔ مستقیم).
 CREATE OR REPLACE FUNCTION catalog.posting_attributes(p_variant_id uuid) RETURNS jsonb
 LANGUAGE sql STABLE AS $$
   SELECT jsonb_strip_nulls(jsonb_build_object(
-           'item_posting_group', g.code,
-           'item_type', s.item_type,
-           'item_category', c.code))
+           'attr:item_posting_group', g.code,
+           'attr:item_type', s.item_type,
+           'attr:item_category', c.code))
     FROM catalog.v_sku s
     LEFT JOIN catalog.item_posting_group g ON g.tenant_id = s.tenant_id AND g.id = s.posting_group_id
     LEFT JOIN catalog.item_category c ON c.tenant_id = s.tenant_id AND c.id = s.category_id
@@ -2599,7 +2919,7 @@ BEGIN
     RAISE EXCEPTION 'HK_TENANT_CONTEXT_MISSING: app.tenant_id is not set' USING ERRCODE = 'P0001';
   END IF;
   IF p_category_id IS NOT NULL THEN
-    SELECT e.path_ids INTO v_path FROM catalog.v_category_effective e WHERE e.tenant_id = v_tenant AND e.category_id = p_category_id;
+    v_path := catalog.category_path(v_tenant, p_category_id);
     IF v_path IS NULL THEN
       RAISE EXCEPTION 'HK_CATALOG_CATEGORY_NOT_FOUND: %', p_category_id USING ERRCODE = 'P0001';
     END IF;
@@ -2630,6 +2950,53 @@ BEGIN
   RETURN v_code;
 END $$;
 
+-- مشترک catalog برای parties.party.merged (RV-MD-09؛ D-M07؛ مشترک core «catalog.party_merge»): ارجاع‌های تغییرپذیر
+-- catalog به بازنده را به جانشینِ فعلی برنده می‌برد — انتساب قیمت، تأمین‌کنندهٔ کالا و شرکت گارانتی. ردیفی که روی جانشین
+-- هم‌ارز دارد (همان فهرست/شعبه/شرکت/کانال، یا همان کالا/variant، یا همان کد کالای تأمین‌کننده) جابه‌جا نمی‌شود و غیرفعال
+-- می‌ماند. idempotent: اجرای دوباره چیزی پیدا نمی‌کند. catalog → parties در DAG است؛ parties هرگز catalog را نمی‌خواند.
+CREATE OR REPLACE FUNCTION catalog.rewire_merged_party(p_merge_id uuid) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE v_tenant uuid := core.current_tenant_id(); m parties.party_merge; v_to uuid; n1 int; n2 int; n3 int;
+BEGIN
+  IF v_tenant IS NULL THEN
+    RAISE EXCEPTION 'HK_TENANT_CONTEXT_MISSING: app.tenant_id is not set' USING ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO m FROM parties.party_merge x WHERE x.tenant_id = v_tenant AND x.id = p_merge_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'HK_PARTY_NOT_FOUND: merge record %', p_merge_id USING ERRCODE = 'P0001';
+  END IF;
+  SELECT coalesce(p.merged_into_id, p.id) INTO v_to FROM parties.party p WHERE p.tenant_id = v_tenant AND p.id = m.winner_party_id;
+
+  WITH x AS (UPDATE catalog.price_list_assignment a SET party_id = v_to
+              WHERE a.tenant_id = v_tenant AND a.party_id = m.loser_party_id
+                AND NOT EXISTS (SELECT 1 FROM catalog.price_list_assignment b
+                                 WHERE b.tenant_id = v_tenant AND b.party_id = v_to AND b.price_list_id = a.price_list_id
+                                   AND b.branch_id IS NOT DISTINCT FROM a.branch_id AND b.company_id IS NOT DISTINCT FROM a.company_id
+                                   AND b.channel IS NOT DISTINCT FROM a.channel)
+              RETURNING 1) SELECT count(*) INTO n1 FROM x;
+  UPDATE catalog.price_list_assignment SET is_active = false
+   WHERE tenant_id = v_tenant AND party_id = m.loser_party_id AND is_active;
+
+  WITH x AS (UPDATE catalog.item_supplier s SET supplier_party_id = v_to
+              WHERE s.tenant_id = v_tenant AND s.supplier_party_id = m.loser_party_id
+                AND NOT EXISTS (SELECT 1 FROM catalog.item_supplier b
+                                 WHERE b.tenant_id = v_tenant AND b.supplier_party_id = v_to
+                                   AND b.item_id = s.item_id AND b.variant_id IS NOT DISTINCT FROM s.variant_id)
+                AND (s.supplier_item_code IS NULL OR NOT EXISTS (
+                       SELECT 1 FROM catalog.item_supplier c WHERE c.tenant_id = v_tenant AND c.supplier_party_id = v_to
+                          AND c.supplier_item_code = s.supplier_item_code))
+              RETURNING 1) SELECT count(*) INTO n2 FROM x;
+  UPDATE catalog.item_supplier SET is_active = false, is_preferred = false
+   WHERE tenant_id = v_tenant AND supplier_party_id = m.loser_party_id AND is_active;
+
+  WITH x AS (UPDATE catalog.item i SET warranty_provider_party_id = v_to
+              WHERE i.tenant_id = v_tenant AND i.warranty_provider_party_id = m.loser_party_id RETURNING 1)
+  SELECT count(*) INTO n3 FROM x;
+
+  RETURN jsonb_build_object('module', 'catalog', 'merge_id', p_merge_id, 'successor_id', v_to,
+                            'price_list_assignment', n1, 'item_supplier', n2, 'item_warranty_provider', n3);
+END $$;
+
 CREATE OR REPLACE VIEW catalog.v_item_uom_effective WITH (security_invoker = true) AS
   SELECT iu.tenant_id, iu.item_id, iu.uom_id, iu.factor, iu.is_base, iu.allow_sales, iu.allow_purchase,
          iu.is_sales_default, iu.is_purchase_default, iu.is_active, u.code AS uom_code, u.name AS uom_name, u.qty_decimals,
@@ -2652,9 +3019,13 @@ GRANT SELECT ON ref.country, ref.province, ref.city, ref.bank, ref.bank_sheba_co
                 ref.moadian_unit, ref.sstid TO hk_app, hk_readonly;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-  parties.party_group, parties.payment_term, parties.payment_term_line, parties.party, parties.party_role,
+  parties.party_group, parties.payment_term, parties.payment_term_line, parties.party_role,
   parties.party_contact, parties.party_address, parties.party_bank_account, parties.party_relation,
   parties.party_legacy_code TO hk_app;
+-- شخص حذف فیزیکی ندارد (D-M25، RV-MD-20): مقدار بُعد ledger از لحظهٔ ساخت به آن FK دارد و parties نمی‌تواند ledger را
+-- صدا بزند؛ کنار گذاشتن = inactive، تکراری = ادغام. پاک‌سازی نهایی مستأجر با hk_migrator است.
+GRANT SELECT, INSERT, UPDATE ON parties.party TO hk_app;
+REVOKE DELETE ON parties.party FROM hk_app;
 GRANT SELECT, INSERT, UPDATE ON parties.party_hold TO hk_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON parties.code_series TO hk_app;
 GRANT SELECT, INSERT, DELETE ON parties.duplicate_dismissal TO hk_app;
@@ -2675,3 +3046,162 @@ GRANT SELECT ON parties.v_party_canonical, parties.v_party_ledger_identity, part
 GRANT SELECT ON ALL TABLES IN SCHEMA catalog TO hk_readonly;
 
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ref, parties, catalog TO hk_app, hk_readonly;
+
+-- =====================================================================
+-- ۱۲. ثبت در کاتالوگ‌های core (R-ORDER: 10 پیش‌نیاز است؛ تا تغییر زنجیرهٔ هارنس با to_regclass محافظت می‌شود)
+--     R-EXPORT/RV-IT-01: رجیستری صدور هر جدول مستأجری؛ RV-IT-02/C-AS-10: مجوزها، محافظ فیلد و قالب نقش؛
+--     RV-X1-23: تنظیمات؛ RV-IT-CUSTOM: فیلد سفارشی؛ RV-MD-09: مشترک رویداد ادغام برای catalog.
+-- =====================================================================
+DO $$
+BEGIN
+  IF to_regclass('core.export_table_registry') IS NOT NULL THEN
+    -- ترتیب صدور ۲۵۰ تا ۲۹۳: پس از core (company، branch، عضویت) و پیش از ledger (dimension_value به party ارجاع دارد).
+    -- PII: شناسه‌ها، نام و تولد اشخاص حقیقی، ارتباط، نشانی و حساب بانکی. هیچ ستون «راز» (hash/توکن) در این دو ماژول نیست.
+    INSERT INTO core.export_table_registry AS r (schema_name, table_name, module, mode, export_order, pii_columns, secret_columns, note) VALUES
+      ('parties','party_group',            'parties', 'rows', 250, '{}', '{}', NULL),
+      ('parties','payment_term',           'parties', 'rows', 251, '{}', '{}', NULL),
+      ('parties','payment_term_line',      'parties', 'rows', 252, '{}', '{}', NULL),
+      ('parties','party',                  'parties', 'rows', 253,
+         '{name,first_name,last_name,father_name,gender,birth_date,birth_cert_no,birth_cert_issue_place,birth_cert_issue_date,national_id,national_id_override_reason,passport_no}', '{}',
+         'merged rows exported verbatim; party_merge_consistent re-verified by the parties import hook'),
+      ('parties','party_role',             'parties', 'rows', 254, '{}', '{}', NULL),
+      ('parties','party_contact',          'parties', 'rows', 255, '{value,person_name}', '{}', NULL),
+      ('parties','party_address',          'parties', 'rows', 256, '{address_line,plate,unit,floor,postal_code,latitude,longitude,phone}', '{}', NULL),
+      ('parties','party_bank_account',     'parties', 'rows', 257, '{sheba,card_number,account_number,holder_name,verified_holder_name}', '{}', NULL),
+      ('parties','party_relation',         'parties', 'rows', 258, '{}', '{}', NULL),
+      ('parties','party_hold',             'parties', 'rows', 259, '{}', '{}', NULL),
+      ('parties','party_legacy_code',      'parties', 'rows', 260, '{legacy_name}', '{}', NULL),
+      ('parties','party_merge',            'parties', 'rows', 261, '{loser_snapshot,winner_before}', '{}', 'append-only history'),
+      ('parties','duplicate_dismissal',    'parties', 'rows', 262, '{}', '{}', NULL),
+      ('parties','party_taxpayer_inquiry', 'parties', 'rows', 263, '{taxpayer_name,raw}', '{}', 'append-only history'),
+      ('parties','code_series',            'parties', 'rows', 264, '{}', '{}', NULL),
+      ('catalog','uom',                    'catalog', 'rows', 270, '{}', '{}', NULL),
+      ('catalog','item_posting_group',     'catalog', 'rows', 271, '{}', '{}', NULL),
+      ('catalog','attribute',              'catalog', 'rows', 272, '{}', '{}', NULL),
+      ('catalog','attribute_value',        'catalog', 'rows', 273, '{}', '{}', NULL),
+      ('catalog','attribute_set',          'catalog', 'rows', 274, '{}', '{}', NULL),
+      ('catalog','attribute_set_member',   'catalog', 'rows', 275, '{}', '{}', NULL),
+      ('catalog','brand',                  'catalog', 'rows', 276, '{}', '{}', NULL),
+      ('catalog','item_category',          'catalog', 'rows', 277, '{}', '{}', NULL),
+      ('catalog','item',                   'catalog', 'rows', 278, '{}', '{}', NULL),
+      ('catalog','item_variant',           'catalog', 'rows', 279, '{}', '{}', NULL),
+      ('catalog','item_uom',               'catalog', 'rows', 280, '{}', '{}', NULL),
+      ('catalog','item_attribute_value',   'catalog', 'rows', 281, '{}', '{}', NULL),
+      ('catalog','barcode',                'catalog', 'rows', 282, '{}', '{}', NULL),
+      ('catalog','barcode_counter',        'catalog', 'rows', 283, '{}', '{}', NULL),
+      ('catalog','scale_barcode_pattern',  'catalog', 'rows', 284, '{}', '{}', NULL),
+      ('catalog','price_list',             'catalog', 'rows', 285, '{}', '{}', NULL),
+      ('catalog','price_list_item',        'catalog', 'rows', 286, '{}', '{}', 'verbatim history; the importer runs with session_replication_role=replica (R-IMPORT)'),
+      ('catalog','price_list_assignment',  'catalog', 'rows', 287, '{}', '{}', NULL),
+      ('catalog','item_supplier',          'catalog', 'rows', 288, '{}', '{}', NULL),
+      ('catalog','item_image',             'catalog', 'rows', 289, '{}', '{}', 'image files travel with core.attachment'),
+      ('catalog','item_legacy_code',       'catalog', 'rows', 290, '{}', '{}', NULL),
+      ('catalog','code_series',            'catalog', 'rows', 291, '{}', '{}', NULL),
+      ('catalog','bom',                    'catalog', 'rows', 292, '{}', '{}', NULL),
+      ('catalog','bom_line',               'catalog', 'rows', 293, '{}', '{}', NULL)
+    ON CONFLICT (schema_name, table_name) DO UPDATE
+      SET module = EXCLUDED.module, mode = EXCLUDED.mode, export_order = EXCLUDED.export_order,
+          pii_columns = EXCLUDED.pii_columns, secret_columns = EXCLUDED.secret_columns, note = EXCLUDED.note
+      WHERE (r.module, r.mode, r.export_order, r.pii_columns, r.secret_columns, r.note)
+            IS DISTINCT FROM (EXCLUDED.module, EXCLUDED.mode, EXCLUDED.export_order, EXCLUDED.pii_columns, EXCLUDED.secret_columns, EXCLUDED.note);
+  END IF;
+
+  IF to_regclass('core.permission') IS NOT NULL THEN
+    INSERT INTO core.permission (code, module, scope_dimensions, risk, allow_service_account, allow_impersonation_write, description_key, introduced_in) VALUES
+      ('parties.party.read',          'parties', '{company}', 'normal',    true,  false, 'perm.parties.party.read',          '1.0'),
+      ('parties.party.create',        'parties', '{company}', 'normal',    true,  false, 'perm.parties.party.create',        '1.0'),
+      ('parties.party.update',        'parties', '{company}', 'normal',    true,  false, 'perm.parties.party.update',        '1.0'),
+      ('parties.party.identity.read', 'parties', '{company}', 'sensitive', true,  false, 'perm.parties.party.identity.read', '1.0'),
+      ('parties.party.override_id',   'parties', '{company}', 'sensitive', false, false, 'perm.parties.party.override_id',   '1.0'),
+      ('parties.party.merge',         'parties', '{}',        'critical',  false, false, 'perm.parties.party.merge',         '1.0'),
+      ('parties.bank_account.read',   'parties', '{company}', 'sensitive', true,  false, 'perm.parties.bank_account.read',   '1.0'),
+      ('parties.bank_account.manage', 'parties', '{company}', 'sensitive', true,  false, 'perm.parties.bank_account.manage', '1.0'),
+      ('parties.bank_account.verify', 'parties', '{company}', 'sensitive', false, false, 'perm.parties.bank_account.verify', '1.0'),
+      ('parties.hold.manage',         'parties', '{company}', 'sensitive', true,  false, 'perm.parties.hold.manage',         '1.0'),
+      ('parties.setup.manage',        'parties', '{}',        'sensitive', true,  false, 'perm.parties.setup.manage',        '1.0'),
+      ('catalog.item.read',           'catalog', '{company}', 'normal',    true,  false, 'perm.catalog.item.read',           '1.0'),
+      ('catalog.item.manage',         'catalog', '{company}', 'normal',    true,  false, 'perm.catalog.item.manage',         '1.0'),
+      ('catalog.item.delete',         'catalog', '{company}', 'sensitive', false, false, 'perm.catalog.item.delete',         '1.0'),
+      ('catalog.setup.manage',        'catalog', '{}',        'sensitive', true,  false, 'perm.catalog.setup.manage',        '1.0'),
+      ('catalog.price.read',          'catalog', '{company}', 'normal',    true,  false, 'perm.catalog.price.read',          '1.0'),
+      ('catalog.price.manage',        'catalog', '{company}', 'sensitive', true,  false, 'perm.catalog.price.manage',        '1.0'),
+      ('catalog.price.purchase.read', 'catalog', '{company}', 'sensitive', true,  false, 'perm.catalog.price.purchase.read', '1.0'),
+      ('catalog.price.backdate',      'catalog', '{company}', 'critical',  true,  false, 'perm.catalog.price.backdate',      '1.0'),
+      ('catalog.bom.read',            'catalog', '{company}', 'normal',    true,  false, 'perm.catalog.bom.read',            '1.0'),
+      ('catalog.bom.manage',          'catalog', '{company}', 'normal',    true,  false, 'perm.catalog.bom.manage',          '1.0'),
+      ('catalog.bom.activate',        'catalog', '{company}', 'sensitive', false, false, 'perm.catalog.bom.activate',        '1.0')
+    ON CONFLICT (code) DO NOTHING;
+  END IF;
+
+  IF to_regclass('core.field_guard') IS NOT NULL THEN
+    -- قیمت فهرست خرید محافظ فیلد ندارد: ستون price مشترک فهرست فروش و خرید است و سرویس با نوع فهرست، بدون مجوز
+    -- catalog.price.purchase.read آن را حذف می‌کند (§۵-۱۲).
+    INSERT INTO core.field_guard (resource, field, read_permission, write_permission, mask_style, is_secret) VALUES
+      ('parties.party',              'national_id',    'parties.party.identity.read', 'parties.party.update',        'partial_last4', true),
+      ('parties.party',              'birth_cert_no',  'parties.party.identity.read', 'parties.party.update',        'partial_last4', true),
+      ('parties.party',              'passport_no',    'parties.party.identity.read', 'parties.party.update',        'partial_last4', true),
+      ('parties.party_bank_account', 'sheba',          'parties.bank_account.read',   'parties.bank_account.manage', 'partial_last4', true),
+      ('parties.party_bank_account', 'card_number',    'parties.bank_account.read',   'parties.bank_account.manage', 'partial_last4', true),
+      ('parties.party_bank_account', 'account_number', 'parties.bank_account.read',   'parties.bank_account.manage', 'partial_last4', true)
+    ON CONFLICT (resource, field) DO NOTHING;
+  END IF;
+
+  IF to_regclass('core.role_template_permission') IS NOT NULL THEN
+    -- owner با grants_all همه را دارد؛ قالب دستیار وجود ندارد (R-AI-PRINCIPAL: سقف = اشتراک سقف ابزار و مجوز کاربر).
+    INSERT INTO core.role_template_permission (template_code, permission_code)
+    SELECT v.t, v.p FROM (VALUES
+      ('accountant','parties.party.read'), ('accountant','parties.party.create'), ('accountant','parties.party.update'),
+      ('accountant','parties.party.identity.read'), ('accountant','parties.party.override_id'), ('accountant','parties.party.merge'),
+      ('accountant','parties.bank_account.read'), ('accountant','parties.bank_account.manage'), ('accountant','parties.hold.manage'),
+      ('accountant','parties.setup.manage'), ('accountant','catalog.item.read'), ('accountant','catalog.price.read'),
+      ('accountant','catalog.price.purchase.read'), ('accountant','catalog.bom.read'),
+      ('sales_clerk','parties.party.read'), ('sales_clerk','parties.party.create'), ('sales_clerk','parties.party.update'),
+      ('sales_clerk','catalog.item.read'), ('sales_clerk','catalog.price.read'), ('sales_clerk','catalog.bom.read'),
+      ('cashier','parties.party.read'), ('cashier','parties.party.create'), ('cashier','catalog.item.read'), ('cashier','catalog.price.read'),
+      ('purchaser','parties.party.read'), ('purchaser','parties.party.create'), ('purchaser','parties.party.update'),
+      ('purchaser','parties.bank_account.read'), ('purchaser','catalog.item.read'), ('purchaser','catalog.item.manage'),
+      ('purchaser','catalog.price.read'), ('purchaser','catalog.price.manage'), ('purchaser','catalog.price.purchase.read'),
+      ('warehouse_keeper','parties.party.read'), ('warehouse_keeper','catalog.item.read'), ('warehouse_keeper','catalog.bom.read'),
+      ('payroll_officer','parties.party.read'), ('payroll_officer','parties.party.create'), ('payroll_officer','parties.party.update'),
+      ('payroll_officer','parties.party.identity.read'), ('payroll_officer','parties.bank_account.read'),
+      ('payroll_officer','parties.bank_account.manage'),
+      ('auditor','parties.party.read'), ('auditor','parties.party.identity.read'), ('auditor','parties.bank_account.read'),
+      ('auditor','catalog.item.read'), ('auditor','catalog.price.read'), ('auditor','catalog.price.purchase.read'), ('auditor','catalog.bom.read'),
+      ('support_readonly','parties.party.read'), ('support_readonly','catalog.item.read'), ('support_readonly','catalog.price.read'),
+      ('integration','parties.party.read'), ('integration','parties.party.create'), ('integration','parties.party.update'),
+      ('integration','catalog.item.read'), ('integration','catalog.item.manage'), ('integration','catalog.price.read'),
+      ('integration','catalog.price.manage')) AS v(t, p)
+    JOIN core.role_template rt ON rt.code = v.t
+    JOIN core.permission pm ON pm.code = v.p
+    UNION ALL
+    SELECT 'admin', pm.code FROM core.permission pm
+     WHERE pm.module IN ('parties','catalog') AND pm.code <> 'catalog.price.backdate'
+       AND EXISTS (SELECT 1 FROM core.role_template rt WHERE rt.code = 'admin')
+    ON CONFLICT DO NOTHING;
+  END IF;
+
+  IF to_regclass('core.setting_def') IS NOT NULL THEN
+    INSERT INTO core.setting_def (key, module, value_type, min_value, max_value, allowed_levels, default_value,
+                                  read_permission, write_permission, description_key, introduced_in) VALUES
+      ('parties.duplicate.threshold', 'parties', 'int', 80, 100, '{tenant}', '92'::jsonb,
+       'parties.party.read', 'parties.setup.manage', 'setting.parties.duplicate.threshold', '1.0')
+    ON CONFLICT (key) DO NOTHING;
+  END IF;
+
+  IF to_regclass('core.event_subscriber') IS NOT NULL THEN
+    INSERT INTO core.event_subscriber (subscriber, ordered, max_attempts, requires_webhook_endpoint, introduced_in)
+    VALUES ('catalog.party_merge', false, 25, false, '1.0')
+    ON CONFLICT (subscriber) DO NOTHING;
+    INSERT INTO core.event_subscription (event_type, subscriber) VALUES ('parties.party.merged', 'catalog.party_merge')
+    ON CONFLICT DO NOTHING;
+  END IF;
+
+  IF to_regclass('core.custom_field_entity') IS NOT NULL AND to_regprocedure('core.attach_custom_fields(regclass,text,text)') IS NOT NULL THEN
+    INSERT INTO core.custom_field_entity (entity_type, module, table_name, json_column, max_fields, description_key) VALUES
+      ('parties.party', 'parties', 'parties.party', 'custom', 50, 'custom_field.entity.parties.party'),
+      ('catalog.item',  'catalog', 'catalog.item',  'custom', 50, 'custom_field.entity.catalog.item')
+    ON CONFLICT (entity_type) DO NOTHING;
+    PERFORM core.attach_custom_fields('parties.party', 'parties.party');
+    PERFORM core.attach_custom_fields('catalog.item', 'catalog.item');
+  END IF;
+END $$;

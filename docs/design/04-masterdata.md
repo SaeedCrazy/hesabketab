@@ -3,7 +3,7 @@
 > **ورودی‌ها:** [`docs/00-decisions.md`](../00-decisions.md)، [`docs/research/README.md`](../research/README.md)، [`sql/00_foundation.sql`](sql/00_foundation.sql)، بخش‌های [01-architecture](01-architecture.md)، [02-core-platform](02-core-platform.md) و [03-ledger](03-ledger.md).
 > **خروجی‌ها:** [`sql/25_masterdata.sql`](sql/25_masterdata.sql)، آزمون پایگاه داده [`sql/tests/25_masterdata_test.sql`](sql/tests/25_masterdata_test.sql)، بردارهای مشترک شناسه‌ها [`sql/tests/iran_id_vectors_v1.json`](sql/tests/iran_id_vectors_v1.json).
 > **ماژول‌ها و اسکیماها:** `parties` (L2) و `catalog` (L2، وابسته به `parties`؛ CR-01)، به‌اضافهٔ دادهٔ مرجع سراسری لازم در `ref`.
-> **وابستگی فایل SQL:** فقط `00_foundation.sql`. فایل روی زنجیرهٔ یکپارچهٔ `00 → 10 → 20 → 25` هم آزموده شد. FKهای بیرونی در §۱۲ هستند.
+> **وابستگی فایل SQL (R-ORDER):** `00_foundation.sql` → `10_core.sql` → این فایل. ثبت در کاتالوگ‌های core (رجیستری صدور، مجوز، محافظ فیلد، قالب نقش، تنظیمات، فیلد سفارشی و مشترک رویداد) در بخش ۱۲ فایل SQL انجام می‌شود. تا هارنس زنجیرهٔ مستقل این بخش را به `00 → 10 → 25` عوض کند (درخواست به یکپارچه‌ساز، §۱۳)، فایل روی `00 → 25` هم اعمال می‌شود: آن بلوک‌ها با `to_regclass` محافظت شده‌اند و shim `core.fa_*` فقط در نبود 10 ساخته می‌شود. آزمون روی هر سه زنجیرهٔ `00 → 25`، `00 → 10 → 25` و پایگاه یکپارچه سبز است. FKهای بیرونی در §۱۲ هستند.
 
 ## ۱. خلاصه
 
@@ -11,16 +11,16 @@
 
 1. **یک مدل شخص با نقش‌ها.** `parties.party` یک ردیف برای هر شخص حقیقی یا حقوقی است. نقش‌ها (`party_role`) تنظیمات تجاری هر نقش را دارند: گروه، سقف اعتبار، شرایط پرداخت و بازاریاب. این تنظیمات یک ردیف پیش‌فرض و استثنای هر شرکت دارند. شخص در سطح مستأجر است، پس یک مشتری در چند شرکتِ یک مستأجر یک «کارت» دارد.
 2. **شناسه‌های ایرانی ساختاری کنترل می‌شوند.** کد ملی، شناسهٔ ملی (قاعدهٔ persian-tools)، شمارهٔ اقتصادی ۱۱ یا ۱۴ رقمی، کد پستی، شبا (mod-97)، کارت (Luhn) و بارکد GTIN همه یک تابع SQL خالص و یک همتای پایتون و TypeScript دارند. هر سه با یک فایل بردار مشترک آزموده می‌شوند. شکست checksum کد ملی و شناسهٔ ملی «خطای قابل override» است: با دلیل ثبت‌شده و مجوز جدا، و CHECK پایگاه داده آن را تضمین می‌کند.
-3. **شخص = بُعد دفتر کل.** برای هر شخص دقیقاً یک مقدار بُعد `party` در `ledger.dimension_value` ساخته می‌شود (تفصیلی شناور، جایگاه ۱). کد آن همان کد شخص است. حساب دریافتنی و پرداختنی هرگز روی شخص ذخیره نمی‌شود. قاعدهٔ نگاشت ledger آن را با شرط `attr:<role>_group` (کد گروه شخص) پیدا می‌کند و تابع `parties.posting_attributes` این ویژگی‌ها را می‌سازد.
-4. **تکراری و ادغام.** تشخیص تکراری دو مرحله دارد: «بلوک‌بندی» در SQL (شناسه، موبایل، شبا و شباهت trigram روی کلید نام) و امتیازدهی در پایتون. ادغام برگشت‌ناپذیر است. بخش درون‌ماژولی آن با تابع `parties.merge_parties` در یک تراکنش انجام می‌شود. ماژول‌های دیگر با رویداد `parties.party.merged` ارجاع‌های **تغییرپذیر** خود را جابه‌جا می‌کنند. اسناد قطعی بازنویسی نمی‌شوند و گزارش‌ها از `v_party_canonical` جانشین را می‌خوانند. ردیف ادغام‌شده فقط‌خواندنی است و ارجاع تازه نمی‌پذیرد.
+3. **شخص = بُعد دفتر کل.** برای هر شخص دقیقاً یک مقدار بُعد `party` در `ledger.dimension_value` ساخته می‌شود (تفصیلی شناور، جایگاه ۱). کد آن همان کد شخص است. حساب دریافتنی و پرداختنی هرگز روی شخص ذخیره نمی‌شود. قاعدهٔ نگاشت ledger آن را با شرط `attr:<role>_group` (کد گروه شخص) پیدا می‌کند و تابع `parties.posting_attributes` این ویژگی‌ها را با همان کلیدهای `attr:` می‌سازد که `PostingRequest.attributes` می‌پذیرد.
+4. **تکراری و ادغام.** تشخیص تکراری دو مرحله دارد: «بلوک‌بندی» در SQL (شناسه، موبایل و شبا روی ایندکس، و نزدیک‌ترین نام‌ها با جست‌وجوی KNN trigram) و امتیازدهی در پایتون. ادغام برگشت‌ناپذیر است. بخش درون‌ماژولی آن با تابع `parties.merge_parties` در یک تراکنش انجام می‌شود و پایگاه داده پس‌شرط‌هایش (سابقهٔ ادغام، نبود فرزند زنده روی بازنده) را خودش می‌سنجد. ماژول‌های دیگر با رویداد `parties.party.merged` ارجاع‌های **تغییرپذیر** خود را جابه‌جا می‌کنند. اسناد قطعی بازنویسی نمی‌شوند و گزارش‌ها از `v_party_canonical` جانشین را می‌خوانند. ردیف ادغام‌شده فقط‌خواندنی است و ارجاع تازه نمی‌پذیرد.
 5. **کالا = الگو + SKU.** هر کالا دست‌کم یک `item_variant` (SKU) دارد. کالای ساده یک variant پیش‌فرض با همان کد دارد. کالای variantدار تا سه محور دارد (مثلاً سایز × رنگ). پس انبار، فروش، بارکد و قیمت همیشه به یک SKU اشاره می‌کنند و تبدیل کالای ساده به variantدار، حتی پس از استفاده، تاریخچه را نمی‌شکند.
 6. **واحد، بارکد، ترازو.** هر کالا یک واحد پایه و چند واحد فرعی با ضریب دارد (کارتن = ۲۴ عدد، گرم = ۰٫۰۰۱ کیلوگرم) و کد واحد مؤدیان (RC_UMGS) را از واحد یا استثنای کالا می‌گیرد. بارکد به (SKU، واحد) اشاره می‌کند. بارکد داخلی RCN-13 با پیشوند GS1 `04` و رقم کنترل ساخته می‌شود. الگوی بارکد ترازو (پیشوند `02` یا `20` تا `29`) قابل تنظیم است و پایگاه داده جلوی تداخل پیشوندها را می‌گیرد.
 7. **مالیات فقط طبقه‌بندی است.** کالا `sstid` (۱۳ رقم، با نوع عمومی یا اختصاصی) و `tax_category_code` دارد. نرخ را موتور قواعد و بخش مالیات حل می‌کنند و این بخش هیچ نرخی نگه نمی‌دارد.
-8. **قیمت.** فهرست قیمت فروش یا خرید، با ارز، دقت، تاریخ اعتبار، شکست مقداری، واحد، و فهرست مشتق (درصد و گرد کردن) تعریف می‌شود. ردیف قیمتی که اثرش آغاز شده تغییرناپذیر است: فقط «بسته» می‌شود و قیمت تازه از امروز ثبت می‌شود. انتساب فهرست به شخص، گروه، شعبه، شرکت یا کانال هم در همین بخش است. موتور تخفیف و قیمت‌یابی نهایی در بخش فروش است.
+8. **قیمت.** فهرست قیمت فروش یا خرید، با ارز، دقت، تاریخ اعتبار، شکست مقداری، واحد، و فهرست مشتق (درصد و گرد کردن) تعریف می‌شود. ردیف قیمتی که اثرش آغاز شده تغییرناپذیر است: فقط «بسته» می‌شود و قیمت تازه از امروز ثبت می‌شود. «قاعدهٔ» فهرستی که تاریخچه دارد (ارز، نوع، دقت، پایه، درصد و گرد کردن) هم منجمد است. انتساب فهرست به شخص، گروه، شعبه، شرکت یا کانال هم در همین بخش است. موتور تخفیف و قیمت‌یابی نهایی در بخش فروش است.
 9. **BOM سبک.** سه نوع دارد: `kit` (بستهٔ فروشی)، `recipe` (دستور پخت کافه) و `production` (تولید داخلی نیمه‌آماده). هر BOM نسخه دارد و چرخهٔ `draft → active → archived` را طی می‌کند. هم‌پوشانی نسخهٔ فعال و چرخه در BOM ساختاری رد می‌شود. منطق مصرف در بخش انبار است.
-10. **قفل پس از استفاده.** با اولین ثبت قطعی، کالا قفل می‌شود. از آن پس واحد پایه، نوع، ردیابی، ضریب واحدها و محورهای موجود ثابت‌اند و تریگر این را اجرا می‌کند (افزودن محور به کالای ساده مجاز است). حذف فیزیکی فقط پیش از استفاده ممکن است.
+10. **قفل پس از استفاده.** با اولین ثبت قطعی، کالا قفل می‌شود. از آن پس واحد پایه، نوع، ردیابی (سریال، بچ و انقضا)، ضریب واحدها و محورهای موجود ثابت‌اند و کالا حذف نمی‌شود؛ تریگر این را اجرا می‌کند (افزودن محور به کالای ساده مجاز است). حذف فیزیکی کالا فقط پیش از استفاده ممکن است. شخص حذف فیزیکی ندارد (D-M25).
 
-اندازه: ۳۹ جدول مستأجری (۱۵ در `parties` و ۲۴ در `catalog`)، ۸ جدول مرجع در `ref`، ۸ ویو با `security_invoker`، ۴۹ تابع، ۶۴ تریگر و ۵۵ ناوردا (§۷). آزمون پایگاه داده همهٔ ناورداهای سطح پایگاه داده را با نقش `hk_app` اجرا می‌کند و سبز است.
+اندازه: ۳۹ جدول مستأجری (۱۵ در `parties` و ۲۴ در `catalog`)، ۸ جدول مرجع در `ref`، ۸ ویو با `security_invoker`، __NFUNC__ تابع، __NTRG__ تریگر و __NINV__ ناوردا (§۷). آزمون پایگاه داده هر ناوردای سطح پایگاه داده را با کد یا نام قید دقیق خودش، با نقش `hk_app` (و برای مسیر درون‌ریزی و همروندی با نقش مالک و دو نشست dblink) اجرا می‌کند و سبز است. آزمون جهش هر تریگر، ایندکس یکتای جزئی و قید CHECK/EXCLUDE را می‌کشد، جز بازماندگانی که دسترس‌ناپذیری‌شان در §۹-۱ اثبات شده است.
 
 ## ۲. دامنه
 
@@ -29,10 +29,11 @@
 | حوزه | محتوا |
 |---|---|
 | **اشخاص** | شخص حقیقی، حقوقی، مشارکت مدنی، تبعهٔ خارجی حقیقی و حقوقی؛ «مشتری عمومی» صندوق؛ شناسه‌ها و وضعیت بررسی آن‌ها؛ نقش‌ها و گروه‌ها؛ سقف اعتبار و شرایط پرداخت؛ راه‌های ارتباطی؛ نشانی با تقسیمات کشوری و کد شعبهٔ مؤدیان؛ حساب‌های بانکی (شبا و کارت)؛ روابط (سهام‌دار، مدیر، ضامن، ...)؛ توقیف تجاری؛ کد قدیمی؛ نتیجهٔ استعلام مؤدی؛ تشخیص تکراری و ادغام؛ سری کد نمایشی |
-| **پیوند با دفتر کل** | تعریف دقیق «شخص = مقدار بُعد party»، ویژگی‌های شرط نگاشت حساب (`<role>_group`، `party_person_type`، `item_posting_group`، `item_type`، `item_category`) و قرارداد رویدادها با ledger |
+| **پیوند با دفتر کل** | تعریف دقیق «شخص = مقدار بُعد party»، ویژگی‌های شرط نگاشت حساب با کلیدهای `attr:` (`attr:<role>_group`، `attr:party_role`، `attr:party_person_type`، `attr:item_posting_group`، `attr:item_type`، `attr:item_category`) و قرارداد رویدادها با ledger |
 | **کاتالوگ** | واحد سنجش و تبدیل؛ دستهٔ درختی؛ برند؛ گروه ثبت کالا؛ ویژگی‌ها و قالب ویژگی (بستهٔ صنفی)؛ کالا و خدمت؛ variant و تولید ماتریسی آن؛ بارکد (سازنده، داخلی، تأمین‌کننده، قدیمی)؛ الگوی بارکد ترازو و PLU؛ پرچم‌های سریال، بچ و انقضا؛ گارانتی؛ `sstid` و کد واحد مؤدیان؛ طبقهٔ مالیاتی؛ تصویر؛ کد کالای تأمین‌کننده؛ کد قدیمی؛ BOM سبک؛ فهرست قیمت، ردیف قیمت و انتساب؛ سری کد کالا |
 | **دادهٔ مرجع** | `ref.country`، `ref.province`، `ref.city`، `ref.bank`، `ref.bank_sheba_code`، `ref.bank_card_bin`، `ref.moadian_unit` و `ref.sstid`، و توابع اعتبارسنجی `ref.is_valid_*` (CR-02 دربارهٔ مالکیت فایل) |
-| **فیلد سفارشی** | ثبت موجودیت‌های `parties.party` و `catalog.item` در رجیستری فیلد سفارشی core (§۱۲) و ستون `custom` |
+| **فیلد سفارشی** | ثبت موجودیت‌های `parties.party` و `catalog.item` در رجیستری فیلد سفارشی core و اتصال `core.attach_custom_fields` (اعتبارسنجی و نمایه) به ستون `custom` (RV-IT-CUSTOM) |
+| **ثبت در کاتالوگ‌های core** | رجیستری صدور `.hkx` برای هر ۳۹ جدول (R-EXPORT)، مجوزها و محافظ فیلد §۵-۱۲، سهم قالب‌های نقش استاندارد، تنظیم `parties.duplicate.threshold` و مشترک رویداد `catalog.party_merge` |
 
 ### ۲-۲. بیرون از دامنه (و مالک)
 
@@ -110,8 +111,8 @@
      یکتایی `(type, source_entity_id)` در ledger تضمین شده است. **مقدار بُعد به نقش وابسته نیست.** شخصی که هم مشتری و هم تأمین‌کننده است یک تفصیلی دارد و دریافتنی و پرداختنی‌اش با «حساب معین» جدا می‌شود.
   2. **ساخت:** ledger `DimensionService.ensure_value(type_code='party', source_module='parties', entity_id, code, name, company_id)` را صدا می‌زند. این کار در subscriber رویداد `parties.party.created` انجام می‌شود، و به‌صورت **تنبل** در `post` اگر `DimensionRef(type='party', entity_id=…)` هنوز مقداری نداشت (CR-04). ورودی آن از ویوی `parties.v_party_ledger_identity` یا `PartyQuery.ledger_identity` می‌آید.
   3. **همگام‌سازی:** `parties.party.renamed` (تغییر نام یا کد) به `DimensionService.rename`، و `parties.party.merged` به `DimensionService.merge(loser_value, winner_value)` می‌رسد (`merged_into_id` در ledger). سطرهای قدیم دفتر تغییر نمی‌کنند.
-  4. **حساب معین:** هیچ ستون «حساب دریافتنی» روی شخص نیست. ماژول صدازننده (فروش، خرید، خزانه، حقوق) در `PostingRequest` کلید نگاشت را می‌فرستد، مثلاً `sales.receivable` یا `purchase.payable`. ویژگی‌ها را `PartyQuery.posting_attributes(party, role, company)` می‌سازد: `{"customer_group": "WHOLESALE", "party_person_type": "legal"}`. حسابدار در `ledger.posting_rule` قاعده‌ای با شرط `{"attr:customer_group": "WHOLESALE"}` می‌گذارد. استثنای یک شخص خاص با شرط `dim:party` ممکن است.
-  5. **گروه مؤثر:** گروه ردیف نقشِ شرکت، وگرنه ردیف پیش‌فرض، وگرنه گروه پیش‌فرض فعال همان نقش، وگرنه کلید حذف می‌شود و قاعدهٔ بدون شرط اعمال می‌شود. کد و نقش گروه تغییرناپذیرند (`HK_PARTY_GROUP_CODE_IMMUTABLE`)، چون کد انتخابگر قاعده است و FK ندارد.
+  4. **حساب معین:** هیچ ستون «حساب دریافتنی» روی شخص نیست. ماژول صدازننده (فروش، خرید، خزانه، حقوق) در `PostingRequest` کلید نگاشت را می‌فرستد، مثلاً `sales.receivable` یا `purchase.payable`. ویژگی‌ها را `PartyQuery.posting_attributes(party, role, company)` می‌سازد و **کلیدها همان دستور شرط ledger‌اند** (`attr:`؛ RV-MD-19): `{"attr:customer_group": "WHOLESALE", "attr:party_role": "customer", "attr:party_person_type": "legal"}`. صدازننده همین dict را بی‌تغییر در `PostingRequest.attributes` می‌گذارد و هیچ پیشوندی اضافه نمی‌کند. حسابدار در `ledger.posting_rule` قاعده‌ای با شرط `{"attr:customer_group": "WHOLESALE"}` می‌گذارد. `attr:party_role` قاعدهٔ قالب `{"attr:party_role": "other"}` (دریافتنی و پرداختنی غیرتجاری) را تغذیه می‌کند. استثنای یک شخص خاص با شرط `dim:party` ممکن است.
+  5. **گروه مؤثر (فیلدبه‌فیلد، RV-MD-03):** `group_id` ردیف نقشِ همان شرکت، وگرنه `group_id` ردیف پیش‌فرض، وگرنه گروه پیش‌فرض فعال همان نقش، وگرنه کلید حذف می‌شود و قاعدهٔ بدون شرط اعمال می‌شود. ردیف شرکتی که فقط سقف اعتبار را بازنویسی کرده (گروهش NULL است) گروه ردیف پیش‌فرض را می‌گیرد. `role_settings` هم همین را برای ستون‌های انتسابی (`group_id`، `payment_term_id`، `default_agent_party_id`، `bank_code`) انجام می‌دهد، ولی سیاست اعتبار (سقف، ارز، کنترل، شمول چک) یک واحد است و ردیف شرکت آن را کامل بازنویسی می‌کند. کد و نقش گروه تغییرناپذیرند (`HK_PARTY_GROUP_CODE_IMMUTABLE`)، چون کد انتخابگر قاعده است و FK ندارد.
 - **دلیل:**
   - الگوی «تفصیلی شناور» سپیدار و راهکاران، و تصمیم D-L02 و D-L03 بخش ۰۳.
   - حساب در قاعدهٔ تاریخ‌دار، با سابقه و قابل‌تغییر، به‌جای کد حساب hardcode یا حساب روی هر شخص.
@@ -134,12 +135,12 @@
 
 ### D-M06 — تشخیص تکراری دو مرحله‌ای و «رد تکراری» ماندگار
 - **تصمیم:**
-  - **بلوک‌بندی در SQL** (`parties.find_duplicate_candidates`): هم‌خوانی شناسهٔ ملی، شمارهٔ اقتصادی، موبایل یا شبا، یا `similarity(name_key) ≥ 0.5` روی ایندکس trigram.
+  - **بلوک‌بندی در SQL** (`parties.find_duplicate_candidates`): هم‌خوانی شناسهٔ ملی، شمارهٔ اقتصادی، موبایل یا شبا (هر کدام برابری روی ایندکس خودش)، یا نزدیک‌ترین `k = max(5 × limit, 50)` نام با جست‌وجوی KNN (`ORDER BY name_key <-> … LIMIT k`) روی ایندکس GiST `(tenant_id, name_key)` و سپس `similarity ≥ 0.5`. دلیل‌ها فقط روی همین مجموعهٔ کوچک حساب می‌شوند (RV-MD-12؛ نسخهٔ پیشین روی هر شخص مستأجر `similarity` می‌گرفت و با ۱۰۰ هزار شخص ۲ تا ۲٫۷ ثانیه طول می‌کشید).
     - `name_key = parties.dedup_name_key(name)` ستون مولد است: کلید جست‌وجوی fa-norm، با حذف نشانه‌گذاری، عنوان‌ها («آقای»، «خانم»، «حاج»، «دکتر»، ...) و قالب‌های حقوقی («شرکت»، «سهامی خاص»، «فروشگاه»، ...).
   - **امتیازدهی در پایتون:** `rapidfuzz.token_set_ratio` روی `name_key`، به‌اضافهٔ وزن نشانه‌ها. آستانهٔ «احتمالاً یکسان» ۹۲ است و پارامتر تنظیمات (`parties.duplicate.threshold`) است.
   - جفتی که کاربر «تکراری نیست» اعلام کرده در `duplicate_dismissal` با ترتیب `(least, greatest)` ثبت می‌شود و دیگر پیشنهاد نمی‌شود.
   - هنگام ساخت شخص، نامزد قوی (شناسه، اقتصادی، شبا، یا موبایل و نام) خطای `409 parties.party.possible_duplicate` می‌دهد، مگر شناسه‌اش در `duplicate_ack` درخواست آمده باشد.
-- **دلیل:** پژوهش ۰۲ همین کلیدها و آستانه را پیشنهاد کرده است. trigram و GIN کار بلوک‌بندی را برای ده‌ها هزار شخص زیر ۵۰ میلی‌ثانیه نگه می‌دارد. rapidfuzz (MIT) در آینهٔ بستهٔ داخلی در دسترس است.
+- **دلیل:** پژوهش ۰۲ همین کلیدها و آستانه را پیشنهاد کرده است. KNN روی GiST trigram هزینه را از اندازهٔ مستأجر جدا می‌کند: ۱۰۰ هزار شخص با نام‌های بسیار مشابه حدود ۳۵ میلی‌ثانیه (هدف ۸۰). rapidfuzz (MIT) در آینهٔ بستهٔ داخلی در دسترس است.
 - **ردشده:** امتیازدهی کامل در SQL (منطق وزن‌دار در PL/pgSQL سخت آزموده می‌شود)، و یکتایی سخت روی نام (نام تکراری واقعی رایج است).
 - **مرجع:** [۰۲ §۶.۸](../research/02-migration-enterprise-and-generic.md#۶۸-تشخیص-تکراری-dedup)، [۰۲ §۶.۶](../research/02-migration-enterprise-and-generic.md#۶۶-نرمالسازی-مقادیر)
 
@@ -149,12 +150,12 @@
     1. هر دو ردیف را با ترتیب ثابت قفل می‌کند.
     2. پیش‌شرط‌ها را بررسی می‌کند.
     3. فرزندان درون `parties` را با قواعد بخش ۵-۶-۳ جابه‌جا می‌کند.
-    4. وضعیت بازنده را `merged` می‌کند.
-    5. مسیر را فشرده می‌کند: هر شخصی که پیش‌تر در بازنده ادغام شده بود مستقیم به برنده اشاره می‌کند.
-    6. شناسه‌های خالی برنده را از بازنده پر می‌کند.
-    7. ردیف فقط‌افزودنی `party_merge` را با snapshot هر دو طرف ثبت می‌کند.
-  - وضعیت `merged` فقط از همین مسیر قابل تنظیم است (`hk.parties_merge` در تراکنش). ردیف ادغام‌شده فقط‌خواندنی است، حذف نمی‌شود و فرزند یا ارجاع تازه نمی‌پذیرد (`HK_PARTY_MERGED`).
-  - ماژول‌های دیگر با رویداد `parties.party.merged` فقط ارجاع‌های **تغییرپذیر** خود را جابه‌جا می‌کنند: پیش‌نویس‌ها، سفارش باز، تنظیمات، انتساب قیمت و کد تأمین‌کننده. این کار idempotent و در تراکنش خودشان است. اسناد قطعی و سطرهای دفتر هرگز تغییر نمی‌کنند. گزارش از `v_party_canonical` (و در ledger از `v_dimension_effective`) جانشین را می‌گیرد.
+    4. ردیف فقط‌افزودنی `party_merge` را با snapshot هر دو طرف ثبت می‌کند.
+    5. وضعیت بازنده را `merged` می‌کند.
+    6. مسیر را فشرده می‌کند: هر شخصی که پیش‌تر در بازنده ادغام شده بود مستقیم به برنده اشاره می‌کند.
+    7. شناسه‌های خالی برنده را از بازنده پر می‌کند.
+  - **پس‌شرط‌ها ساختاری‌اند، نه مسیر (RV-MD-11):** هیچ GUC یا پرچمی «merged» را باز نمی‌کند. تریگر `party_guard` گذار به `merged` را فقط وقتی می‌پذیرد که ردیف `party_merge` همان (برنده، بازنده) ثبت شده باشد و بازنده هیچ فرزند زنده‌ای نداشته باشد: نقش، ارتباط، نشانی و حساب فعال، توقیف آزادنشده، رابطه، کد قدیمی، «رد تکراری» یا نقش‌هایی که او بازاریابشان است (`HK_PARTY_MERGE_INCOMPLETE`). قید deferred `trg_party_merge_consistent` برعکسش را می‌سنجد: هر ردیف `party_merge` در پایان تراکنش یک ادغام کامل‌شده را توصیف می‌کند (`HK_PARTY_MERGE_RECORD_ORPHAN`). پیش از سنجش، ردیف با `FOR UPDATE` قفل می‌شود تا با `FOR KEY SHARE` نگهبان‌های فرزند سریال شود. پس یک `set_config` یا UPDATE دستی ادغام ناقص نمی‌سازد؛ GUC پیشین `hk.parties_merge` حذف شد. ردیف ادغام‌شده فقط‌خواندنی است، جز فشرده‌سازی مسیر (`merged_into_id` فقط به جانشینِ هدف فعلی؛ `HK_PARTY_MERGE_REPOINT`، RV-MD-06)، و فرزند یا ارجاع تازه نمی‌پذیرد (`HK_PARTY_MERGED`). ردیف کهنه‌ای که هنوز به بازنده اشاره دارد فقط «بازنشسته» می‌شود (غیرفعال یا آزاد)، نه زنده.
+  - ماژول‌های دیگر با رویداد `parties.party.merged` فقط ارجاع‌های **تغییرپذیر** خود را جابه‌جا می‌کنند: پیش‌نویس‌ها، سفارش باز، تنظیمات، انتساب قیمت و کد تأمین‌کننده. این کار idempotent و در تراکنش خودشان است. catalog هم مشترک است (`catalog.party_merge`، ثبت‌شده در `core.event_subscriber`؛ RV-MD-09) و کارش را تابع SQL `catalog.rewire_merged_party(merge_id)` انجام می‌دهد. اسناد قطعی و سطرهای دفتر هرگز تغییر نمی‌کنند. گزارش از `v_party_canonical` (و در ledger از `v_dimension_effective`) جانشین را می‌گیرد.
   - تریگر عمومی `parties.child_party_guard('<column>')` منتشر می‌شود تا هر ماژول آن را روی ستون‌های شخص جدول‌های تغییرپذیرش بگذارد.
 - **دلیل:**
   - اصل تغییرناپذیری سند قطعی و دفتر کل (قرارداد مشترک).
@@ -274,7 +275,7 @@
 - **تصمیم:**
   - `track_serial`، `track_batch`، `track_expiry` (نیازمند بچ)، `shelf_life_days` (نیازمند انقضا)، `warranty_days` و `warranty_provider_party_id` روی کالا هستند. ردیابی فقط برای کالای `stock` مجاز است.
   - شمارهٔ سریال، بچ، تاریخ انقضا و گارانتی هر سریال جدول‌های inventory هستند (الگوی bundle).
-  - این پرچم‌ها پس از استفاده قفل می‌شوند.
+  - پس از استفاده `track_serial`، `track_batch` و `track_expiry` قفل می‌شوند (RV-MD-18): بچ‌های موجود تاریخ انقضا ندارند، پس روشن کردن انقضا FEFO و قاعدهٔ «فروش بچ منقضی» بخش ۰۵ را می‌شکند. `shelf_life_days` فقط پیش‌فرض تاریخ انقضای بچ تازه است و پس از قفل هم قابل ویرایش است؛ چون به `track_expiry` بسته است، با قفل انقضا نمی‌تواند انقضا را دور بزند. گارانتی (`warranty_days` و ارائه‌دهنده) قفل نمی‌شود، چون فقط فروش‌های بعدی را تعیین می‌کند (گارانتی هر سریال روی خود سریال ثبت می‌شود).
 - **دلیل:** کالای برقی سریال و گارانتی، و داروخانه و سوپرمارکت بچ و انقضا لازم دارند. تغییر ردیابی پس از وجود موجودی، دفتر انبار را ناسازگار می‌کند.
 - **ردشده:** ردیابی در سطح variant: بی‌نیاز است و پیچیدگی می‌آورد.
 - **مرجع:** [۰۶ §۵-۳](../research/06-feature-benchmark.md#۵-۳-لوازم-برقی-و-خانگی-خرده-و-عمده-مشتری-سوم)، [۰۶ §۵-۴](../research/06-feature-benchmark.md#۵-۴-داروخانه)، [۰۶ §۷-۳](../research/06-feature-benchmark.md#۷-۳-انبار-و-ارزیابی)
@@ -285,7 +286,7 @@
     - `kit` و `recipe` فقط برای کالای `non_stock` یا `service` هستند و هنگام فروش منفجر یا مصرف می‌شوند.
     - `production` فقط برای کالای `stock` است و نیمه‌آماده‌ای مثل سیروپ یا سس را با «سند تولید داخلی» انبار می‌سازد.
   - هر BOM `version_no`، `yield_qty` و `yield_uom_id` دارد و سطرها `qty`، `uom_id` و `waste_percent` دارند.
-  - چرخه: `draft → active → archived`. ایجاد فقط در `draft`. فعال‌سازی دست‌کم یک سطر می‌خواهد. BOM فعال فقط بسته (`valid_to`) یا بایگانی می‌شود. سطر فقط روی پیش‌نویس تغییر می‌کند. حذف فقط برای پیش‌نویس است.
+  - چرخه: `draft → active → archived`. ایجاد فقط در `draft`. فعال‌سازی دست‌کم یک سطر می‌خواهد و `valid_from ≥ امروزِ مستأجر` (پس‌تاریخ فقط با پرچم مهاجرت `hk.catalog_allow_backdate`؛ RV-MD-16). BOM فعال فقط بسته (`valid_to ≥ دیروز`) یا بایگانی می‌شود و بازهٔ گذشته‌اش (پایانِ پیش از دیروز) تغییر نمی‌کند — همان قاعدهٔ سطر قیمت. سطر فقط روی پیش‌نویس تغییر می‌کند. حذف فقط برای پیش‌نویس است.
   - بازهٔ اعتبار نسخه‌های فعالِ یک (کالا، variant، نوع) با EXCLUDE هم‌پوشانی ندارد. چرخه (مؤلفه‌ای که به والد برسد) رد می‌شود. مؤلفهٔ variantدار باید `component_variant_id` داشته باشد.
 - **دلیل:**
   - کافه «دستور پخت با کسر خودکار» و «نیمه‌آماده با تولید داخلی ساده» لازم دارد.
@@ -300,8 +301,9 @@
 - **تصمیم:**
   - `price_list` این‌ها را دارد: `kind ∈ {sales, purchase}`، `currency`، `price_precision`، `prices_include_tax`، اعتبار فهرست، پیش‌فرض (یکی برای هر (شرکت، نوع))، و فهرست پایه با `base_adjust_percent` و گرد کردن (`rounding_increment` و `rounding_mode`). فهرست پایه هم‌نوع و هم‌ارز است، بی‌چرخه است و عمق اشتقاق حداکثر ۳ است.
   - `price_list_item`: (کالا، variant یا همه، واحد، `min_qty`) با `[valid_from, valid_to]`. هم‌پوشانی بازه برای کلید یکسان با EXCLUDE رد می‌شود. دقت مبلغ ≤ دقت فهرست است.
-    - **ردیفی که اثرش آغاز شده** (`valid_from < امروزِ مستأجر`) تغییر یا حذف نمی‌شود. فقط `valid_to ≥ دیروز` می‌گیرد. ردیف تازه از امروز یا آینده است.
-    - ورود پس‌تاریخ فقط در UoW مهاجرت با مجوز `catalog.price.backdate` و پرچم تراکنشی `hk.catalog_allow_backdate` ممکن است.
+    - **ردیفی که اثرش آغاز شده** (`valid_from < امروزِ مستأجر`) تغییر یا حذف نمی‌شود، با هیچ پرچمی. فقط `valid_to ≥ دیروز` می‌گیرد. ردیف تازه از امروز یا آینده است و ردیف آینده با ویرایش به گذشته نمی‌رود.
+    - **درج** پس‌تاریخ (پر کردن تاریخچه) فقط در UoW مهاجرت با مجوز `catalog.price.backdate` و پرچم تراکنشی `hk.catalog_allow_backdate` ممکن است (RV-MD-11). EXCLUDE تضمین می‌کند که این درج فقط شکاف تاریخچه را پر کند.
+  - **قاعدهٔ فهرست منجمد (RV-MD-04):** وقتی «خانوادهٔ» فهرست — خودش، نیاکان پایه‌اش و فهرست‌های مشتق از آن — ردیفی با اثر آغازشده دارد، `kind`، `currency`، `price_precision`، `prices_include_tax`، `base_price_list_id`، `base_adjust_percent`، `rounding_increment`، `rounding_mode` و `valid_from` فهرست تغییر نمی‌کنند (`HK_CATALOG_PRICE_LIST_RULE_FROZEN`) و `valid_to` فقط ≥ دیروز. تغییر قاعده = فهرست تازه (و انتساب تازه). مستقل از تاریخچه: فرزند مشتق و انتساب گروه باید با نوع و ارز تازه سازگار بمانند و ردیف‌های موجود در دقت تازه بگنجند.
   - `price_list_assignment`: انتساب فهرست به شخص یا گروه شخص (نه هر دو)، شعبه، شرکت یا کانال (`pos`، `invoice`، `online`)، با اولویت و بازه. گروه با نوع فهرست سازگار است: فروش برای مشتری و خرید برای تأمین‌کننده.
   - `catalog.resolve_price` قیمت پایهٔ یک فهرست را با قاعدهٔ ثابت می‌دهد (§۵-۶-۷). تخفیف، طرح و انتخاب فهرست بر اساس انتساب کار بخش فروش است.
 - **دلیل:**
@@ -318,18 +320,19 @@
   - `item.usage_locked_at` فقط با `CatalogService.mark_used` و فقط از NULL به زمان تنظیم می‌شود. هنگام درج ممنوع است و برگشت ندارد.
   - inventory، sales، purchase و pos آن را در همان تراکنشِ اولین ثبت قطعی سطر صدا می‌زنند.
   - پس از قفل این‌ها ثابت‌اند:
-    - `base_uom_id`، `item_type`، `track_serial` و `track_batch`
+    - `base_uom_id`، `item_type`، `track_serial`، `track_batch` و `track_expiry` (RV-MD-18)
     - محورهای موجود (افزودن محور تازه به کالای ساده مجاز است)
     - ضریب، واحد و پایه بودن `item_uom` (حذف هم ممنوع است؛ غیرفعال کنید)
     - مقدار محورهای موجودِ variantها
+  - کالای قفل‌شده حذف نمی‌شود (`HK_CATALOG_ITEM_LOCKED` روی DELETE؛ RV-MD-15). تریگر حذف آبشاری واحدها قفل را نمی‌بیند، چون والد پیش‌تر حذف شده است؛ پس نگهبان روی خود کالاست.
 - **دلیل:** دفتر انبار مقدار را به واحد پایه ذخیره می‌کند. تغییر ضریب یا واحد پایه همهٔ مانده‌های گذشته را بی‌صدا غلط می‌کند.
 - **ردشده:** پرس‌وجوی «آیا استفاده شده؟» از ماژول‌های بالادست هنگام هر ویرایش: خلاف DAG است و کند.
 - **مرجع:** [۰۶ §۷-۳](../research/06-feature-benchmark.md#۷-۳-انبار-و-ارزیابی)
 
 ### D-M19 — گروه ثبت کالا و گروه شخص: کد پایدار، انتخابگر نگاشت
 - **تصمیم:**
-  - `item_posting_group` (مثل «کالای تجاری»، «مواد اولیه» یا «خدمات») روی کالا یا به‌صورت پیش‌فرض روی دسته است. نزدیک‌ترین نیای دارای پیش‌فرض برنده است (`v_category_effective`).
-  - `catalog.posting_attributes(variant)` این‌ها را می‌دهد: `{"item_posting_group", "item_type", "item_category"}`.
+  - `item_posting_group` (مثل «کالای تجاری»، «مواد اولیه» یا «خدمات») روی کالا یا به‌صورت پیش‌فرض روی دسته است. نزدیک‌ترین نیای دارای پیش‌فرض برنده است. `catalog.category_posting_group` از دستهٔ خود کالا رو به بالا می‌رود (عمق ≤ ۱۰، هر گام یک جست‌وجوی کلید؛ RV-MD-13) و `v_sku` و `posting_attributes` از آن استفاده می‌کنند؛ `v_category_effective` فقط نمای درخت برای UI است.
+  - `catalog.posting_attributes(variant)` با کلیدهای دستور شرط ledger این‌ها را می‌دهد: `{"attr:item_posting_group", "attr:item_type", "attr:item_category"}` (RV-MD-19).
   - کد گروه ثبت کالا تغییرناپذیر است.
 - **دلیل:** قاعدهٔ نگاشت ledger با `attr:item_posting_group` حساب موجودی، بهای تمام‌شده و فروش را پیدا می‌کند (بخش ۰۳ D-L14). FK از ledger به catalog وجود ندارد، پس کد باید پایدار باشد.
 - **ردشده:** حساب موجودی روی هر کالا: همان مشکل D-M04.
@@ -363,7 +366,7 @@
     - ویژگی‌ها و قالب ویژگی
     - گروه‌های ثبت کالا و گروه‌های شخص
     - الگوی ترازو، سری کد، فیلد سفارشی پیشنهادی (از core) و قاعده‌های نگاشت پیشنهادی (از ledger)
-  - هر ردیف ساخته‌شده `source_pack` دارد. اعمال idempotent است و کلیدش کد است. ردیفی که کاربر ویرایش کرده بازنویسی نمی‌شود.
+  - هر ردیف ساخته‌شده `source_pack` دارد. اعمال idempotent است و کلیدش کد است. ردیفی که کاربر ویرایش کرده بازنویسی نمی‌شود. «ویرایش‌شده» با hash فیلدهای مدیریت‌شده در `rules.pack_artifact.content_sha256` تشخیص داده می‌شود، نه با `row_version` که با هر touch و ممیزی بالا می‌رود و مثبت کاذب می‌دهد (05:CR-C10؛ `CatalogPackApplier`).
   - چند بسته با هم فعال می‌شوند.
   - فیلد سفارشی با `core.custom_field_def` و ستون `custom jsonb` روی `party` و `item` است.
 - **دلیل:** اصل «هستهٔ عمومی + بستهٔ صنفی» و پاسخ Q-A (صنف‌های تازه بعداً، بدون تغییر هسته).
@@ -394,9 +397,9 @@
 
 ### D-M25 — حذف فیزیکی فقط پیش از استفاده
 - **تصمیم:**
-  - **شخص:** حذف فقط وقتی ممکن است که هیچ ارجاع FK وجود نداشته باشد. اسناد سایر ماژول‌ها FK دارند، پس پایگاه داده حذف را رد می‌کند و API خطای `parties.party.in_use` می‌دهد. در غیر این صورت وضعیت `inactive` می‌شود.
-  - **کالا:** حذف فقط پیش از `usage_locked_at` ممکن است، و همان حفاظت FK را دارد. فرزندان درون‌ماژولی با `ON DELETE CASCADE` حذف می‌شوند.
-- **دلیل:** دادهٔ آزمایشی یا اشتباه تایپیِ تازه باید پاک‌شدنی باشد. پس از استفاده، تاریخچه مقدم است.
+  - **شخص: حذف فیزیکی ندارد (RV-MD-20).** مقدار بُعد `party` در ledger (D-M04) از لحظهٔ ساخت با FK به شخص اشاره می‌کند، و parties (L2) نمی‌تواند ledger (L3) را صدا بزند تا آن مقدار را پاک کند. پس «حذف بی‌ارجاع» عملاً هرگز رخ نمی‌داد. به‌جایش: اشتباه تایپی → ویرایش (نام، کد و شناسه‌ها تغییرپذیرند و رویداد `renamed` بُعد را همگام می‌کند)، تکراری → ادغام، و دادهٔ آزمایشی یا نامعتبر → `inactive` (از انتخابگرها پنهان، سند تازه نمی‌پذیرد). `hk_app` روی `parties.party` گرنت DELETE ندارد؛ پاک‌سازی نهایی مستأجر با `hk_migrator` است. API مسیر DELETE شخص ندارد.
+  - **کالا:** حذف فقط پیش از `usage_locked_at` ممکن است (`HK_CATALOG_ITEM_LOCKED` روی کالای قفل‌شده)، و همان حفاظت FK را دارد. کالا مقدار بُعد ندارد، پس کالای تازه و استفاده‌نشده واقعاً حذف‌شدنی است. فرزندان درون‌ماژولی با `ON DELETE CASCADE` حذف می‌شوند.
+- **دلیل:** کالای اشتباه تایپیِ تازه باید پاک‌شدنی باشد. شخص از لحظهٔ ساخت در دفتر کل «حساب تفصیلی» دارد، پس غیرفعال کردن صادقانه‌تر از وعدهٔ حذفی است که FK آن را رد می‌کند. پس از استفاده، تاریخچه مقدم است.
 
 ## ۴. مدل داده
 
@@ -505,7 +508,7 @@ erDiagram
 | `party_bank_account` | حساب بانکی شخص | `sheba` (CHECK `is_valid_sheba`)، `card_number` (CHECK Luhn)، `account_number`، `bank_code` (از شبا پر می‌شود؛ ناسازگاری خطا؛ از BIN فقط اگر شبا نیست)، شعبه، صاحب حساب، `currency`، `is_primary` (یکی)، ستون‌های راستی‌آزمایی (`verified_holder_name`، `verified_at`، `verification_provider` و `verification_ref`، سه‌تایی جفت). تغییر شبا، کارت یا شماره حساب راستی‌آزمایی را پاک می‌کند. دست‌کم یک شناسه لازم است. `UNIQUE (party, sheba)` و `(party, card)` |
 | `party_relation` | رابطهٔ دو شخص | `relation ∈ {contact_person, director, shareholder, guarantor, parent_company, family, other}`، `share_percent` فقط برای سهام‌دار، بازهٔ اعتبار، بی‌رابطه با خود |
 | `party_hold` | توقیف | `scope`، `source`، `reason`، `placed_*` و `released_*`. یک فعال برای هر (شخص، scope، source). فقط آزادسازی یک‌باره (`trg_hold_guard`). بدون DELETE |
-| `party_legacy_code` | کد در نرم‌افزار مبدأ | `source_system` (`holoo`، `sepidar`، `mahak`، `hesabfa`، `excel`، `hesabketab`، ...)، `source_scope`، `legacy_code` (ident نرمال)، `legacy_name` خام، `legacy_kind`، `migration_run_id` (ارجاع نرم؛ migration بالادست است). فقط `party_id` تغییر می‌کند |
+| `party_legacy_code` | کد در نرم‌افزار مبدأ | `source_system` (`holoo`، `sepidar`، `mahak`، `hesabfa`، `excel`، `hesabketab`، ...)، `source_scope`، `legacy_code` (ident نرمال)، `legacy_name` خام، `legacy_kind`، `migration_job_id` (ارجاع نرم به `migration.job`؛ migration بالادست است؛ 08:CR-MG09). `source_scope` همان «`source_db`» بخش ۰۸ است (مثلاً `Holoo1` یا `Sepidar01/1405`). فقط `party_id` تغییر می‌کند |
 | `party_merge` | سابقهٔ ادغام (فقط‌افزودنی) | `winner_party_id`، `loser_party_id` (یکتا: هر شخص حداکثر یک بار بازنده می‌شود)، `reason`، `merged_by`، `loser_snapshot` و `winner_before` (jsonb کامل ردیف)، `moved` (شمار ردیف‌های جابه‌جاشده به تفکیک جدول)، `participants` (مشترکان رویداد در لحظهٔ ادغام) |
 | `duplicate_dismissal` | «این دو تکراری نیستند» | `party_a_id < party_b_id` (CHECK)، یکتا. هنگام ادغام ردیف‌های بازنده حذف می‌شوند |
 | `party_taxpayer_inquiry` | نتیجهٔ استعلام مؤدی (فقط‌افزودنی) | `economic_code`، `outcome ∈ {found, not_found, error}`، `taxpayer_name`، `taxpayer_status`، `raw`، `adapter`، `inquired_*` |
@@ -515,9 +518,10 @@ erDiagram
 
 | تریگر | جدول | قاعده |
 |---|---|---|
-| `trg_party_guard` (`party_guard`) | `party` | درج با `merged` ممنوع است. `merged` فقط وقتی `hk.parties_merge = id` باشد (از `merge_parties`). ردیف ادغام‌شده فقط `merged_into_id` را تغییر می‌دهد (فشرده‌سازی مسیر) و حذف نمی‌شود. هدف ادغام خودش ادغام‌شده نیست. `tenant_id` و `id` تغییرناپذیرند |
-| `trg_child_party_guard` (`child_party_guard(col)`) | `party_role`، `party_contact`، `party_address`، `party_bank_account`، `party_hold`، `party_legacy_code`، `party_taxpayer_inquiry`، `party_relation` (هر دو ستون) | درج یا ویرایش ردیفی که به شخص ادغام‌شده اشاره کند → `HK_PARTY_MERGED`. **تابع عمومی** و قابل استفادهٔ ماژول‌های دیگر |
-| `trg_party_role_guard` | `party_role` | محدودیت شرکت، «مشتری عمومی» و بازاریاب ادغام‌شده |
+| `trg_party_guard` (`party_guard`) | `party` | درج با `merged` ممنوع است. گذار به `merged` فقط با پس‌شرط‌های ادغام: ردیف `party_merge` همان (برنده، بازنده) و نبود فرزند زنده روی بازنده (`HK_PARTY_MERGED_ONLY_VIA_MERGE`، `HK_PARTY_MERGE_INCOMPLETE`؛ پیش از سنجش `FOR UPDATE`). ردیف ادغام‌شده فقط `merged_into_id` را و فقط به جانشینِ هدف فعلی تغییر می‌دهد (`HK_PARTY_MERGE_REPOINT`) و حذف نمی‌شود. هدف ادغام خودش ادغام‌شده نیست. تنگ کردن `company_id` وقتی ردیف نقش شرکت دیگری هست رد می‌شود (`HK_PARTY_ROLE_COMPANY_SCOPE`؛ RV-MD-14). `tenant_id` و `id` تغییرناپذیرند |
+| `trg_party_merge_consistent` (deferred) | `party_merge` | هر ردیف سابقه در پایان تراکنش یک ادغام کامل‌شده است (`HK_PARTY_MERGE_RECORD_ORPHAN`) |
+| `trg_child_party_guard` (`child_party_guard(col)`) | `party_role`، `party_contact`، `party_address`، `party_bank_account`، `party_hold`، `party_legacy_code`، `party_taxpayer_inquiry`، `party_relation` (هر دو ستون) | درج یا تغییر ستون شخص به شخص ادغام‌شده → `HK_PARTY_MERGED`؛ شخص با `FOR KEY SHARE` (همان قفل FK) خوانده می‌شود تا با ادغام در جریان سریال شود (RV-MD-05). ویرایش بی‌تغییر ستون شخص روی ردیفی که شخصش ادغام شده فقط «بازنشسته کردن» است (`is_active=false` یا آزادسازی توقیف). **تابع عمومی** و قابل استفادهٔ ماژول‌های دیگر |
+| `trg_party_role_guard` | `party_role` | محدودیت شرکت (شخص با `FOR KEY SHARE`)، «مشتری عمومی» و بازاریاب ادغام‌شده (هنگام درج یا تغییر بازاریاب، با `FOR KEY SHARE`) |
 | `trg_payment_term_sum` و `trg_payment_term_has_lines` | `payment_term_line` و `payment_term` | deferred؛ جمع ۱۰۰ و دست‌کم یک خط |
 | `trg_bank_account_guard` | `party_bank_account` | استخراج یا تطبیق بانک از شبا، بانک از BIN، و پاک کردن راستی‌آزمایی |
 | `trg_hold_guard` | `party_hold` | فقط یک آزادسازی |
@@ -533,9 +537,9 @@ erDiagram
 | `dedup_name_key(text)` | IMMUTABLE | کلید نام برای تکراری (dedup-v1). نسخهٔ تازه = تابع تازه + بازتولید ستون |
 | `national_id_acceptable(type, value, status)` | IMMUTABLE | قاعدهٔ CHECK شناسهٔ ملی (D-M02) |
 | `merge_parties(winner, loser, reason, actor, participants)` | `→ uuid` (شناسهٔ `party_merge`) | ادغام درون‌ماژولی (§۵-۶-۳) |
-| `find_duplicate_candidates(party, min_similarity=0.5, limit=20)` | `→ (candidate_id, reasons[], name_similarity)` | بلوک‌بندی تکراری |
-| `role_settings(party, role, company)` | `→ SETOF party_role` | ردیف مؤثر نقش |
-| `posting_attributes(party, role, company)` | `→ jsonb` | ویژگی‌های شرط قاعدهٔ نگاشت؛ ادغام‌شده → جانشین |
+| `find_duplicate_candidates(party, min_similarity=0.5, limit=20)` | `→ (candidate_id, reasons[], name_similarity)` | بلوک‌بندی تکراری؛ فقط شاخه‌های ایندکس‌دار و KNN نام (`HK_PARTY_DUPLICATE_ARGS` برای آرگومان بیرون از بازه) |
+| `role_settings(party, role, company)` | `→ SETOF party_role` | ردیف مؤثر نقش: ردیف شرکت (ستون‌های انتسابی خالی از ردیف پیش‌فرض) یا ردیف پیش‌فرض |
+| `posting_attributes(party, role, company)` | `→ jsonb` | ویژگی‌های شرط قاعدهٔ نگاشت با کلیدهای `attr:` (`attr:<role>_group`، `attr:party_role`، `attr:party_person_type`)؛ ادغام‌شده → جانشین |
 | `next_party_code(role=NULL, group=NULL)` | `→ text` | کد تازه از سری |
 | `v_party_canonical` | ویو | `(party_id, canonical_party_id, status)`. برای گزارش و تجمیع اسناد قدیمی |
 | `v_party_ledger_identity` | ویو | ورودی `ensure_value`: کد، نام، شرکت و جانشین |
@@ -575,18 +579,18 @@ erDiagram
 | `trg_category_guard` | بی‌چرخه و عمق ≤ ۱۰ |
 | `trg_posting_group_guard` | کد تغییرناپذیر |
 | `trg_axis_guard` و `trg_item_axis_guard` | محور فقط ویژگی محورپذیر |
-| `trg_item_guard` | قفل هنگام درج ممنوع؛ پس از قفل، واحد پایه، نوع، ردیابی و محورهای موجود ثابت؛ قفل برگشت ندارد |
+| `trg_item_guard` | قفل هنگام درج ممنوع؛ پس از قفل، واحد پایه، نوع، ردیابی (سریال، بچ و انقضا) و محورهای موجود ثابت و حذف ممنوع؛ قفل برگشت ندارد؛ شرکت گارانتی ادغام‌شده (هنگام درج یا تغییر ستون) رد |
 | `trg_variant_guard` | هویت variant ثابت؛ پس از قفل کالا، مقدار محورِ موجود ثابت (NULL → مقدار مجاز) |
 | `trg_item_uom_guard` | پس از قفل: ضریب، واحد و پایه ثابت؛ حذف ممنوع |
 | `trg_item_integrity` (سه جدول، deferred) | `check_item_integrity`: ردیف واحد پایه، variant پیش‌فرض کالای ساده با کد کالا، و مقادیر محور variantها |
 | `trg_item_attribute_value_guard` | نوع مقدار و «نه محور» |
-| `trg_barcode_guard` | هویت ثابت؛ برخورد با پیشوند ترازوی فعال |
-| `trg_scale_pattern_guard` | برخورد با بارکد موجود؛ واحد وزن از جنس جرم |
-| `trg_price_list_guard` | پایه هم‌نوع و هم‌ارز، بی‌چرخه، عمق ≤ ۳ |
-| `trg_price_list_item_guard` | دقت؛ ممنوعیت پس‌تاریخ؛ تغییرناپذیری اثر گذشته؛ هویت ثابت |
-| `trg_price_list_assignment_guard` | سازگاری گروه با نوع فهرست؛ شخص ادغام‌شده |
-| `trg_item_supplier_guard` | تأمین‌کنندهٔ ادغام‌شده |
-| `trg_bom_guard` و `trg_bom_line_guard` | ماشین حالت BOM، سازگاری نوع، چرخه و variant مؤلفه |
+| `trg_barcode_guard` | هویت ثابت؛ برخورد با پیشوند ترازوی فعال (پس از قفل مشورتی تراکنشی (مستأجر، پیشوند)؛ RV-MD-17) |
+| `trg_scale_pattern_guard` | برخورد با بارکد موجود هنگام فعال‌سازی یا تغییر پیشوند (همان قفل مشورتی)؛ واحد وزن از جنس جرم |
+| `trg_price_list_guard` | پایه هم‌نوع و هم‌ارز، بی‌چرخه، عمق ≤ ۳؛ قاعدهٔ منجمد پس از آغاز اثر خانواده؛ سازگاری فرزند مشتق، انتساب و دقت ردیف‌ها (RV-MD-04) |
+| `trg_price_list_item_guard` | دقت؛ ممنوعیت پس‌تاریخ (پرچم مهاجرت فقط برای درج)؛ تغییرناپذیری اثر گذشته؛ هویت ثابت |
+| `trg_price_list_assignment_guard` | سازگاری گروه با نوع فهرست؛ شخص ادغام‌شده (`catalog.party_ref_check`: درج یا تغییر ستون با `FOR KEY SHARE`؛ ردیف کهنه فقط غیرفعال) |
+| `trg_item_supplier_guard` | تأمین‌کنندهٔ ادغام‌شده (همان `party_ref_check`) |
+| `trg_bom_guard` و `trg_bom_line_guard` | ماشین حالت BOM، سازگاری نوع، چرخه و variant مؤلفه؛ فعال‌سازی از امروز و بستن از دیروز (RV-MD-16) |
 | `trg_touch` | `updated_at` و `row_version` |
 
 **توابع و ویوهای `catalog`:**
@@ -600,10 +604,14 @@ erDiagram
 | `resolve_price(list, variant, uom, qty, on)` | `→ (price, source_price_list_id, entry_id, via)` | قیمت پایهٔ یک فهرست (§۵-۶-۷) |
 | `bom_reaches(tenant, from, target)` | STABLE | تشخیص چرخه تا عمق ۲۵ |
 | `check_item_integrity(tenant, item)` | void | قاعدهٔ یکپارچگی، که از تریگر deferred صدا زده می‌شود |
-| `posting_attributes(variant)` | `→ jsonb` | `item_posting_group`، `item_type` و `item_category` |
+| `posting_attributes(variant)` | `→ jsonb` | `attr:item_posting_group`، `attr:item_type` و `attr:item_category` |
 | `next_item_code(category=NULL)` | `→ text` | کد تازه از سری نزدیک‌ترین نیا |
-| `v_category_effective` | ویو بازگشتی | مسیر (`path_ids`، `path_codes`، `path_names`)، عمق، و پیش‌فرض‌های ارث‌برده |
-| `v_sku` | ویو | SKU با نام نمایشی، نوع، واحد پایه، گروه ثبت مؤثر، ردیابی، `sstid` مؤثر، طبقهٔ مالیات، پرچم‌ها، `is_active` (کالا و variant)، محورها و PLU |
+| `category_path(tenant, category)` و `category_posting_group(tenant, category)` | STABLE | پیمایش رو به بالا از یک دسته (ریشه اول) و گروه ثبت مؤثر؛ هر گام یک جست‌وجوی کلید (RV-MD-13) |
+| `price_list_family_has_history(tenant, list)` | STABLE | آیا خود فهرست، نیاکان پایه یا مشتق‌هایش ردیفی با اثر آغازشده دارند (RV-MD-04) |
+| `party_ref_check(...)` و `scale_prefix_lock(tenant, prefix)` | داخلی | نگهبان ارجاع به شخص و قفل مشورتی پیشوند ترازو |
+| `rewire_merged_party(merge_id)` | `→ jsonb` | مشترک `catalog.party_merge`: انتساب قیمت، تأمین‌کننده و شرکت گارانتی بازنده → جانشین؛ idempotent (RV-MD-09) |
+| `v_category_effective` | ویو بازگشتی | فقط نمای درخت (UI): مسیر (`path_ids`، `path_codes`، `path_names`)، عمق، و پیش‌فرض‌های ارث‌برده |
+| `v_sku` | ویو | SKU با نام نمایشی، نوع، واحد پایه، گروه ثبت مؤثر (`category_posting_group`)، ردیابی، `sstid` مؤثر، طبقهٔ مالیات، پرچم‌ها، `is_active` (کالا و variant)، محورها، PLU، `warranty_days` و `warranty_provider_party_id` (05:CR-C08) |
 | `v_item_uom_effective` | ویو | واحدهای کالا با کد، نام، اعشار و `moadian_unit_code` مؤثر |
 | `v_barcode_lookup` | ویو | کد → (variant، کالا، واحد، ضریب، فعال بودن) |
 
@@ -611,11 +619,11 @@ erDiagram
 
 | نقش | parties | catalog | ref |
 |---|---|---|---|
-| `hk_app` | SELECT، INSERT، UPDATE و DELETE روی جدول‌های تغییرپذیر؛ `party_hold`: بدون DELETE؛ `duplicate_dismissal`: بدون UPDATE؛ `party_merge` و `party_taxpayer_inquiry`: فقط SELECT و INSERT | SELECT، INSERT، UPDATE و DELETE روی جدول‌ها؛ `barcode_counter`: بدون DELETE | SELECT |
+| `hk_app` | SELECT، INSERT، UPDATE و DELETE روی جدول‌های تغییرپذیر؛ `party`: بدون DELETE (D-M25)؛ `party_hold`: بدون DELETE؛ `duplicate_dismissal`: بدون UPDATE؛ `party_merge` و `party_taxpayer_inquiry`: فقط SELECT و INSERT | SELECT، INSERT، UPDATE و DELETE روی جدول‌ها؛ `barcode_counter`: بدون DELETE | SELECT |
 | `hk_readonly` | SELECT همه | SELECT همه | SELECT |
 | هر دو | EXECUTE همهٔ توابع `ref`، `parties` و `catalog`؛ SELECT ویوها | | |
 
-همهٔ توابع `SECURITY INVOKER` هستند. پس RLS در `merge_parties`، `resolve_price`، `parse_scale_barcode` و دیگر توابع هم برقرار است (`INV-MD-01`).
+همهٔ توابع `SECURITY INVOKER` هستند. پس RLS در `merge_parties`، `resolve_price`، `parse_scale_barcode` و دیگر توابع هم برقرار است (`INV-MD-01`). این بخش هیچ GUC تراکنشی جز `hk.catalog_allow_backdate` ندارد (R-GUC؛ `hk.parties_merge` حذف شد).
 
 ## ۵. منطق دامنه و سرویس‌ها
 
@@ -883,7 +891,7 @@ class PartyService:
     async def create(self, uow, cmd: PartyCreate) -> PartyOut: ...
     async def update(self, uow, party_id: UUID, patch: PartyPatch) -> PartyOut: ...
     async def set_status(self, uow, party_id: UUID, status: Literal["active", "inactive"], row_version: int) -> PartyOut: ...
-    async def delete(self, uow, party_id: UUID, row_version: int) -> None: ...          # فقط بی‌ارجاع ← parties.party.in_use
+    # حذف فیزیکی شخص وجود ندارد (D-M25)؛ set_status(..., "inactive") کنار می‌گذارد و ادغام تکراری را یکی می‌کند
     async def upsert_role(self, uow, party_id: UUID, role: PartyRoleIn, row_version: int | None) -> UUID: ...
     async def deactivate_role(self, uow, role_id: UUID, row_version: int) -> None: ...
     async def add_contact(self, uow, party_id: UUID, c: ContactIn) -> UUID: ...           # و update/remove
@@ -1051,8 +1059,9 @@ PartyMergeService.merge(req):
   1  authz parties.party.merge؛ اگر core.approval_policy برای 'parties.party.merge' فعال است ← درخواست تأیید و توقف
   2  هر دو row_version با ردیف فعلی برابر (قفل خوش‌بینانه)
   3  participants ← فهرست مشترکان فعال رویداد parties.party.merged (core.event_subscription)
-  4  merge_id ← SELECT parties.merge_parties(winner, loser, reason, actor, participants)   -- یک تراکنش
-  5  outbox parties.party.merged {merge_id, winner_id, loser_id, loser_code, chain: [شناسه‌های فشرده‌شده]}
+  4  compressed_ids ← شناسهٔ اشخاصی که پیش‌تر در بازنده ادغام شده بودند (فشرده‌سازی مسیر)
+     merge_id ← SELECT parties.merge_parties(winner, loser, reason, actor, participants)   -- یک تراکنش
+  5  outbox parties.party.merged {merge_id, winner_id, loser_id, loser_code, compressed_ids}
   6  audit (جزئیات = moved)
 ```
 
@@ -1062,24 +1071,24 @@ PartyMergeService.merge(req):
 |---|---|
 | پیش‌شرط‌ها | برنده ≠ بازنده؛ دلیل ≥ ۵ نویسه؛ هیچ‌کدام `merged` یا «مشتری عمومی» نیستند؛ اگر بازنده شناسهٔ ملی دارد، نوع شخص یکسان است و شناسهٔ برنده خالی یا برابر است؛ شمارهٔ اقتصادی هر دو در صورت وجود برابر است؛ اگر برنده به شرکتی محدود است، بازنده هم به همان شرکت محدود است |
 | قفل | `FOR UPDATE` هر دو ردیف به ترتیب `id` (جلوگیری از بن‌بست ادغام‌های متقاطع) |
-| `party_role` | ردیف (نقش، شرکت) که برنده ندارد منتقل می‌شود؛ بقیه روی بازنده غیرفعال می‌شوند. `default_agent_party_id = loser` در نقش‌های دیگران → برنده |
+| `party_role` | ردیف (نقش، شرکت) که برنده ندارد منتقل می‌شود؛ بقیه روی بازنده غیرفعال می‌شوند. بازاریابِ ردیف منتقل‌شده اگر خودِ برنده باشد پاک می‌شود (همان شخص دو بار ثبت شده بود؛ `moved.party_role_agent_cleared`؛ RV-MD-21). `default_agent_party_id = loser` در نقش‌های دیگران → برنده |
 | `party_contact` | غیرتکراری‌ها (kind، value) منتقل می‌شوند. «اصلی» فقط اگر برنده اصلیِ آن نوع را ندارد. تکراری‌ها روی بازنده غیرفعال می‌شوند |
 | `party_address` | همه منتقل می‌شوند. «اصلی» فقط اگر برنده اصلی ندارد. `moadian_branch_code` تکراری NULL می‌شود |
 | `party_bank_account` | غیرتکراری‌ها (شبا یا کارت) منتقل می‌شوند. تکراری‌ها روی بازنده غیرفعال می‌مانند، چون treasury ممکن است به آن‌ها ارجاع داده باشد |
 | `party_relation` | رابطهٔ برنده↔بازنده حذف می‌شود. بقیه در هر دو جهت بی‌تکرار منتقل می‌شوند و باقی‌مانده حذف می‌شود |
-| `party_hold` فعال | منتقل می‌شود اگر برنده هم‌ارز (scope، source) فعال ندارد. وگرنه با یادداشت «آزاد در ادغام» آزاد می‌شود. **توقیف هرگز با ادغام گم نمی‌شود** |
+| `party_hold` فعال | توقیف تغییرناپذیر است و فقط آزاد می‌شود (`trg_hold_guard`)؛ پس «انتقال» = توقیف هم‌ارز تازه روی برنده با همان scope، source، دلیل، گذارنده و زمان گذاشتن، و آزاد کردن توقیف بازنده با یادداشت «آزاد در ادغام؛ توقیف هم‌ارز روی جانشین …» (RV-MD-02). اگر برنده هم‌ارز (scope، source) فعال دارد، فقط آزاد می‌شود. **توقیف فعال هرگز با ادغام گم نمی‌شود** و سابقهٔ بازنده می‌ماند |
 | `party_legacy_code` | همه منتقل می‌شوند، به‌اضافهٔ کد خود بازنده (`hesabketab/merged`) |
 | `duplicate_dismissal` | ردیف‌های بازنده حذف می‌شوند |
+| سابقه | `party_merge` با `loser_snapshot`، `winner_before`، `moved` (شامل `path_compressed`) و `participants`، پیش از تغییر وضعیت (پس‌شرط `party_guard`) |
 | ردیف بازنده | `status='merged'`، `merged_into_id`، `merged_at`. هر ردیفی که به بازنده اشاره می‌کرد → برنده (فشرده‌سازی مسیر) |
 | هویت برنده | شناسهٔ ملی (با وضعیت و override)، اقتصادی، گذرنامه و ثبت، اگر خالی‌اند، از بازنده پر می‌شوند |
-| سابقه | `party_merge` با `loser_snapshot`، `winner_before`، `moved` و `participants` |
 
 قواعد subscriberها (هر ماژول، idempotent با `merge_id`):
 
 | ماژول | جابه‌جا می‌شود | جابه‌جا نمی‌شود |
 |---|---|---|
 | ledger | `DimensionService.merge(value(loser), value(winner))`: `merged_into_id` و غیرفعال. قاعده‌های نگاشت با `dim:party = کد بازنده` گزارش می‌شوند تا حسابدار اصلاح کند | سطرهای سند |
-| catalog | `price_list_assignment.party_id` (تکراری حذف)، `item_supplier.supplier_party_id` (تکراری: ادغام کد تأمین‌کننده، ترجیحی برنده)، `item.warranty_provider_party_id` | — |
+| catalog (`catalog.party_merge` → `catalog.rewire_merged_party`) | `price_list_assignment.party_id` و `item_supplier.supplier_party_id` به جانشینِ فعلی برنده؛ ردیفی که روی جانشین هم‌ارز دارد (همان فهرست، شعبه، شرکت و کانال؛ یا همان کالا و variant؛ یا همان کد کالای تأمین‌کننده) جابه‌جا نمی‌شود و روی بازنده غیرفعال می‌ماند؛ `item.warranty_provider_party_id` | — |
 | sales و purchase | پیش‌نویس، پیش‌فاکتور و سفارش باز | فاکتور و برگشت قطعی |
 | treasury | چک‌های در جریان: فقط فیلد «طرف‌حساب جاری» برای پیگیری. حساب‌های بانکی شخص در treasury | سند دریافت و پرداخت قطعی |
 | payroll | اگر هر دو قرارداد کار فعال داشته باشند، subscriber خطای عملیاتی گزارش می‌کند تا کاربر دستی تصمیم بگیرد | فیش قطعی |
@@ -1093,6 +1102,7 @@ PartyMergeService.merge(req):
 parties.party.created ──► ledger subscriber: ensure_value('party', 'parties', id, code, name, company_id)
 sales.post(invoice):
    attrs ← PartyQuery.posting_attributes(customer, 'customer', company) ∪ CatalogQuery.posting_attributes(sku) (برای سطر کالا)
+           (کلیدها از پیش «attr:»‌دارند و بی‌تغییر در PostingRequest.attributes می‌روند؛ صدازننده پیشوند اضافه نمی‌کند)
    PostingRequest.lines += {posting_key:'sales.receivable', attributes: attrs, dimensions:[DimensionRef('party', entity_id=customer)]}
    ledger.post: DimensionRef → value_id (اگر نبود: ensure_value تنبل با PartyQuery.ledger_identity؛ CR-04)
                MappingService.resolve('sales.receivable', attrs) → حساب (مثلاً «بدهکاران تجاری – همکاران» برای WHOLESALE)
@@ -1161,14 +1171,18 @@ resolve_price(L, v, u, q, d):
      نامزدها: ردیف‌های X برای item با (variant_id = v یا NULL)، d ∈ [valid_from, valid_to]،
                (uom = u یا uom = پایه)، min_qty·factor(uom) ≤ q·f_u
      ترتیب: uom دقیق > پایه؛ سپس variant مشخص > سطح کالا؛ سپس بزرگ‌ترین min_qty به واحد پایه
-     اگر یافت: p ← (uom دقیق ? price : round(price·f_u, X.precision))
+     اگر یافت: p ← price (در واحد خود ردیف)
                برای فهرست‌های مشتقِ پیموده‌شده از درونی به بیرونی: p ← round_inc(p·(1+adj/100)) ؛ round(p, precision)
+               اگر uom ردیف ≠ u: p ← round(p·f_u, 12)   -- بدون گرد کردن به دقت فهرست (RV-MD-22)
                return (p, X, entry, via ∈ {direct, base_uom, derived})
      وگرنه X ← X.base (عمق ≤ ۳)
   هیچ ← None (sales: «قیمت تعریف نشده»؛ هرگز صفر بی‌صدا)
 ```
 
-قیمت کالای ترازوی قیمتی از خود بارکد می‌آید و `resolve_price` صدا زده نمی‌شود. sales ثبت می‌کند که منبع قیمت «بارکد» بوده است.
+- **قرارداد خروجی (RV-MD-22):** `price` قیمت یک واحدِ واحد درخواستی است. برای واحد دقیق همان مبلغ ردیف (در دقت فهرست) است؛ برای واحد تبدیل‌شده ضرب دقیق بدون گرد کردن (مقیاس `core.rate`، ۱۲ رقم اعشار). مصرف‌کننده مبلغ سطر را `round(qty × price, دقت فهرست)` حساب می‌کند و قیمت واحد را پیش از ضرب گرد نمی‌کند. مثال: ۱۲٬۳۴۵٬۶۷۸ ریال/کیلوگرم ← ۱۲٬۳۴۵٫۶۷۸ ریال/گرم و ۲۵۰ گرم = ۳٬۰۸۶٬۴۲۰ ریال (نه ۳٬۰۸۶٬۵۰۰).
+- **فهرست مشتق:** درصد و گرد کردن روی قیمتِ واحدی اعمال می‌شود که ردیف پایه در آن تعریف شده است (مثلاً کیلوگرم)، و تبدیل به واحد کوچک‌تر پس از آن انجام می‌شود. پس «عمده = خرده −۷٪، گرد به ۱۰۰۰ ریال» قیمت گرم را به ۱۰۰۰ ریال گرد نمی‌کند.
+
+قیمت کالای ترازوی قیمتی از خود بارکد می‌آید و `resolve_price` صدا زده نمی‌شود. sales ثبت می‌کند که منبع قیمت «بارکد» بوده است (`sales.invoice_line.price_source = 'barcode'`؛ 05:CR-C08).
 
 #### ۵-۶-۸. فعال‌سازی نسخهٔ BOM
 
@@ -1176,8 +1190,9 @@ resolve_price(L, v, u, q, d):
 activate(bom, valid_from):
   1  bom.status = draft، ≥۱ سطر (DB)
   2  prev ← نسخهٔ فعال همان (item, variant, kind) با بازهٔ شامل valid_from
+     valid_from ≥ امروزِ مستأجر (DB: HK_CATALOG_BOM_BACKDATED؛ فقط مهاجرت با پرچم پس‌تاریخ)
      اگر prev: اگر prev.valid_from ≥ valid_from ← 409 catalog.bom.overlap (نسخهٔ آینده‌دار را دستی بایگانی کنید)
-               وگرنه UPDATE prev SET valid_to = valid_from − 1
+               وگرنه UPDATE prev SET valid_to = valid_from − 1   (≥ دیروز؛ DB: HK_CATALOG_BOM_PAST_IMMUTABLE)
   3  UPDATE bom SET status='active', valid_from, activated_at=now(), activated_by  (EXCLUDE تضمین نهایی)
   4  رویداد catalog.bom.activated {bom_id, item_id, variant_id, kind, valid_from, previous_bom_id}
 inventory.consume(sale_line): bom ← CatalogQuery.bom_for(variant, kind, sale_date) (variant-خاص > سطح کالا)
@@ -1192,10 +1207,10 @@ inventory.consume(sale_line): bom ← CatalogQuery.bom_for(variant, kind, sale_d
 #### ۵-۶-۱۰. ورود بالک از مهاجرت (idempotent)
 
 ```
-upsert_parties(run, system, scope, rows):          -- دسته‌های ≤ ۱۰۰۰، هر دسته یک savepoint
+upsert_parties(job_id, system, scope, rows):       -- دسته‌های ≤ ۱۰۰۰، هر دسته یک savepoint؛ scope = source_db بخش ۰۸ (CR-MG09)
   برای هر ردیف:
     1  نرمال‌سازی و اعتبارسنجی (همان create)؛ شناسهٔ غلط ← وضعیت override با دلیل خودکار
-       «migration:<system>:<scope> checksum failed; approved in run <run>» فقط اگر کاربر در ویزارد «پذیرش گروهی» زده باشد،
+       «migration:<system>:<scope> checksum failed; approved in job <job_id>» فقط اگر کاربر در ویزارد «پذیرش گروهی» زده باشد،
        وگرنه ردیف خطا (سطح Error قابل override در گزارش dry-run)
     2  match: party_legacy_code(system, scope, code) ← update؛ وگرنه national_id ← پیوند به موجود (+ legacy code)؛
        وگرنه economic_code/sheba/mobile+name ≥ T ← «پیشنهاد پیوند» در گزارش (کاربر تأیید می‌کند)؛ وگرنه insert
@@ -1204,6 +1219,10 @@ upsert_parties(run, system, scope, rows):          -- دسته‌های ≤ ۱۰
   خروجی: شمار inserted/updated/linked/errors + نگاشت legacy→id برای مراحل بعد
 upsert_items: همان الگو؛ کد کالا اگر با الگوی Code نخواند (فاصله، فارسی) ← کد تازه از سری + legacy code؛
   گروه اصلی/فرعی هلو ← دسته‌های دوسطحی با کد صفردار حفظ‌شده؛ واحدها با کد؛ قیمت‌ها با upsert_prices(backdate=true)
+  (پرچم پس‌تاریخ فقط «درج» تاریخچه را باز می‌کند؛ ویرایش یا حذف ردیف اثرگذار حتی در مهاجرت ممنوع است)
+deactivate_if_unused(kind ∈ {party, item}, ids):   -- برای rollback جبرانی مهاجرت (CR-MG09، CR-MG17)
+  هر شناسه‌ای که از job همین کار ساخته شده و هیچ ارجاعی جز legacy code خود ندارد ← inactive (کالا: حذف اگر قفل نیست)؛
+  بقیه دست‌نخورده و در گزارش rollback «در حال استفاده» فهرست می‌شوند
 ```
 
 #### ۵-۶-۱۱. اعمال بستهٔ صنفی
@@ -1213,7 +1232,8 @@ apply(pack, version):
   manifest ← rules.PackQuery.manifest(pack, version)   (بستهٔ امضاشده؛ امضا در rules بررسی شده)
   برای هر نوع شیء به ترتیب وابستگی (uom → attribute → attribute_value → attribute_set → posting_group → category →
        party_group → payment_term → scale_pattern → code_series):
-     موجود با همان code و source_pack=pack ← اگر row_version = نسخهٔ ساخت بسته (ویرایش‌نشده) ← به‌روزرسانی به نسخهٔ تازه؛ وگرنه رد و گزارش
+     موجود با همان code و source_pack=pack ← اگر hash فیلدهای مدیریت‌شده = rules.pack_artifact.content_sha256 نصب (ویرایش‌نشده)
+        ← به‌روزرسانی به نسخهٔ تازه و ثبت hash تازه؛ وگرنه رد و گزارش (05:CR-C10)
      موجود با همان code و source_pack دیگر/NULL ← رد و گزارش «تعارض کد»
      ناموجود ← insert با source_pack
   فیلدهای سفارشی پیشنهادی ← core.CustomFieldService.ensure؛ قاعده‌های نگاشت پیشنهادی ← ledger.MappingService.propose (پیش‌نویس)
@@ -1273,7 +1293,7 @@ apply(pack, version):
 | `parties.party.renamed` | party | party_id، old_code، code، old_name، name | ledger (rename)، pos-sync |
 | `parties.party.identity_changed` | party | party_id، changed_fields[] (person_type، national_id، economic_code، ...) | tax |
 | `parties.party.status_changed` | party | party_id، from، to | pos-sync |
-| `parties.party.merged` | party | merge_id، winner_id، loser_id، loser_code، compressed_ids[] | ledger، catalog، sales، purchase، treasury، payroll، pos، reports |
+| `parties.party.merged` | party | merge_id، winner_id، loser_id، loser_code، compressed_ids[] (یک نام در همه‌جا؛ §۵-۶-۳) | ledger، catalog (`catalog.party_merge`)، sales، purchase، treasury، payroll، pos، reports |
 | `parties.role.changed` | party | party_id، role، company_id، group_code، credit_limit، credit_control | sales (کش اعتبار)، pos-sync |
 | `parties.hold.placed` و `parties.hold.released` | party | party_id، hold_id، scope، source | sales، purchase، treasury، pos-sync |
 | `parties.bank_account.changed` | party | party_id، account_id، sheba_last4، verified | treasury (هشدار پرداخت به شبای تازه) |
@@ -1291,38 +1311,45 @@ apply(pack, version):
 
 ### ۵-۹. نگاشت خطای پایگاه داده به کد API (`errors.yaml` ماژول‌ها)
 
+همهٔ کدها قاعدهٔ R-ERR را دارند: `<module>.<object>.<reason>`، پیشوند = ماژول تعریف‌کننده (`parties` یا `catalog`)، و هر `500` به شکل `<module>.internal.<reason>`. نگاشت روی نام قید یا پیشوند پیام `HK_…` است (همان چیزی که آزمون پایگاه داده دقیق می‌سنجد).
+
 | پیشوند DB یا قید | کد API | وضعیت |
 |---|---|---|
-| CHECK `party_national_id_valid` یا `party_national_id_override` | `parties.party.national_id_invalid` (با `overridable`) | 422 |
+| CHECK `party_national_id_valid`، `party_national_id_presence` یا `party_national_id_override` | `parties.party.national_id_invalid` (با `overridable`) | 422 |
 | unique `party_national_id_uq` | `parties.party.duplicate_national_id` (با `existing_party_id`) | 409 |
 | unique `(tenant_id, code)` روی party یا item یا variant | `parties.party.code_taken` و `catalog.item.code_taken` | 409 |
-| سایر CHECKهای شخص (`party_*`، `contact_*`، `address_*`، `bank_account_*`) | `parties.validation` (با `constraint` و `field`) | 422 |
+| سایر CHECKهای شخص (`party_*`، `contact_*`، `address_*`، `bank_account_*`) | `parties.party.invalid` (با `constraint` و `field`) | 422 |
 | `HK_PARTY_MERGED`، `HK_PARTY_MERGED_IMMUTABLE` و `HK_PARTY_MERGED_ONLY_VIA_MERGE` | `parties.party.merged` (با `successor_id`) | 409 |
-| `HK_PARTY_MERGE_*` و `HK_PARTY_ALREADY_MERGED` | `parties.merge.not_allowed` (با `reason`) | 409 |
+| `HK_PARTY_MERGE_*` (پیش‌شرط) و `HK_PARTY_ALREADY_MERGED` | `parties.merge.not_allowed` (با `reason`) | 409 |
+| `HK_PARTY_MERGE_INCOMPLETE`، `HK_PARTY_MERGE_RECORD_ORPHAN` و `HK_PARTY_MERGE_REPOINT` (فقط اگر کدی ادغام را دور بزند) | `parties.internal.merge_invariant` | 500 |
 | `HK_PARTY_ROLE_COMPANY_SCOPE` و `HK_PARTY_ANONYMOUS_ROLE` | `parties.role.not_allowed` | 422 |
 | `HK_PARTY_PAYMENT_TERM_SUM` | `parties.payment_term.invalid_lines` | 422 |
 | `HK_PARTY_BANK_MISMATCH` | `parties.bank_account.bank_mismatch` | 422 |
 | `HK_PARTY_HOLD_*` | `parties.hold.immutable` | 409 |
-| `HK_PARTY_GROUP_CODE_IMMUTABLE`، `HK_CATALOG_POSTING_GROUP_CODE_IMMUTABLE` و `HK_PARTY_LEGACY_CODE_IMMUTABLE` | `*.code_immutable` | 409 |
-| FK violation روی حذف شخص یا کالا | `parties.party.in_use` و `catalog.item.in_use` | 409 |
+| `HK_PARTY_GROUP_CODE_IMMUTABLE`، `HK_CATALOG_POSTING_GROUP_CODE_IMMUTABLE` و `HK_PARTY_LEGACY_CODE_IMMUTABLE` | `parties.party_group.code_immutable`، `catalog.posting_group.code_immutable` و `parties.legacy_code.immutable` | 409 |
+| FK violation روی حذف کالا | `catalog.item.in_use` (شخص حذف فیزیکی ندارد؛ D-M25) | 409 |
 | `HK_CATALOG_ITEM_*` (یکپارچگی) و `HK_CATALOG_VARIANT_AXES` | `catalog.item.integrity` | 422 |
 | `HK_CATALOG_ITEM_LOCKED` و `HK_CATALOG_VARIANT_LOCKED` | `catalog.item.locked` | 409 |
 | `HK_CATALOG_ATTRIBUTE_*` و `HK_CATALOG_CATEGORY_*` | `catalog.setup.invalid` | 422 |
 | CHECK `barcode_*` و unique barcode | `catalog.barcode.invalid` و `catalog.barcode.taken` | 422 و 409 |
 | `HK_CATALOG_BARCODE_SCALE_PREFIX` و `HK_CATALOG_SCALE_PREFIX_CONFLICT` | `catalog.barcode.scale_prefix_conflict` | 409 |
 | `HK_CATALOG_BARCODE_IMMUTABLE` | `catalog.barcode.immutable` | 409 |
-| `HK_CATALOG_SCALE_WEIGHT_UOM` | `catalog.setup.invalid` | 422 |
-| `HK_CATALOG_BARCODE_SPACE_EXHAUSTED`، `HK_CATALOG_CODE_SERIES_EXHAUSTED` و `HK_PARTY_CODE_SERIES_EXHAUSTED` | `catalog.code_space_exhausted` و `parties.code_space_exhausted` | 409 |
+| `HK_CATALOG_SCALE_WEIGHT_UOM` و CHECK `scale_*` | `catalog.setup.invalid` | 422 |
+| `HK_CATALOG_BARCODE_SPACE_EXHAUSTED`، `HK_CATALOG_CODE_SERIES_EXHAUSTED` و `HK_PARTY_CODE_SERIES_EXHAUSTED` | `catalog.barcode.space_exhausted`، `catalog.code_series.exhausted` و `parties.code_series.exhausted` | 409 |
 | `HK_CATALOG_PRICE_*` و EXCLUDE `price_list_item_no_overlap` | `catalog.price.immutable_history`، `catalog.price.overlap` و `catalog.price.precision` | 409 و 422 |
-| `HK_CATALOG_PRICE_LIST_*` و `HK_CATALOG_ASSIGNMENT_GROUP_ROLE` | `catalog.price_list.invalid` | 422 |
-| `HK_CATALOG_BOM_*` و EXCLUDE `bom_active_no_overlap` | `catalog.bom.invalid`، `catalog.bom.overlap` و `catalog.bom.immutable` | 422 و 409 |
+| `HK_CATALOG_PRICE_LIST_RULE_FROZEN` | `catalog.price_list.rule_frozen` (پیشنهاد: «فهرست تازه بسازید») | 409 |
+| `HK_CATALOG_PRICE_LIST_*` (جز بالا) و `HK_CATALOG_ASSIGNMENT_GROUP_ROLE` | `catalog.price_list.invalid` | 422 |
+| `HK_CATALOG_BOM_*` و EXCLUDE `bom_active_no_overlap` | `catalog.bom.invalid`، `catalog.bom.overlap` و `catalog.bom.immutable` (`BACKDATED` و `PAST_IMMUTABLE` اینجا) | 422 و 409 |
 | `HK_PARTY_ROLE_INVALID` | `parties.role.invalid` | 422 |
 | `HK_PARTY_NOT_FOUND` (ادغام) | `parties.party.not_found` | 404 |
-| `HK_PARTY_IMMUTABLE_FIELD` و `HK_CATALOG_IMMUTABLE_FIELD` (تغییر `tenant_id`، `id` یا والد) | `core.immutable_field` | 500 (باگ؛ API چنین تغییری را نمی‌فرستد) |
+| `HK_PARTY_IMMUTABLE_FIELD` و `HK_CATALOG_IMMUTABLE_FIELD` (تغییر `tenant_id`، `id` یا والد) | `parties.internal.immutable_field` و `catalog.internal.immutable_field` | 500 (باگ؛ API چنین تغییری را نمی‌فرستد) |
+| `HK_PARTY_DUPLICATE_ARGS` | `parties.internal.invalid_argument` | 500 (باگ) |
 | `HK_CATALOG_CATEGORY_NOT_FOUND` | `catalog.category.not_found` | 404 |
-| `HK_PARTY_CODE_SERIES_INACTIVE` و `HK_CATALOG_CODE_SERIES_INACTIVE` | `*.code_series.inactive` | 409 |
+| `HK_PARTY_CODE_SERIES_INACTIVE` و `HK_CATALOG_CODE_SERIES_INACTIVE` | `parties.code_series.inactive` و `catalog.code_series.inactive` | 409 |
+| `HK_IMMUTABLE` (`party_merge`، `party_taxpayer_inquiry`) | `core.record.immutable` | 409 |
+| `HK_CF_*` (فیلد سفارشی) | کدهای `core.custom_field.*` کاتالوگ kernel | 422 |
 | `HK_ENCODING` (فقط هنگام migration) | — (شکست استقرار) | — |
-| `HK_TENANT_CONTEXT_MISSING` | `core.tenant.context_violation` | 500 (باگ) |
+| `HK_TENANT_CONTEXT_MISSING` | `core.internal.tenant_isolation` | 500 (باگ) |
 
 ### ۵-۱۰. سطح دستیار هوشمند (Q-F)
 
@@ -1340,8 +1367,10 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 
 - **قفل‌ها:**
   - `next_party_code`، `next_item_code` و `allocate_internal_barcode` ردیف سری یا شمارنده را تا commit قفل می‌کنند (سریال‌سازی تخصیص کد).
-  - ادغام دو ردیف شخص را به ترتیب `id` قفل می‌کند.
+  - ادغام دو ردیف شخص را به ترتیب `id` با `FOR UPDATE` قفل می‌کند. هر درج یا تغییر ارجاع به شخص (فرزندان parties، `party_role`، انتساب قیمت، تأمین‌کننده، شرکت گارانتی و جدول‌های ماژول‌های دیگر با `child_party_guard`) ردیف شخص را با `FOR KEY SHARE` می‌خواند؛ پس درجِ هم‌زمان با ادغام تا commit آن منتظر می‌ماند و وضعیت `merged` را می‌بیند (RV-MD-05). گذار به `merged` و تنگ کردن `company_id` درون تریگر `party_guard` به `FOR UPDATE` ارتقا می‌یابد تا با همین نگهبان‌ها سریال شود (RV-MD-14).
+  - درج بارکد ۱۳ رقمی و فعال‌سازی الگوی ترازو قفل مشورتی تراکنشی `(مستأجر، پیشوند دورقمی)` می‌گیرند (RV-MD-17). سنجش پس از قفل در READ COMMITTED snapshot تازه دارد؛ `UnitOfWork` همین سطح جداسازی را به کار می‌برد.
   - `mark_used` ردیف کالا را قفل می‌کند.
+  - آزمون همروندی این قفل‌ها با دو نشست واقعی (dblink) در `T20` آزمون پایگاه داده است.
   - ورود بالک مهاجرت شمارنده را یک بار برای دسته قفل می‌کند.
 - **هدف‌های کارایی** (معیارهای `bench_*` در CI شبانه):
 
@@ -1366,7 +1395,7 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 
 | مجوز | کار |
 |---|---|
-| `parties.party.read`، `parties.party.create`، `parties.party.update` و `parties.party.delete` | پایهٔ شخص و فرزندان |
+| `parties.party.read`، `parties.party.create` و `parties.party.update` | پایهٔ شخص و فرزندان (حذف فیزیکی شخص و مجوز `parties.party.delete` وجود ندارد؛ D-M25) |
 | `parties.party.identity.read` (حساس) | دیدن کامل شناسهٔ ملی، شمارهٔ شناسنامه و گذرنامه (وگرنه `partial_last4`) |
 | `parties.party.override_id` | پذیرش شناسهٔ با checksum غلط |
 | `parties.party.merge` | ادغام (پیشنهاد: با `core.approval_policy`) |
@@ -1380,10 +1409,12 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | `catalog.price.backdate` | فقط نقش مهاجرت و مدیر |
 | `catalog.bom.read`، `catalog.bom.manage` و `catalog.bom.activate` | — |
 
-`field_guard`ها:
-- `parties.party.national_id` و `birth_cert_no` و `passport_no` ← `parties.party.identity.read` (`partial_last4`)
-- `parties.party_bank_account.sheba` و `card_number` و `account_number` ← `parties.bank_account.read` (`partial_last4`)
-- `catalog.price_list_item.price` برای فهرست `purchase` ← `catalog.price.purchase.read` (`omit`). این قاعده را سرویس با نوع فهرست اعمال می‌کند.
+`field_guard`ها (ثبت‌شده در `core.field_guard` در بخش ۱۲ فایل SQL؛ RV-IT-02):
+- `parties.party.national_id` و `birth_cert_no` و `passport_no` ← خواندن `parties.party.identity.read`، نوشتن `parties.party.update` (`partial_last4`، `is_secret` = همیشه پوشیده در ورود به‌جای کاربر)
+- `parties.party_bank_account.sheba` و `card_number` و `account_number` ← خواندن `parties.bank_account.read`، نوشتن `parties.bank_account.manage` (`partial_last4`، `is_secret`)
+- قیمت فهرست `purchase` ← `catalog.price.purchase.read` (`omit`). ستون `price` مشترک فهرست فروش و خرید است، پس این قاعده **ردیف `field_guard` ندارد** و سرویس آن را با نوع فهرست اعمال می‌کند.
+
+**ثبت در core (بخش ۱۲ فایل SQL):** همهٔ مجوزهای جدول بالا در `core.permission` با `risk` (عادی؛ حساس: شناسه، حساب بانکی، توقیف، تنظیمات، حذف کالا، مدیریت قیمت، قیمت خرید و فعال‌سازی BOM؛ بحرانی: ادغام و پس‌تاریخ) و `scope_dimensions = {company}` (جز ادغام و تنظیمات، که سطح مستأجرند). سهم قالب‌های نقش استاندارد: `admin` همه جز `catalog.price.backdate`؛ `accountant` اشخاص کامل (با ادغام و override) و خواندن کاتالوگ و قیمت خرید؛ `sales_clerk` و `cashier` خواندن و ساخت شخص و خواندن کالا و قیمت فروش (بدون شناسهٔ کامل)؛ `purchaser` مدیریت کالا و قیمت و قیمت خرید؛ `warehouse_keeper` خواندن کالا و BOM؛ `payroll_officer` شخص، شناسه و حساب بانکی؛ `auditor` همهٔ خواندن‌ها؛ `support_readonly` خواندن پایه؛ `integration` خواندن و نوشتن شخص، کالا و قیمت. `catalog.price.backdate` در هیچ قالبی نیست و فقط نقش مهاجرت آن را صریح می‌گیرد. قالب دستیار وجود ندارد (R-AI-PRINCIPAL). تنظیم `parties.duplicate.threshold` (int، ۸۰ تا ۱۰۰، پیش‌فرض ۹۲، سطح مستأجر، نوشتن با `parties.setup.manage`) در `core.setting_def` ثبت است (RV-X1-23).
 
 ## ۶. API
 
@@ -1404,8 +1435,7 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | POST | `/parties/validate` | آزمون خشک (نرمال‌سازی، شناسه‌ها، تکراری) | `parties.party.read` | — |
 | GET | `/parties/{id}` | خواندن (`follow_merge=true` پیش‌فرض؛ پاسخ `merged_into_id` دارد) | `parties.party.read` | — |
 | PATCH | `/parties/{id}` | ویرایش فیلدهای شخص | `parties.party.update` | — |
-| DELETE | `/parties/{id}` | حذف شخص بی‌ارجاع | `parties.party.delete` | — |
-| POST | `/parties/{id}/status` | `active` یا `inactive` | `parties.party.update` | — |
+| POST | `/parties/{id}/status` | `active` یا `inactive` (شخص حذف فیزیکی ندارد؛ D-M25) | `parties.party.update` | — |
 | GET، POST | `/parties/{id}/roles` | نقش‌ها؛ ساخت یا به‌روزرسانی نقش (پیش‌فرض یا شرکت) | `parties.party.read` / `.update` | — |
 | PATCH، DELETE | `/party-roles/{role_id}` | ویرایش یا غیرفعال کردن نقش | `parties.party.update` | — |
 | GET، POST | `/parties/{id}/contacts` | راه‌های ارتباطی | `parties.party.read` / `.update` | — |
@@ -1501,53 +1531,56 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | **INV-MD-04** | `hk_readonly` می‌خواند و نمی‌نویسد | GRANT | `T19 INV-MD-04 readonly can read` و `readonly cannot write` |
 | **INV-MD-05** | ستون‌های متنی نرمال fa-norm-v1 هستند. کدها (شخص، کالا، SKU، گروه، ...) در مستأجر یکتا و ASCII‌اند. ستون‌های جست‌وجو مولدند | CHECK `x = core.fa_normalize_text(x)`؛ UNIQUE؛ `GENERATED` | `T02 INV-MD-05 fa-norm …`؛ `T06 INV-MD-05 unnormalized name (Arabic yeh)` و `duplicate party code` |
 | **INV-MD-06** | هر به‌روزرسانی ردیف تغییرپذیر `row_version` را یک واحد زیاد و `updated_at` را تازه می‌کند | `trg_touch` (`core.touch_row`) | `T06 INV-MD-06 row_version increments`؛ `tests/db/masterdata/test_concurrency.py::test_if_match_conflict_409` |
+| **INV-MD-07** | هر جدول مستأجری این بخش در `core.export_table_registry` (با ستون‌های PII) ثبت است؛ مجوزها و محافظ فیلد §۵-۱۲، سهم قالب‌های نقش، تنظیم `parties.duplicate.threshold`، مشترک `catalog.party_merge` و فیلد سفارشی `party` و `item` در core ثبت‌اند؛ `core.security_lint()` برای `parties`، `catalog` و `ref` تهی است | بخش ۱۲ فایل SQL (وقتی 10 اعمال شده؛ R-ORDER) | `T21 RV-IT-01 …`، `RV-IT-02 …`، `RV-X1-23 …`، `RV-MD-09 catalog subscribes to parties.party.merged` و `RV-IT-CUSTOM …` (کلید تعریف‌نشده ← `HK_CF_UNKNOWN_FIELD`) |
+| **INV-MD-08** | هر قید CHECK دو اسکیما (حتی در مسیر درون‌ریزی با `session_replication_role=replica` که تریگر و FK خاموش‌اند) مقدار ناقض را با نام خودش رد می‌کند | قیدهای CHECK | `T23 every CHECK of parties and catalog is exercised by name` (شمارش = همهٔ CHECKهای کاتالوگ) و `T23 unique index …` |
 | **INV-PTY-01** | `national_id` و `national_id_status` هر دو NULL یا هر دو پرند. قالب بر حسب نوع: حقیقی ۱۰، حقوقی ۱۱، مشارکت مدنی ۱۱ (`format_only`)، تبعهٔ حقیقی ۱۲ (`format_only`)، تبعهٔ حقوقی بدون شناسه | CHECK `party_national_id_presence` و `party_national_id_valid` (`parties.national_id_acceptable`) | `T06 INV-PTY-01 legal id with 10 digits`، `civil partnership marked valid`، `foreign legal with national id` و `national id without status` |
 | **INV-PTY-02** | `valid` ⇔ checksum درست. `override` فقط برای checksum غلط، با دلیل ≥ ۵ نویسه و زمان، و هرگز برای «همه رقم یکسان». ستون‌های override فقط با `override` پرند | CHECK `party_national_id_valid` و `party_national_id_override`؛ سرویس: وضعیت را خودش تعیین می‌کند و مجوز `override_id` می‌خواهد | `T06 INV-PTY-02 bad checksum marked valid`، `override of a valid code`، `override without reason`، `override of all-same digits` و `override fields on valid`؛ `tests/integration/parties/test_party_create.py::test_override_requires_permission` |
 | **INV-PTY-03** | شناسهٔ ملی در مستأجر بین اشخاص ادغام‌نشده یکتاست (بین مستأجرها نه) | ایندکس یکتای جزئی `party_national_id_uq` | `T06 INV-PTY-03 duplicate national id`؛ `T10 INV-PTY-03 duplicate of adopted id`؛ `T17` (همان کد در مستأجر B) |
 | **INV-PTY-04** | شمارهٔ اقتصادی دقیقاً ۱۱ یا ۱۴ رقم است | CHECK `ref.is_valid_economic_code` | `T06 INV-PTY-04 economic code 12 digits` |
 | **INV-PTY-05** | فیلدهای حقیقی (نام، پدر، جنسیت، تولد، شناسنامه) فقط برای حقیقی و تبعهٔ حقیقی‌اند. شناسنامه و محل و تاریخ صدورش فقط برای حقیقی ایرانی‌اند، و تاریخ صدور ≥ تاریخ تولد. ثبت فقط برای حقوقی‌ها. «مشتری عمومی» حقیقی و بی‌شناسه است. گذرنامه و کشورش جفت‌اند | CHECKهای `party_natural_fields`، `party_birth_cert_iranian`، `party_birth_cert_dates`، `party_legal_fields`، `party_anonymous` و `party_passport_pair` | `T06 INV-PTY-05 natural with registration no`، `legal with first name`، `anonymous with id`، `birth certificate on foreign natural` و `birth certificate issued before birth` |
 | **INV-PTY-06** | گروه ردیف نقش، گروهی از همان نقش است | FK ترکیبی `(tenant_id, group_id, role)` → `party_group(tenant_id, id, role)` | `T07 INV-PTY-06 customer role with supplier group` |
-| **INV-PTY-07** | برای هر (شخص، نقش، شرکت یا NULL) حداکثر یک ردیف هست. تنظیم مؤثر: ردیف شرکت، وگرنه پیش‌فرض. ردیف شرکت در محدودهٔ `party.company_id` است. «مشتری عمومی» فقط نقش مشتری بی‌اعتبار دارد | `UNIQUE NULLS NOT DISTINCT`؛ `parties.role_settings`؛ `trg_party_role_guard` | `T07 INV-PTY-07 duplicate role/company`، `company-specific role settings win`، `default role settings as fallback`، `role for a company outside party scope` و `anonymous as supplier` |
+| **INV-PTY-07** | برای هر (شخص، نقش، شرکت یا NULL) حداکثر یک ردیف هست. تنظیم مؤثر: ردیف شرکت (ستون‌های انتسابی خالی از ردیف پیش‌فرض)، وگرنه پیش‌فرض. ردیف شرکت در محدودهٔ `party.company_id` است، هم هنگام نوشتن نقش و هم هنگام تنگ کردن محدودهٔ شخص، حتی هم‌زمان. «مشتری عمومی» فقط نقش مشتری بی‌اعتبار دارد | `UNIQUE NULLS NOT DISTINCT`؛ `parties.role_settings`؛ `trg_party_role_guard` (`FOR KEY SHARE`)؛ `trg_party_guard` (تنگ کردن با `FOR UPDATE`) | `T07 INV-PTY-07 duplicate role/company`، `company-specific role settings win`، `default role settings as fallback`، `role for a company outside party scope` و `anonymous as supplier`؛ `T10b RV-MD-14 narrowing a party below its company role rows` و `RV-MD-03 role_settings: …`؛ `T20 RV-MD-14 …` (دو نشست، هر دو ترتیب) |
 | **INV-PTY-08** | سقف اعتبار و ارزش جفت‌اند. `credit_control ≠ none` سقف لازم دارد. اعتبار فقط برای مشتری و تأمین‌کننده است. بازاریاب فقط برای مشتری و ≠ خود است | CHECKهای `party_role_credit_*` و `party_role_agent` | `T07 INV-PTY-08 credit limit without currency`، `block without limit` و `credit on employee role` |
 | **INV-PTY-09** | خطوط هر شرایط پرداخت در پایان تراکنش جمعشان دقیقاً ۱۰۰٪ است و دست‌کم یک خط دارند. روز تخفیف ≤ روز سررسید | تریگرهای قیدی deferred `trg_payment_term_sum` و `trg_payment_term_has_lines`؛ CHECK | `T05 INV-PTY-09 sum 90 accepted`، `term without lines accepted` و `discount days > due days`؛ hypothesis `test_payment_term_split_sums_to_total` |
 | **INV-PTY-10** | موبایل `09xxxxxxxxx` یا E.164 غیرایرانی است. تلفن و فکس قالب‌دارند. ایمیل کوچک‌حرف است. برای هر (شخص، نوع) حداکثر یک راه ارتباطی اصلی فعال هست | CHECKهای `contact_*`؛ ایندکس `party_contact_one_primary` | `T08 INV-PTY-10 mobile without leading zero`، `+98 must be normalized`، `email upper case` و `second primary mobile` |
 | **INV-PTY-11** | شهرِ نشانی متعلق به استانش است. نشانی خارجی تقسیمات ایران ندارد. کد پستی ایران ۱۰ رقم است. یک نشانی اصلی و کد شعبهٔ مؤدیان یکتا برای هر شخص | FK ترکیبی به `ref.city`؛ CHECKهای `address_*`؛ ایندکس‌های جزئی | `T08 INV-PTY-11 city outside province`، `postal 9 digits` و `foreign address with Iranian province` |
 | **INV-PTY-12** | شبا mod-97 و کارت Luhn معتبرند. دست‌کم یک شناسهٔ حساب هست. بانکِ شبا از کد شبا می‌آید و ناسازگاری خطاست. BIN فقط بانک نمایشی را پر می‌کند. تغییر شناسهٔ حساب راستی‌آزمایی را پاک می‌کند. یک حساب اصلی برای هر شخص | CHECKها؛ `trg_bank_account_guard`؛ ایندکس جزئی | `T08 INV-PTY-12 bank derived from SHEBA`، `bank from card BIN (display only)`، `invalid SHEBA`، `invalid card`، `SHEBA/bank mismatch`، `no identifier` و `SHEBA change clears verification` |
-| **INV-PTY-13** | برای هر (شخص، scope، source) حداکثر یک توقیف فعال هست. توقیف فقط یک بار آزاد می‌شود، بقیهٔ ستون‌ها تغییرناپذیرند و حذف ممکن نیست. `v_party_hold_state` دقیقاً توقیف‌های فعال را تجمیع می‌کند | ایندکس `party_hold_one_active`؛ `trg_hold_guard`؛ نبود DELETE grant | `T09 INV-PTY-13 second active hold`، `hold state view`، `edit hold reason`، `release twice` و `delete hold` |
-| **INV-PTY-14** | وضعیت `merged` فقط از `parties.merge_parties` تنظیم می‌شود. ردیف ادغام‌شده (جز `merged_into_id`) تغییرناپذیر و حذف‌نشدنی است. هیچ ردیف تازه یا ویرایش‌شده‌ای در parties یا catalog به شخص ادغام‌شده اشاره نمی‌کند | `trg_party_guard`؛ `trg_child_party_guard`؛ تریگرهای انتساب قیمت، تأمین‌کننده و نقش | `T06 INV-PTY-14 insert as merged` و `direct status merged`؛ `T10 INV-PTY-14 loser merged`، `merged row immutable`، `child for merged party` و `delete merged party`؛ `T15 INV-PTY-14 assignment to merged party` |
-| **INV-PTY-15** | زنجیرهٔ ادغام وجود ندارد: `merged_into_id` همیشه به شخص ادغام‌نشده اشاره می‌کند. `v_party_canonical` جانشین نهایی را با یک گام می‌دهد | فشرده‌سازی مسیر در `merge_parties`؛ `trg_party_guard` (`HK_PARTY_MERGE_CHAIN`) | `T10 INV-PTY-15 canonical view`، `path compression` و `no merge chains`؛ hypothesis stateful `test_merge_machine` |
-| **INV-PTY-16** | پیش‌شرط‌های ادغام (§۵-۶-۳) برقرارند. پس از ادغام: فرزندان بی‌تکرار منتقل شده‌اند، تکراری‌ها روی بازنده غیرفعال‌اند، برنده شناسه‌های خالی را گرفته، کد بازنده کد قدیمیِ برنده شده، و هیچ توقیف فعالی گم نشده است | `merge_parties` | `T10 INV-PTY-16 merge same`، `short reason`، `identity conflict`، `anonymous`، `winner adopts identity`، `contacts moved without duplicates`، `loser contacts deactivated`، `bank account moved`، `role moved`، `legacy codes moved + loser code recorded`، `merge already merged` و `identity travels along the chain`؛ `test_merge_machine::holds_never_lost` |
-| **INV-PTY-17** | هر ادغام دقیقاً یک ردیف فقط‌افزودنی `party_merge` دارد (هر بازنده یک بار) | UNIQUE `(tenant_id, loser_party_id)`؛ `core.forbid_mutation`؛ grant | `T10 INV-PTY-17 merge record` و `merge record immutable` |
+| **INV-PTY-13** | برای هر (شخص، scope، source) حداکثر یک توقیف فعال هست. توقیف فقط یک بار آزاد می‌شود، بقیهٔ ستون‌ها تغییرناپذیرند و حذف ممکن نیست. `v_party_hold_state` دقیقاً توقیف‌های فعال را تجمیع می‌کند | ایندکس `party_hold_one_active`؛ `trg_hold_guard`؛ نبود DELETE grant؛ CHECKهای `party_hold_check*` | `T09 INV-PTY-13 second active hold`، `hold state view`، `edit hold reason`، `release twice` و `delete hold`؛ `T23` |
+| **INV-PTY-14** | `merged` فقط با پس‌شرط‌های ادغام تنظیم می‌شود (سابقهٔ `party_merge` و نبود فرزند زنده)، با هیچ GUC یا UPDATE دستی نه. ردیف ادغام‌شده (جز فشرده‌سازی `merged_into_id`) تغییرناپذیر و حذف‌نشدنی است. هیچ ردیف تازه، ستون شخصِ تغییریافته یا ردیفِ زنده‌شده‌ای در parties یا catalog به شخص ادغام‌شده اشاره نمی‌کند، حتی با درج هم‌زمان با ادغام؛ ردیف کهنه فقط بازنشسته (غیرفعال یا آزاد) می‌شود | `trg_party_guard`؛ `trg_child_party_guard` و `catalog.party_ref_check` (`FOR KEY SHARE`)؛ تریگرهای نقش، انتساب، تأمین‌کننده و کالا؛ نبود DELETE grant | `T06 INV-PTY-14 insert as merged` و `direct status merged`؛ `T10 INV-PTY-14 …`؛ `T10b RV-MD-11 …` و `INV-PTY-14 stale child …`؛ `T10c` (مسیر مالک)؛ `T12b INV-PTY-14 … for merged party` (هر جدول فرزند)؛ `T15 INV-PTY-14 assignment to merged party`؛ `T15c RV-MD-09 …`؛ `T20 RV-MD-05 …` (دو نشست) |
+| **INV-PTY-15** | زنجیرهٔ ادغام وجود ندارد: `merged_into_id` همیشه به شخص ادغام‌نشده اشاره می‌کند و فقط با فشرده‌سازی مسیر (به جانشینِ هدف فعلی) تغییر می‌کند. `v_party_canonical` جانشین نهایی را با یک گام می‌دهد | فشرده‌سازی مسیر در `merge_parties`؛ `trg_party_guard` (`HK_PARTY_MERGE_CHAIN`، `HK_PARTY_MERGE_REPOINT`)؛ CHECKهای `party_merge_cols` و `party_merge_self` (مسیر درون‌ریزی) | `T10 INV-PTY-15 canonical view`، `path compression` و `no merge chains`؛ `T10b RV-MD-06 repoint merged party to an unrelated party`؛ `T10c INV-PTY-15 … (import path)`؛ hypothesis stateful `test_merge_machine` |
+| **INV-PTY-16** | پیش‌شرط‌های ادغام (§۵-۶-۳) برقرارند. پس از ادغام: فرزندان بی‌تکرار منتقل شده‌اند، تکراری‌ها روی بازنده غیرفعال‌اند، برنده شناسه‌های خالی را گرفته، کد بازنده کد قدیمیِ برنده شده، بازاریابِ برابر با برنده پاک شده، و هیچ توقیف فعالی گم نشده است (توقیف هم‌ارز روی برنده) | `merge_parties`؛ پس‌شرط `party_guard` | `T10 INV-PTY-16 …`؛ `T10b RV-MD-02 …` و `RV-MD-21 moved role drops the winner as its own agent`؛ `test_merge_machine::holds_never_lost` |
+| **INV-PTY-17** | هر ادغام دقیقاً یک ردیف فقط‌افزودنی `party_merge` دارد (هر بازنده یک بار)، و هر ردیف `party_merge` در پایان تراکنش یک ادغام کامل‌شده را توصیف می‌کند | UNIQUE `(tenant_id, loser_party_id)`؛ `core.forbid_mutation`؛ grant؛ قید deferred `trg_party_merge_consistent` | `T10 INV-PTY-17 merge record` و `merge record immutable`؛ `T10b INV-PTY-17 orphan merge record` و `merge record counts …`؛ `T10c INV-PTY-17 merge record immutable (owner role, trigger path)` |
 | **INV-PTY-18** | کد قدیمی در (سیستم، دامنه، کد) یکتاست و جز `party_id` تغییرناپذیر است | UNIQUE؛ `trg_legacy_code_guard` | `T09 INV-PTY-18 duplicate legacy code` و `legacy code immutable`؛ `tests/integration/masterdata/test_import.py::test_reimport_is_update` |
 | **INV-PTY-19** | سابقهٔ استعلام مؤدی فقط‌افزودنی است | `core.forbid_mutation`؛ grant | `T09 INV-PTY-19 inquiry update` |
 | **INV-PTY-20** | «رد تکراری» برای هر جفت یک ردیف با ترتیب `a < b` دارد | CHECK و UNIQUE | `T09 INV-PTY-20 dismissal order` |
-| **INV-PTY-21** | `dedup_name_key` عنوان‌ها و قالب‌های حقوقی را حذف می‌کند. `find_duplicate_candidates` هر شخص هم‌شناسه، هم‌اقتصادی، هم‌شبا، هم‌موبایل یا هم‌نام (≥ آستانه) را برمی‌گرداند، و ادغام‌شده، مشتری عمومی و جفت ردشده را نه | توابع SQL؛ امتیاز پایتون | `T02 INV-PTY-21 dedup key strips legal forms` و `dedup key honorifics`؛ `T10 INV-PTY-21 duplicate found by mobile + name`؛ `tests/unit/parties/test_duplicate_score.py` |
+| **INV-PTY-21** | `dedup_name_key` عنوان‌ها و قالب‌های حقوقی را حذف می‌کند. `find_duplicate_candidates` هر شخص هم‌شناسه، هم‌اقتصادی، هم‌شبا، هم‌موبایل یا از نزدیک‌ترین نام‌ها (≥ آستانه) را برمی‌گرداند، و ادغام‌شده، مشتری عمومی و جفت ردشده را نه. هیچ شاخه‌ای کل جدول اشخاص را پیمایش نمی‌کند | توابع SQL؛ ایندکس GiST `party_name_key_trgm_gist` (KNN)؛ امتیاز پایتون | `T02 INV-PTY-21 …`؛ `T10 INV-PTY-21 duplicate found by mobile + name`؛ `T22 RV-MD-12 duplicate blocking never scans the whole party table` (۲۰ هزار شخص)؛ `tests/unit/parties/test_duplicate_score.py`؛ bench شبانه ۱۰۰ هزار |
 | **INV-PTY-22** | کد و نقش گروه شخص تغییرناپذیرند (انتخابگر نگاشت) | `trg_party_group_guard` | `T05 INV-PTY-22 party group code immutable` و `party group role immutable` |
 | **INV-PTY-23** | `next_party_code` کدی برمی‌گرداند که هیچ شخص مستأجر ندارد، از فعال‌ترین سری مشخص: (نقش، گروه) > نقش > پیش‌فرض. عدد بزرگ‌تر از طول صفرگذاری بریده نمی‌شود. هر (نقش، گروه) یک سری دارد و سری گروه هم‌نقش است | تابع و قفل ردیف؛ UNIQUE؛ FK ترکیبی؛ CHECK | `T18 INV-PTY-23 default series created on demand`، `allocator skips manually used code`، `role series`، `group series beats role series`، `no truncation past pad width`، `fallback to default series`، `group series with other role`، `group series without role` و `second default series`؛ `test_concurrency.py::test_parallel_code_allocation_unique` |
-| **INV-PTY-24** | `posting_attributes(p, role, company)` = `{"<role>_group": گروه مؤثر, "party_person_type": نوع}` برای جانشینِ `p`. گروه مؤثر: ردیف شرکت > ردیف پیش‌فرض > گروه پیش‌فرض نقش > حذف کلید. `v_party_ledger_identity` کد، نام و جانشین را می‌دهد | تابع SQL؛ ویو | `T18 INV-PTY-24 company-specific group`، `default role row group`، `default group of the role when no role row`، `no group -> key omitted`، `merged party resolves to successor`، `invalid role` و `ledger identity view`؛ `tests/integration/masterdata/test_ledger_link.py::test_receivable_account_by_customer_group` |
+| **INV-PTY-24** | `posting_attributes(p, role, company)` = `{"attr:<role>_group": گروه مؤثر, "attr:party_role": role, "attr:party_person_type": نوع}` برای جانشینِ `p`، با کلیدهایی که `ledger.valid_conditions` می‌پذیرد. گروه مؤثر فیلدبه‌فیلد: گروه ردیف شرکت > گروه ردیف پیش‌فرض > گروه پیش‌فرض نقش > حذف کلید. `v_party_ledger_identity` کد، نام و جانشین را می‌دهد | تابع SQL؛ ویو | `T18 INV-PTY-24 company-specific group (attr: keys)`، `keys accepted by ledger condition grammar`، `default role row group`، `default group of the role when no role row`، `no group -> key omitted`، `merged party resolves to successor`، `invalid role` و `ledger identity view`؛ `T10b RV-MD-03 …`؛ `tests/integration/masterdata/test_ledger_link.py::test_receivable_account_by_customer_group` |
 | **INV-CAT-01** | هر کالا دقیقاً یک ردیف واحد پایه با `factor = 1` برابر `item.base_uom_id` دارد. تبدیل = `qty × f_from / f_to` | CHECK `item_uom_base_factor`؛ ایندکس `item_uom_one_base`؛ `check_item_integrity` (deferred)؛ `convert_qty` | `T12 INV-CAT-01 base row with factor <> 1`، `carton -> pieces`، `grams -> kg` و `posting group inherited from category in v_sku`؛ hypothesis `test_convert_roundtrip` |
 | **INV-CAT-02** | هر کالا ≥ ۱ variant دارد. کالای ساده دقیقاً یک variant پیش‌فرض با کد برابر کد کالا دارد | `check_item_integrity` (deferred) | `T12 INV-CAT-02 item without variant accepted` و `default variant code accepted` |
 | **INV-CAT-03** | variantهای کالای variantدار دقیقاً مقادیر محورهای کالا (ویژگی درست) را دارند، پیش‌فرض ندارند، و ترکیبشان یکتاست | `check_item_integrity`؛ `UNIQUE NULLS NOT DISTINCT`؛ CHECK `variant_default_no_axes` | `T12 INV-CAT-03 missing axis value accepted`، `wrong attribute value accepted`، `default variant on variant item accepted` و `duplicate combination` |
 | **INV-CAT-04** | `has_variants ⇔ axis1`. محورها پیوسته و متمایزند. فقط ویژگی محورپذیر (گزینه‌ای) محور کالا یا قالب می‌شود | CHECK `item_axes_shape` و `item_axes_distinct`؛ `attribute_axis_guard` | `T12 INV-CAT-04 axes without has_variants`، `same axis twice`، `non-axis attribute as axis` و `axis member must be axis-capable` |
 | **INV-CAT-05** | ردیابی سریال، بچ و انقضا فقط برای کالای انباری است. انقضا بچ می‌خواهد و عمر قفسه انقضا | CHECKهای `item_tracking_stock_only`، `item_expiry_needs_batch` و `item_shelf_life_needs_expiry` | `T12 INV-CAT-05 serial on service` و `expiry without batch` |
-| **INV-CAT-06** | قفل استفاده فقط از NULL به زمان می‌رود و هنگام درج ممنوع است. پس از قفل: واحد پایه، نوع، سریال و بچ، محورهای موجود، ضریب، واحد و پایه بودن واحدهای کالا، و مقدار محورِ موجود variantها ثابت‌اند. واحد حذف نمی‌شود. تبدیل ساده به variantدار مجاز است | `trg_item_guard`، `trg_item_uom_guard` و `trg_variant_guard` | `T13 INV-CAT-06 lock on insert`، `base uom frozen`، `unlock`، `tracking frozen`، `factor frozen`، `unit delete`، `variant axis value frozen`، `existing axis frozen`، `simple -> variant conversion after use` و `variant -> simple after use`؛ `test_concurrency.py::test_mark_used_vs_base_uom_change` |
+| **INV-CAT-06** | قفل استفاده فقط از NULL به زمان می‌رود و هنگام درج ممنوع است. پس از قفل: واحد پایه، نوع، سریال، بچ و انقضا، محورهای موجود، ضریب، واحد و پایه بودن واحدهای کالا، و مقدار محورِ موجود variantها ثابت‌اند. کالا و واحدش حذف نمی‌شوند. عمر قفسه پیش‌فرض بچ تازه است. تبدیل ساده به variantدار مجاز است | `trg_item_guard` (INSERT، UPDATE و DELETE)؛ `trg_variant_guard`؛ `trg_item_uom_guard` | `T13 INV-CAT-06 …`؛ `T13b RV-MD-15 locked item cannot be deleted`، `RV-MD-18 expiry tracking frozen after use`، `expiry tracking cannot be dropped after use` و `D-M15 shelf life …` |
 | **INV-CAT-07** | درخت دسته بی‌چرخه است و عمقش ≤ ۱۰ | `trg_category_guard` | `T12 INV-CAT-07 category cycle` |
 | **INV-CAT-08** | کد بارکد در مستأجر یکتاست. GTINها طول و رقم کنترل درست دارند. variant و واحد بارکد مال همان کالایند. هویت بارکد تغییرناپذیر است. هر (variant، واحد) یک بارکد اصلی دارد. بارکد کارتن ضریب واحد را برمی‌گرداند | UNIQUE؛ CHECK `barcode_gtin_*`؛ FK ترکیبی `(item, variant)` و `(item, uom)`؛ `trg_barcode_guard`؛ `v_barcode_lookup` | `T14 INV-CAT-08 carton barcode resolves factor 24`، `bad EAN check digit`، `duplicate barcode`، `variant of another item`، `unit not allowed for item` و `barcode identity immutable` |
 | **INV-CAT-09** | بارکد `internal` همیشه EAN-13 با پیشوند `04` است. تخصیص‌دهنده کدهای پیاپی با رقم کنترل درست می‌دهد و هیچ کد موجودی را تکرار نمی‌کند | CHECK `barcode_internal_rcn`؛ `allocate_internal_barcode` با قفل شمارنده | `T14 INV-CAT-09 internal barcode outside 04`، `first internal barcode` و `allocator skips manually used code`؛ `test_concurrency.py::test_parallel_internal_barcodes_unique` |
 | **INV-CAT-10** | پیشوند الگوی ترازو ∈ {02، 20..29} است. بازه‌ها در ارقام ۳ تا ۱۲ و بی‌هم‌پوشانی‌اند. هر پیشوند یک الگوی فعال دارد. هیچ بارکد ۱۳ رقمی با پیشوند الگوی فعال وجود ندارد (هر دو جهت). وزن واحد جرم و قیمت ارز و واحد مبلغ صریح دارد. تجزیه فقط با رقم کنترل درست انجام می‌شود | CHECKهای `scale_*`؛ ایندکس `scale_pattern_active_prefix`؛ `trg_barcode_guard` و `trg_scale_pattern_guard`؛ `parse_scale_barcode` | `T14 INV-CAT-10 parse weight barcode`، `bad check digit not parsed`، `barcode collides with scale prefix`، `pattern collides with existing barcode`، `prefix outside 02/20-29 (19)`، `prefix 04 (internal RCN space) rejected`، `overlapping ranges`، `second active pattern on prefix`، `price pattern needs explicit amount unit` و `weight unit must be mass` |
 | **INV-CAT-11** | برای یک (فهرست، کالا، variant یا همه، واحد، `min_qty`) بازه‌های اعتبار هم‌پوشانی ندارند | EXCLUDE `price_list_item_no_overlap` | `T15 INV-CAT-11 overlapping validity`؛ hypothesis `test_set_prices_never_overlaps` |
-| **INV-CAT-12** | دقت مبلغ ردیف قیمت ≤ `price_precision` فهرست است | `trg_price_list_item_guard` | `T15 INV-CAT-12 precision of IRR list` |
-| **INV-CAT-13** | ردیف قیمت با `valid_from < امروزِ مستأجر` تغییر یا حذف نمی‌شود، جز بستن `valid_to ≥ دیروز`. درج پس‌تاریخ ممنوع است، جز با `hk.catalog_allow_backdate` در UoW مهاجرت. هویت ردیف ثابت است. ردیف آینده آزاد است | `trg_price_list_item_guard`؛ سرویس: پرچم فقط با `catalog.price.backdate` | `T15 INV-CAT-13 backdated insert`، `change past price`، `delete effective entry`، `close into the past`، `identity immutable` و `history preserved, new price from today` |
-| **INV-CAT-14** | فهرست پایه هم‌نوع و هم‌ارز است، بی‌چرخه، با عمق ≤ ۳. هر (شرکت، نوع) حداکثر یک فهرست پیش‌فرض فعال دارد | `trg_price_list_guard`؛ ایندکس `price_list_one_default` | `T15 INV-CAT-14 base list of other kind`، `derived cycle` و `second default list` |
-| **INV-CAT-15** | `resolve_price` قاعدهٔ §۵-۶-۷ را دقیقاً اجرا می‌کند: فهرست درخواستی فعال و معتبر؛ واحد دقیق > پایه × ضریب؛ variant > سطح کالا؛ بزرگ‌ترین شکست ≤ مقدار؛ مشتق از درون به بیرون با گرد کردن؛ فهرست پایهٔ غیرفعال هنوز منبع است؛ نبود قیمت = هیچ (نه صفر) | تابع SQL؛ پیاده‌سازی مرجع پایتون | `T15 INV-CAT-15 direct`، `quantity break`، `exact unit wins`، `exact unit beats base-unit break`، `item-level price for variant`، `variant-specific price wins`، `base unit x factor`، `derived -7% rounded to 1000`، `no price before validity`، `inactive base still feeds derived` و `inactive requested list yields nothing`؛ hypothesis `test_resolve_price_matches_reference_model` |
-| **INV-CAT-16** | انتساب فهرست حداکثر یکی از شخص و گروه را دارد. گروه با نوع فهرست سازگار است (فروش ← مشتری، خرید ← تأمین‌کننده) | CHECK؛ `trg_price_list_assignment_guard` | `T15 INV-CAT-16 sales list to supplier group` |
-| **INV-CAT-17** | BOM فقط `draft` ساخته می‌شود. `draft → active` با ≥ ۱ سطر. ردیف فعال فقط `valid_to` یا بایگانی می‌گیرد و `archived` نهایی است. سطرها فقط روی پیش‌نویس تغییر می‌کنند و فقط پیش‌نویس حذف می‌شود. نسخه‌های فعال هم‌پوشانی ندارند. `kit` و `recipe` برای کالای غیرانباری و `production` برای کالای انباری است. بی‌چرخه است. مؤلفهٔ variantدار variant مشخص می‌خواهد | `trg_bom_guard`، `trg_bom_line_guard`، EXCLUDE `bom_active_no_overlap` و `bom_reaches` | `T16 INV-CAT-17 recipe for stock item`، `production for non-stock item`، `created active`، `line on active BOM`، `edit active BOM`، `delete active BOM`، `activate empty BOM`، `overlapping active versions`، `archived is final`، `cycle` و `component variant required`؛ hypothesis `test_bom_cycle_detection_matches_reference` |
+| **INV-CAT-12** | دقت مبلغ ردیف قیمت ≤ `price_precision` فهرست است، هم هنگام نوشتن ردیف و هم هنگام کاهش دقت فهرست | `trg_price_list_item_guard`؛ `trg_price_list_guard` | `T15 INV-CAT-12 precision of IRR list`؛ `T15b RV-MD-04 precision lowered below existing entries` |
+| **INV-CAT-13** | ردیف قیمت با `valid_from < امروزِ مستأجر` با هیچ پرچمی تغییر یا حذف نمی‌شود، جز بستن `valid_to ≥ دیروز`. درج پس‌تاریخ ممنوع است، جز با `hk.catalog_allow_backdate` در UoW مهاجرت، و این پرچم فقط درج را باز می‌کند. هویت ردیف ثابت است. ردیف آینده آزاد است ولی به گذشته نمی‌رود. قاعدهٔ فهرستی که تاریخچه دارد منجمد است | `trg_price_list_item_guard`؛ `trg_price_list_guard`؛ سرویس: پرچم فقط با مجوز `catalog.price.backdate` | `T15 INV-CAT-13 …`؛ `T15b RV-MD-11 backdate flag does not …` (سه مورد) و `RV-MD-04 …` |
+| **INV-CAT-14** | فهرست پایه هم‌نوع و هم‌ارز است، بی‌چرخه، با عمق ≤ ۳، هم هنگام نوشتن فهرست مشتق و هم هنگام تغییر فهرست پایه. وقتی خانوادهٔ فهرست اثر آغازشده دارد، نوع، ارز، دقت، شمول مالیات، پایه، درصد، گرد کردن و آغاز اعتبار ثابت‌اند و پایان فقط ≥ دیروز. هر (شرکت، نوع) حداکثر یک فهرست پیش‌فرض فعال دارد | `trg_price_list_guard`؛ ایندکس `price_list_one_default`؛ CHECKهای `price_list_check*` | `T15 INV-CAT-14 …`؛ `T15b RV-MD-04 derived percent frozen …`، `derived rounding frozen`، `tax inclusion frozen …`، `list validity start frozen`، `list closed into the past`، `base currency change orphans a derived list`، `base kind change orphans a derived list` و `past derived price unchanged` |
+| **INV-CAT-15** | `resolve_price` قاعدهٔ §۵-۶-۷ را دقیقاً اجرا می‌کند: فهرست درخواستی فعال و معتبر؛ واحد دقیق > پایه × ضریب؛ variant > سطح کالا؛ بزرگ‌ترین شکست ≤ مقدار؛ مشتق از درون به بیرون با گرد کردن روی واحد ردیف؛ تبدیل واحد بی‌گرد (مقیاس ۱۲)؛ فهرست پایهٔ غیرفعال هنوز منبع است؛ نبود قیمت = هیچ ردیف | تابع | `T15 INV-CAT-15 …`؛ `T15b RV-MD-22 per-gram price is the exact conversion`، `250 g line amount …`، `derived per-gram price …` و `derived wholesale per-gram price …` |
+| **INV-CAT-16** | انتساب فهرست حداکثر یکی از شخص و گروه را دارد. گروه با نوع فهرست سازگار است (فروش ← مشتری، خرید ← تأمین‌کننده)، هم هنگام نوشتن انتساب و هم هنگام تغییر نوع فهرست. انتساب شخص ادغام‌شده با مشترک `catalog.party_merge` به جانشین می‌رود | CHECK؛ `trg_price_list_assignment_guard`؛ `trg_price_list_guard`؛ `catalog.rewire_merged_party` | `T15 INV-CAT-16 sales list to supplier group`؛ `T15b RV-MD-04 kind change against a customer-group assignment`؛ `T15c RV-MD-09 …` |
+| **INV-CAT-17** | BOM فقط `draft` ساخته می‌شود. `draft → active` با ≥ ۱ سطر و `valid_from ≥ امروز` (پس‌تاریخ فقط با پرچم مهاجرت). ردیف فعال فقط `valid_to ≥ دیروز` یا بایگانی می‌گیرد، بازهٔ گذشته‌اش ثابت است و `archived` نهایی است. سطرها فقط روی پیش‌نویس تغییر می‌کنند و فقط پیش‌نویس حذف می‌شود. نسخه‌های فعال هم‌پوشانی ندارند. `kit` و `recipe` فقط برای غیرانباری، `production` فقط برای انباری. چرخه ممنوع | `trg_bom_guard`؛ `trg_bom_line_guard`؛ EXCLUDE؛ CHECKهای `bom_check*` | `T16 INV-CAT-17 …`؛ `T16b RV-MD-16 backdated activation`، `active BOM closed into the past`، `archive with a past end date` و `past window of the active BOM preserved`؛ `T16b INV-CAT-17 archived without archived_at` و `draft with end before start` |
 | **INV-CAT-18** | ویژگی توصیفی دقیقاً یک مقدار از نوع درست دارد و محور همان کالا نیست | CHECK `num_nonnulls = 1`؛ `trg_item_attribute_value_guard` | `T12 INV-CAT-18 value type mismatch` و `descriptive value on an axis attribute` |
 | **INV-CAT-19** | `sstid` ۱۳ رقم و جفت نوعش است. کد واحد مؤدیان مؤثر = استثنای کالا، وگرنه کد واحد | CHECKها؛ `v_item_uom_effective` | `T12 INV-CAT-19 sstid 12 digits`، `sstid without kind` و `moadian unit via uom` |
 | **INV-CAT-20** | کد SKU در مستأجر یکتاست (پس کد کالای ساده با SKU کالای دیگر برخورد نمی‌کند) | UNIQUE `(tenant_id, code)` روی `item_variant` | `T12 INV-CAT-20 duplicate SKU code` |
 | **INV-CAT-21** | کد گروه ثبت کالا تغییرناپذیر است | `trg_posting_group_guard` | `T12 INV-CAT-21 posting group code immutable` |
-| **INV-CAT-22** | گروه ثبت مؤثر SKU = گروه کالا، وگرنه پیش‌فرض نزدیک‌ترین نیای دسته. `catalog.posting_attributes` آن را با `item_type` و کد دسته می‌دهد | `v_category_effective`؛ `v_sku`؛ تابع | `T18 INV-CAT-22 posting group inherited from ancestor category`، `category path` و `item posting attributes` |
+| **INV-CAT-22** | گروه ثبت مؤثر SKU = گروه کالا، وگرنه پیش‌فرض نزدیک‌ترین نیای دسته، با پیمایش رو به بالا (بی ساختن درخت). `catalog.posting_attributes` آن را با `attr:item_type` و `attr:item_category` می‌دهد | `category_posting_group`؛ `category_path`؛ `v_sku`؛ تابع | `T18 INV-CAT-22 …`؛ `T22 RV-MD-13 v_sku plan has no recursive tree build`، `posting attributes walk up by key, no category table scan`، `next_item_code walks up by key …` و `category_path root-first` (۳۳۳۰ دسته) |
 | **INV-CAT-23** | `next_item_code` کدی می‌دهد که نه کالا و نه SKU مستأجر دارد، از سری خود دسته، نزدیک‌ترین نیا، یا پیش‌فرض. هر دسته یک سری دارد | تابع با قفل؛ UNIQUE | `T18 INV-CAT-23 default series created on demand`، `own category series`، `nearest ancestor series; skips used item/SKU code`، `own series beats ancestor`، `unknown category` و `second series for one category` |
+| **INV-CAT-24** | کد کالای تأمین‌کننده برای هر تأمین‌کننده یکتاست؛ هر (کالا، variant) حداکثر یک تأمین‌کنندهٔ ترجیحی فعال دارد. تأمین‌کننده و شرکت گارانتی ادغام‌شده پذیرفته نمی‌شوند و مشترک ادغام آن‌ها را به جانشین می‌برد | ایندکس‌های `item_supplier_code` و `item_supplier_one_preferred`؛ `trg_item_supplier_guard`؛ `trg_item_guard`؛ `rewire_merged_party` | `T12b INV-CAT-24 supplier item code unique per supplier`، `INV-PTY-14 item supplier is a merged party` و `warranty provider is a merged party`؛ `T15c RV-MD-09 …`؛ `T23 unique index item_supplier_one_preferred` |
 
 ## ۸. سناریوهای مرزی و خطا
 
