@@ -51,13 +51,14 @@ END $$;
 
 -- نگهبان منشأ تراکنش (C-AS-02، R-AI-PRINCIPAL): در تراکنش آغازشده با مدل دستیار ('assistant') یا تحقق پیشنهاد
 -- ('assistant_confirm') هیچ نوشتنی در جدول‌های ثبت و وضعیت دفتر کل مجاز نیست (پیش‌نویس با created_via='assistant' آزاد است).
--- GUC تراکنشی app.actor_via در رجیستری R-GUC ثبت است و UnitOfWork آن را می‌گذارد. تا core.forbid_actor_via() در 10_core
--- نیامده همین تابع محلی (هم‌معنا) به کار می‌رود؛ پس از آن بدنهٔ تریگرها به تابع core اشاره می‌کند.
+-- GUC تراکنشی app.actor_via در رجیستری R-GUC ثبت است و UnitOfWork آن را می‌گذارد. وقتی 10_core پیش‌تر اعمال شده (R-ORDER)
+-- تریگرها تابع مشترک core.forbid_actor_via() را صدا می‌زنند (کد HK_CORE_ACTOR_VIA)؛ در زنجیرهٔ مستقل 00 → 20 همین تابع محلی
+-- هم‌معنا (کد HK_LEDGER_ACTOR_VIA): هر مقدار جز 'direct' — از جمله مقدار ناشناخته (fail-closed) — رد می‌شود.
 CREATE OR REPLACE FUNCTION ledger.forbid_actor_via() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE v text := COALESCE(NULLIF(current_setting('app.actor_via', true), ''), 'direct');
 BEGIN
-  IF v IN ('assistant', 'assistant_confirm') THEN
+  IF v <> 'direct' THEN
     RAISE EXCEPTION 'HK_LEDGER_ACTOR_VIA: % on %.% is not allowed in an assistant-originated transaction (actor_via=%)',
       TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME, v USING ERRCODE = 'P0001';
   END IF;
@@ -1681,9 +1682,13 @@ BEGIN
   -- پیوند شمارهٔ عطف (INV-LED-40، RV-LEDGER-21، RV-IT2-13): اگر شمارهٔ این سند در همین تراکنش با core.number_next
   -- (doc_type='ledger.journal'، doc_id=شناسهٔ سند) صادر شده و فراخوان پیوند را نداده، پیوند پر می‌شود؛ درستی پیوند و
   -- اجباری بودن آن را journal_verify در commit می‌سنجد.
+  -- جست‌وجو از سری ledger.journal همین شرکت و ایندکس یکتای number_issued_one_per_doc (tenant_id, series_id, doc_id)؛
+  -- نه اسکن number_issued همهٔ اسناد مستأجر
   IF NEW.number_issued_id IS NULL AND to_regclass('core.number_issued') IS NOT NULL THEN
-    SELECT n.id INTO NEW.number_issued_id FROM core.number_issued n
-     WHERE n.tenant_id = NEW.tenant_id AND n.doc_type = 'ledger.journal' AND n.doc_id = NEW.id AND n.status = 'used'
+    SELECT n.id INTO NEW.number_issued_id
+      FROM core.number_series s
+      JOIN core.number_issued n ON n.tenant_id = s.tenant_id AND n.series_id = s.id AND n.doc_id = NEW.id AND n.status = 'used'
+     WHERE s.tenant_id = NEW.tenant_id AND s.company_id = NEW.company_id AND s.doc_type = 'ledger.journal'
      ORDER BY n.issued_at DESC LIMIT 1;
   END IF;
 
@@ -2163,6 +2168,8 @@ END $$;
 -- پرند)، و درج سرسند همین‌جا رد می‌شود.
 DO $$
 DECLARE r record;
+        v_fn text := CASE WHEN to_regprocedure('core.forbid_actor_via()') IS NOT NULL THEN 'core.forbid_actor_via'
+                          ELSE 'ledger.forbid_actor_via' END;
 BEGIN
   FOR r IN SELECT * FROM (VALUES
       ('ledger.journal', 'INSERT OR UPDATE'), ('ledger.fiscal_year', 'INSERT OR UPDATE'), ('ledger.fiscal_period', 'INSERT OR UPDATE'),
@@ -2172,8 +2179,7 @@ BEGIN
       ('ledger.coa_extension_applied', 'INSERT'), ('ledger.year_close_run', 'INSERT OR UPDATE'),
       ('ledger.fx_revaluation_run', 'INSERT OR UPDATE'), ('ledger.eledger_export', 'INSERT OR UPDATE')) AS v(tbl, ev) LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS "0_actor_via_guard" ON %s', r.tbl);
-    EXECUTE format('CREATE TRIGGER "0_actor_via_guard" BEFORE %s ON %s FOR EACH ROW EXECUTE FUNCTION ledger.forbid_actor_via()',
-                   r.ev, r.tbl);
+    EXECUTE format('CREATE TRIGGER "0_actor_via_guard" BEFORE %s ON %s FOR EACH ROW EXECUTE FUNCTION %s()', r.ev, r.tbl, v_fn);
   END LOOP;
 END $$;
 

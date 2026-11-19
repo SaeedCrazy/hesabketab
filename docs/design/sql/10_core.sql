@@ -538,7 +538,7 @@ CREATE TABLE IF NOT EXISTS core.approval_policy (
   condition           jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(condition) = 'object'),
   enforce_sod         boolean NOT NULL DEFAULT true,
   distinct_approvers  boolean NOT NULL DEFAULT true,
-  expires_after       interval,
+  expires_after       interval CHECK (expires_after IS NULL OR expires_after > interval '0'),
   is_active           boolean NOT NULL DEFAULT true,
   version             integer NOT NULL DEFAULT 1,
   created_at          timestamptz NOT NULL DEFAULT now(),
@@ -1971,6 +1971,10 @@ CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON core.app_user FOR EACH ROW E
 CREATE OR REPLACE FUNCTION core.uli_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
+  -- فقط خود کاربر (RLS uli_insert/uli_update هم همین است)؛ پیش از هر بررسی دیگر با 42501 روشن
+  IF NEW.user_id IS DISTINCT FROM core.current_user_id() AND NOT core.privileged_context() THEN
+    RAISE EXCEPTION 'HK_CORE_NOT_SELF: login identifiers are written only by their user' USING ERRCODE = '42501';
+  END IF;
   IF TG_OP = 'UPDATE' THEN
     IF (NEW.user_id, NEW.kind, NEW.value) IS DISTINCT FROM (OLD.user_id, OLD.kind, OLD.value) THEN
       PERFORM core.raise_hk('HK_CORE_IMMUTABLE_FIELD', 'login identifier (user, kind, value) is immutable; delete and add a new one');
@@ -1980,11 +1984,8 @@ BEGIN
     END IF;
   END IF;
   IF NEW.verified_at IS NOT NULL AND (TG_OP = 'INSERT' OR OLD.verified_at IS NULL) AND NOT core.privileged_context() THEN
-    IF NEW.kind = 'username' THEN
-      IF NEW.user_id IS DISTINCT FROM core.current_user_id() THEN
-        PERFORM core.raise_hk('HK_CORE_UNVERIFIED', 'only the user asserts their own username');
-      END IF;
-    ELSIF NOT EXISTS (
+    -- نام کاربری را خود کاربر برمی‌گزیند (نوشتن غیرخود بالاتر با 42501 رد شده است)؛ تلفن/ایمیل فقط با OTP مصرف‌شده
+    IF NEW.kind <> 'username' AND NOT EXISTS (
         SELECT 1 FROM core.otp_challenge c
          WHERE c.user_id = NEW.user_id AND c.destination = NEW.value
            AND c.channel = CASE NEW.kind WHEN 'phone' THEN 'sms' ELSE 'email' END
@@ -1997,6 +1998,36 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON core.user_login_identifier;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON core.user_login_identifier FOR EACH ROW EXECUTE FUNCTION core.uli_guard();
+
+-- چالش OTP (پایهٔ تأیید شناسه در uli_guard): مصرف‌نشده ساخته می‌شود؛ مقصد و hash تغییرناپذیر؛ تلاش فقط بالا؛
+-- مصرف یک‌بار و فقط پیش از انقضا و پیش از پایان تلاش‌ها. پس «OTP مصرف‌شده» را برنامه نمی‌تواند جعل کند.
+CREATE OR REPLACE FUNCTION core.otp_challenge_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.consumed_at IS NOT NULL OR NEW.attempts <> 0 OR NEW.created_at > now() + interval '1 minute'
+       OR NEW.created_at < now() - interval '1 minute' THEN
+      PERFORM core.raise_hk('HK_CORE_OTP', 'an OTP challenge starts unconsumed, with 0 attempts, now');
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF (NEW.id, NEW.user_id, NEW.purpose, NEW.channel, NEW.destination, NEW.code_hash, NEW.max_attempts, NEW.created_at, NEW.expires_at)
+     IS DISTINCT FROM
+     (OLD.id, OLD.user_id, OLD.purpose, OLD.channel, OLD.destination, OLD.code_hash, OLD.max_attempts, OLD.created_at, OLD.expires_at)
+     OR NEW.attempts < OLD.attempts THEN
+    PERFORM core.raise_hk('HK_CORE_IMMUTABLE_FIELD', 'OTP challenge is immutable except attempts (up) and consumption');
+  END IF;
+  IF OLD.consumed_at IS NOT NULL AND NEW.consumed_at IS DISTINCT FROM OLD.consumed_at THEN
+    PERFORM core.raise_hk('HK_CORE_OTP', 'an OTP challenge is consumed once');
+  END IF;
+  IF OLD.consumed_at IS NULL AND NEW.consumed_at IS NOT NULL
+     AND (OLD.expires_at <= now() OR OLD.attempts >= OLD.max_attempts) THEN
+    PERFORM core.raise_hk('HK_CORE_OTP', 'an expired or exhausted OTP challenge cannot be consumed');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON core.otp_challenge;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON core.otp_challenge FOR EACH ROW EXECUTE FUNCTION core.otp_challenge_guard();
 
 -- ---------- عضویت: ماشین حالت + درج فقط «دعوت» + پذیرش فقط توسط خود کاربر + حداقل یک مالک فعال ----------
 CREATE OR REPLACE FUNCTION core.membership_transition_guard() RETURNS trigger
@@ -2096,24 +2127,30 @@ DROP TRIGGER IF EXISTS trg_guard ON core.device_token;
 CREATE TRIGGER trg_guard BEFORE UPDATE ON core.device_token FOR EACH ROW EXECUTE FUNCTION core.device_token_guard();
 
 -- ---------- نشست: نسخهٔ security_epoch، دستگاه فعال، ابطال یک‌طرفه (RV-CORE-02، RV-X4-05) ----------
--- دستگاه فعال؟ (definer: درج نشست PIN پیش از زمینهٔ کامل مستأجر هم باید دستگاه را ببیند)
-CREATE OR REPLACE FUNCTION core.session_device_active(p_tenant uuid, p_device uuid) RETURNS boolean
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT EXISTS (SELECT 1 FROM core.device d WHERE d.tenant_id = p_tenant AND d.id = p_device AND d.status = 'active')
-$$;
+-- (نسخهٔ پیشین تابع definer core.session_device_active(p_tenant, …) داشت که وضعیت دستگاه هر مستأجری را برای hk_app
+--  آشکار می‌کرد؛ حذف شد: نشست دستگاه‌دار فقط در زمینهٔ همان مستأجر ساخته می‌شود و دستگاه با RLS عادی خوانده می‌شود.)
+DROP FUNCTION IF EXISTS core.session_device_active(uuid, uuid);
 
 CREATE OR REPLACE FUNCTION core.user_session_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE v_epoch integer;
 BEGIN
   IF TG_OP = 'INSERT' THEN
+    -- نشست فقط برای خود کاربر احرازشده (RLS user_self هم همین را می‌گوید؛ این‌جا پیش از جست‌وجوی کاربر با پیام روشن)
+    IF NEW.user_id IS DISTINCT FROM core.current_user_id() AND NOT core.privileged_context() THEN
+      RAISE EXCEPTION 'HK_CORE_NOT_SELF: a session is created only for the current user' USING ERRCODE = '42501';
+    END IF;
     SELECT u.security_epoch INTO v_epoch FROM core.app_user u WHERE u.id = NEW.user_id AND u.status = 'active';
     IF NOT FOUND THEN
       PERFORM core.raise_hk('HK_CORE_USER_INACTIVE', 'a session needs an active user');
     END IF;
     NEW.security_epoch := v_epoch;          -- هر مقدار ارسالی برنامه نادیده گرفته می‌شود
-    IF NEW.device_id IS NOT NULL AND NOT core.session_device_active(NEW.active_tenant_id, NEW.device_id) THEN
-      PERFORM core.raise_hk('HK_CORE_DEVICE_INACTIVE', 'a device-bound session needs an active device of the session tenant');
+    -- نشست دستگاه‌دار (PIN صندوق) فقط در زمینهٔ همان مستأجر (ورود PIN پس از احراز دستگاه با توکن دستگاه) و با دستگاه active
+    IF NEW.device_id IS NOT NULL AND (
+         (core.current_tenant_id() IS DISTINCT FROM NEW.active_tenant_id AND NOT core.privileged_context())
+         OR NOT EXISTS (SELECT 1 FROM core.device d
+                         WHERE d.tenant_id = NEW.active_tenant_id AND d.id = NEW.device_id AND d.status = 'active')) THEN
+      PERFORM core.raise_hk('HK_CORE_DEVICE_INACTIVE', 'a device-bound session needs an active device of the current (session) tenant');
     END IF;
     RETURN NEW;
   END IF;
@@ -2221,7 +2258,9 @@ BEGIN
     NEW.policy_version     := p.version;
     NEW.enforce_sod        := p.enforce_sod;
     NEW.distinct_approvers := p.distinct_approvers;
-    NEW.expires_at         := CASE WHEN p.expires_after IS NOT NULL THEN NEW.created_at + p.expires_after END;
+    -- مهلت از زمان پایگاه داده (نه created_at ارسالی برنامه که می‌توانست انقضا را به آینده ببرد)
+    NEW.created_at         := now();
+    NEW.expires_at         := CASE WHEN p.expires_after IS NOT NULL THEN now() + p.expires_after END;
     RETURN NEW;
   END IF;
 
@@ -4572,7 +4611,7 @@ BEGIN
       'HK_DEFINER_REVIEWED: 2026-11-18 section 02; returns identifiers only, fixed search_path, no dynamic SQL');
   END LOOP;
   -- توابع definer نوشتنی هسته (هر کدام فقط ستون‌ها/ردیف‌های مستأجر جاری را با RLS عادی می‌نویسد)
-  FOREACH f IN ARRAY ARRAY['core.session_device_active(uuid,uuid)', 'core.device_revoke_sessions()',
+  FOREACH f IN ARRAY ARRAY['core.device_revoke_sessions()',
                            'core.member_invite(text,text,text)',
                            'core.number_next(uuid,text,text,text,uuid)', 'core.number_reserve_range(uuid,text,uuid,integer)',
                            'core.number_record_external(uuid,text,bigint,text,text,uuid,uuid,uuid)',
