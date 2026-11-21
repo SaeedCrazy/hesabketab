@@ -367,7 +367,8 @@ CREATE TABLE IF NOT EXISTS inventory.stock_doc (
   CONSTRAINT stock_doc_received_after CHECK (received_date IS NULL OR received_date >= doc_date),
   CONSTRAINT stock_doc_opening_unit CHECK (doc_type <> 'opening' OR amount_unit IS NOT NULL),
   CONSTRAINT stock_doc_gl_link CHECK ((gl_status = 'posted') = (gl_journal_id IS NOT NULL)),
-  CONSTRAINT stock_doc_gl_when_posted CHECK (status = 'draft' OR gl_status <> 'pending')
+  CONSTRAINT stock_doc_gl_when_posted CHECK (status = 'draft' OR gl_status <> 'pending'),
+  CONSTRAINT stock_doc_cancel_gl CHECK (status <> 'cancelled' OR gl_status <> 'posted' OR cancel_journal_id IS NOT NULL)
 );
 SELECT core.enable_tenant_rls('inventory.stock_doc');
 CREATE INDEX IF NOT EXISTS stock_doc_date_idx ON inventory.stock_doc (tenant_id, company_id, doc_type, doc_date);
@@ -510,6 +511,7 @@ CREATE TABLE IF NOT EXISTS inventory.stock_move (
   source_doc_id        uuid NOT NULL,
   source_line_id       uuid,
   origin               text NOT NULL DEFAULT 'online' CHECK (origin IN ('online','offline_device','migration','system')),
+  device_id            uuid,                -- دستگاه صندوق برای فروش آفلاین (RV-COM-20)
   created_by           uuid,
   created_at           timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (id),
@@ -519,6 +521,7 @@ CREATE TABLE IF NOT EXISTS inventory.stock_move (
   FOREIGN KEY (tenant_id, company_id, branch_id) REFERENCES core.branch(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, warehouse_id) REFERENCES inventory.warehouse(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, warehouse_id, location_id) REFERENCES inventory.location(tenant_id, warehouse_id, id),
+  FOREIGN KEY (tenant_id, device_id) REFERENCES core.device(tenant_id, id),
   FOREIGN KEY (tenant_id, item_id, variant_id) REFERENCES catalog.item_variant(tenant_id, item_id, id),
   FOREIGN KEY (tenant_id, item_id, uom_id) REFERENCES catalog.item_uom(tenant_id, item_id, uom_id),
   FOREIGN KEY (tenant_id, item_id, batch_id) REFERENCES inventory.batch(tenant_id, item_id, id),
@@ -540,16 +543,22 @@ CREATE TABLE IF NOT EXISTS inventory.stock_move (
   CONSTRAINT stock_move_reverse_shape CHECK ((valuation_rule = 'reverse') = (reversal_of_move_id IS NOT NULL)),
   CONSTRAINT stock_move_reverse_source CHECK (reversal_of_move_id IS NULL OR cost_source_move_id IS NULL),
   CONSTRAINT stock_move_components_shape CHECK (valuation_rule <> 'components' OR cost_group_id IS NOT NULL),
-  CONSTRAINT stock_move_production_group CHECK (move_kind NOT IN ('production_in','production_out') OR cost_group_id IS NOT NULL)
+  CONSTRAINT stock_move_production_group CHECK (move_kind NOT IN ('production_in','production_out') OR cost_group_id IS NOT NULL),
+  -- استثنای «صندوق آفلاین هرگز رد نمی‌شود» فقط برای فروش ثبت‌شده از دستگاه (RV-COM-20)
+  CONSTRAINT stock_move_offline_device CHECK ((origin = 'offline_device') = (device_id IS NOT NULL)
+                                              AND (origin <> 'offline_device' OR source_module IN ('pos','sales')))
 );
 SELECT core.enable_tenant_rls('inventory.stock_move');
 CREATE UNIQUE INDEX IF NOT EXISTS stock_move_seq_uq ON inventory.stock_move (tenant_id, posting_seq);
 CREATE UNIQUE INDEX IF NOT EXISTS stock_move_one_reversal ON inventory.stock_move (tenant_id, reversal_of_move_id) WHERE reversal_of_move_id IS NOT NULL;
--- تلهٔ «تکرار افتتاحیهٔ انبار» (پژوهش ۰۱): یک حرکت افتتاحیه برای هر (شرکت، انبار، SKU، بچ)
-CREATE UNIQUE INDEX IF NOT EXISTS stock_move_one_opening ON inventory.stock_move (tenant_id, company_id, warehouse_id, variant_id, batch_id)
-  NULLS NOT DISTINCT WHERE move_kind = 'opening' AND reversal_of_move_id IS NULL;
+-- تلهٔ «تکرار افتتاحیهٔ انبار» (پژوهش ۰۱): یک افتتاحیهٔ «زنده» برای هر (شرکت، انبار، SKU، بچ) — در stock_move_before زیر قفل
+-- مشورتی کلید سنجیده می‌شود تا افتتاحیهٔ برگشت‌خورده (ابطال/بازگشت مهاجرت) دوباره قابل ورود باشد (RV-COM-11).
+DROP INDEX IF EXISTS inventory.stock_move_one_opening;
 CREATE INDEX IF NOT EXISTS stock_move_pool_point ON inventory.stock_move (tenant_id, pool_id, move_date, posting_seq);
 CREATE INDEX IF NOT EXISTS stock_move_wh_point ON inventory.stock_move (tenant_id, warehouse_id, variant_id, move_date, posting_seq);
+-- بررسی‌های افتتاحیه روی هر حرکت (یکتایی و «پیش از افتتاحیه نیست») نباید کل تاریخچهٔ کالا را بپیماید (RV-COM-19)
+CREATE INDEX IF NOT EXISTS stock_move_opening_idx ON inventory.stock_move (tenant_id, company_id, warehouse_id, variant_id, move_date)
+  WHERE move_kind = 'opening';
 CREATE INDEX IF NOT EXISTS stock_move_source_idx ON inventory.stock_move (tenant_id, source_doc_id);
 CREATE INDEX IF NOT EXISTS stock_move_cost_source_idx ON inventory.stock_move (tenant_id, cost_source_move_id) WHERE cost_source_move_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS stock_move_group_idx ON inventory.stock_move (tenant_id, cost_group_id) WHERE cost_group_id IS NOT NULL;
@@ -617,6 +626,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS valuation_layer_one_initial ON inventory.valua
 CREATE INDEX IF NOT EXISTS valuation_layer_move_idx ON inventory.valuation_layer (tenant_id, move_id);
 CREATE INDEX IF NOT EXISTS valuation_layer_gl_idx ON inventory.valuation_layer (tenant_id, company_id, gl_date);
 CREATE INDEX IF NOT EXISTS valuation_layer_run_idx ON inventory.valuation_layer (tenant_id, repost_run_id) WHERE repost_run_id IS NOT NULL;
+
+-- وضعیت بهای جاری هر حرکت (مشتق؛ فقط موتور definer می‌نویسد؛ RV-COM-01). وضعیت مؤثر حرکت فقط از آخرین ارزیابی خود حرکت
+-- (اولیه یا بازپخش) می‌آید، نه از «بدترین» لایه‌ها: لایهٔ اولیهٔ «نامعلوم» حرکتی که بعداً با بازارزیابی معلوم شده، دیگر
+-- last_unit_cost استخر یا وضعیت حرکت‌های وابسته (برگشت، ورود انتقال، خروجی تولید) را تعیین نمی‌کند.
+CREATE TABLE IF NOT EXISTS inventory.move_cost_state (
+  tenant_id    uuid NOT NULL REFERENCES core.tenant(id),
+  id           uuid NOT NULL DEFAULT uuidv7(),
+  company_id   uuid NOT NULL,
+  move_id      uuid NOT NULL,
+  pool_id      uuid NOT NULL,
+  cost_status  text NOT NULL CHECK (cost_status IN ('known','estimated','unknown')),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, move_id),
+  FOREIGN KEY (tenant_id, company_id, move_id) REFERENCES inventory.stock_move(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, pool_id) REFERENCES inventory.cost_pool(tenant_id, id)
+);
+SELECT core.enable_tenant_rls('inventory.move_cost_state');
 
 -- صف FIFO (مشتق): باقی‌ماندهٔ هر لایهٔ ورودی
 CREATE TABLE IF NOT EXISTS inventory.fifo_layer (
@@ -817,11 +845,12 @@ CREATE TABLE IF NOT EXISTS inventory.periodic_close (
   fiscal_year_id          uuid NOT NULL,
   period_from             date NOT NULL,
   period_to               date NOT NULL,
-  basis                   text NOT NULL CHECK (basis IN ('valuation','count','manual')),
+  basis                   text NOT NULL CHECK (basis IN ('valuation','count','manual','opening')),   -- opening: ثبت ماندهٔ آغاز حالت ادواری (RV-COM-17)
   status                  text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','posted','reversed')),
   opening_value           core.amount NOT NULL DEFAULT 0 CHECK (opening_value >= 0),
   purchases_value         core.amount NOT NULL DEFAULT 0 CHECK (purchases_value >= 0),
   purchase_returns_value  core.amount NOT NULL DEFAULT 0 CHECK (purchase_returns_value >= 0),
+  purchase_discounts_value core.amount NOT NULL DEFAULT 0 CHECK (purchase_discounts_value >= 0),   -- RV-COM-09
   closing_value           core.amount NOT NULL DEFAULT 0 CHECK (closing_value >= 0),
   cogs_value              core.amount NOT NULL,
   count_session_id        uuid,
@@ -841,11 +870,20 @@ CREATE TABLE IF NOT EXISTS inventory.periodic_close (
   FOREIGN KEY (tenant_id, company_id, reversal_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, posted_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership(tenant_id, user_id),
-  CONSTRAINT periodic_close_cogs CHECK (cogs_value = opening_value + purchases_value - purchase_returns_value - closing_value),
+  CONSTRAINT periodic_close_cogs CHECK (cogs_value = opening_value + purchases_value - purchase_returns_value - purchase_discounts_value
+                                                      - closing_value),
   CONSTRAINT periodic_close_range CHECK (period_to >= period_from),
-  CONSTRAINT periodic_close_posted CHECK ((status <> 'draft') = (gl_journal_id IS NOT NULL AND posted_at IS NOT NULL)),
-  CONSTRAINT periodic_close_reversed CHECK ((status = 'reversed') = (reversal_journal_id IS NOT NULL)),
-  CONSTRAINT periodic_close_count_basis CHECK ((basis = 'count') = (count_session_id IS NOT NULL))
+  -- بستن عادی سند GL دارد؛ ثبت آغاز (opening) فقط ماندهٔ افتتاحیهٔ GL را به زیردفتر می‌دهد و سند ندارد
+  CONSTRAINT periodic_close_posted CHECK ((status <> 'draft') = (posted_at IS NOT NULL)
+                                          AND (basis = 'opening' OR (status <> 'draft') = (gl_journal_id IS NOT NULL))
+                                          AND (basis <> 'opening' OR (gl_journal_id IS NULL AND reversal_journal_id IS NULL))),
+  CONSTRAINT periodic_close_reversed CHECK (basis = 'opening' OR (status = 'reversed') = (reversal_journal_id IS NOT NULL)),
+  CONSTRAINT periodic_close_count_basis CHECK ((basis = 'count') = (count_session_id IS NOT NULL)),
+  CONSTRAINT periodic_close_opening_shape CHECK (basis <> 'opening' OR (period_from = period_to AND purchases_value = 0
+                                                 AND purchase_returns_value = 0 AND purchase_discounts_value = 0 AND closing_value = opening_value)),
+  -- دو بستن ثبت‌شدهٔ هم‌پوشان یعنی دو بار COGS همان ماه‌ها (RV-COM-08)
+  CONSTRAINT periodic_close_no_overlap EXCLUDE USING gist (tenant_id WITH =, company_id WITH =,
+    daterange(period_from, period_to, '[]') WITH &&) WHERE (status = 'posted' AND basis <> 'opening')
 );
 SELECT core.enable_tenant_rls('inventory.periodic_close');
 CREATE UNIQUE INDEX IF NOT EXISTS periodic_close_one_posted ON inventory.periodic_close (tenant_id, company_id, period_to) WHERE status = 'posted';
@@ -902,10 +940,32 @@ LANGUAGE sql IMMUTABLE AS $$
     WHEN 'opening'         THEN p_rule = 'input'
     WHEN 'adjust_in'       THEN p_rule IN ('input','pool_in')
     WHEN 'production_in'   THEN p_rule IN ('components','input')
-    WHEN 'sale_return'     THEN p_rule IN ('source','pool_in')
+    WHEN 'sale_return'     THEN p_rule IN ('source','input')     -- input: برگشتِ فروشِ بی‌حرکت (تاریخچهٔ مهاجرت) با بهای صریح
     WHEN 'transfer_in'     THEN p_rule = 'source'
     WHEN 'purchase_return' THEN p_rule IN ('source','pool_out')
     ELSE p_rule = 'pool_out' END
+$$;
+
+-- کلید طرف مقابل پیش‌فرض حرکت دائمی (اگر سرویس کلید دقیق‌تری نداده باشد؛ RV-COM-17): لایه‌های مشتق بعدی
+-- (تسویهٔ کسری، بازارزیابی) در برابر همین کلید ثبت می‌شوند.
+CREATE OR REPLACE FUNCTION inventory.default_contra_key(p_kind text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE p_kind
+    WHEN 'receipt'         THEN 'purchase.grni'
+    WHEN 'purchase_return' THEN 'purchase.grni'
+    WHEN 'sale_issue'      THEN 'inventory.cogs'
+    WHEN 'sale_return'     THEN 'inventory.cogs'
+    WHEN 'backflush'       THEN 'inventory.cogs'
+    WHEN 'waste'           THEN 'inventory.waste'
+    WHEN 'consumption'     THEN 'inventory.internal_consumption'
+    WHEN 'adjust_in'       THEN 'inventory.adjustment'
+    WHEN 'adjust_out'      THEN 'inventory.adjustment'
+    WHEN 'transfer_out'    THEN 'inventory.goods_in_transit'
+    WHEN 'transfer_in'     THEN 'inventory.goods_in_transit'
+    WHEN 'production_out'  THEN 'inventory.asset'
+    WHEN 'production_in'   THEN 'inventory.asset'
+    WHEN 'opening'         THEN 'ledger.opening_balance_clearing'
+  END
 $$;
 
 -- سیاست مؤثر شرکت در یک تاریخ
@@ -940,6 +1000,75 @@ CREATE OR REPLACE FUNCTION inventory.move_value(p_move_id uuid) RETURNS numeric
 LANGUAGE sql STABLE AS $$
   SELECT coalesce(sum(l.value), 0) FROM inventory.valuation_layer l WHERE l.move_id = p_move_id
 $$;
+
+-- پیوند سند با شمارهٔ صادرشده (core.number_issued؛ قرارداد خواندن CR-C07): همین سند و همین نوع
+CREATE OR REPLACE FUNCTION inventory.assert_number_link(p_number_issued_id uuid, p_doc_type text, p_doc_id uuid) RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  IF p_number_issued_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM core.number_issued n
+        WHERE n.id = p_number_issued_id AND n.status = 'used' AND n.doc_type = p_doc_type AND n.doc_id = p_doc_id) THEN
+    PERFORM core.raise_hk('HK_COMMERCE_NUMBER_LINK', format('number %s was not issued to %s %s', p_number_issued_id, p_doc_type, p_doc_id));
+  END IF;
+END $$;
+
+-- پیوند سند با GL: سند حسابداری باید مبدأش همین سند باشد (ویوی منتشرشدهٔ ledger.v_journal_line). p_must_be_reversed: سند
+-- باید برگشت خورده باشد (ابطال).
+CREATE OR REPLACE FUNCTION inventory.assert_gl_link(p_journal_id uuid, p_module text, p_doc_id uuid, p_must_be_reversed boolean DEFAULT false)
+RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  IF p_journal_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM ledger.v_journal_line v
+        WHERE v.journal_id = p_journal_id AND v.source_module = p_module AND v.source_doc_id = p_doc_id) THEN
+    PERFORM core.raise_hk('HK_COMMERCE_GL_LINK', format('journal %s does not originate from %s document %s', p_journal_id, p_module, p_doc_id));
+  END IF;
+  IF p_must_be_reversed AND p_journal_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM ledger.v_journal_line v WHERE v.journal_id = p_journal_id AND v.is_reversed) THEN
+    PERFORM core.raise_hk('HK_COMMERCE_GL_NOT_REVERSED', format('journal %s of cancelled document %s is not reversed', p_journal_id, p_doc_id));
+  END IF;
+END $$;
+
+-- ارزش موجودی حرکت‌های زندهٔ سندها به تفکیک حساب GL موجودی (لایه‌های move و تسویهٔ کسری؛ لایه‌های بعدی سند خودشان را دارند).
+-- p_reversals: فقط حرکت‌های برگشت (ابطال) به‌جای حرکت‌های اصلی.
+CREATE OR REPLACE FUNCTION inventory.doc_stock_values(p_doc_ids uuid[], p_reversals boolean DEFAULT false)
+RETURNS TABLE (account_id uuid, value numeric)
+LANGUAGE sql STABLE AS $$
+  SELECT m.asset_account_id, sum(l.value)
+    FROM inventory.stock_move m
+    JOIN inventory.valuation_layer l ON l.tenant_id = m.tenant_id AND l.move_id = m.id AND l.reason IN ('move','negative_settlement')
+   WHERE m.source_doc_id = ANY (p_doc_ids) AND m.asset_account_id IS NOT NULL
+     AND (m.reversal_of_move_id IS NOT NULL) = p_reversals
+   GROUP BY m.asset_account_id
+$$;
+
+-- سند(های) GL موجودی (source_module='inventory') = ارزش حرکت‌ها برای هر حساب موجودی (RV-IT2-01، RV-IT2-09). اگر ارزشی هست
+-- سند لازم است. چند سند (ارسال و دریافت انتقال دومرحله‌ای) با هم سنجیده می‌شوند.
+CREATE OR REPLACE FUNCTION inventory.assert_stock_journals(p_journal_ids uuid[], p_doc_ids uuid[], p_reversals boolean DEFAULT false)
+RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+DECLARE v_bad text; v_j uuid[] := array_remove(p_journal_ids, NULL);
+BEGIN
+  IF cardinality(v_j) = 0 THEN
+    IF EXISTS (SELECT 1 FROM inventory.doc_stock_values(p_doc_ids, p_reversals) x WHERE x.value <> 0) THEN
+      PERFORM core.raise_hk('HK_COMMERCE_STOCK_GL_MISSING', 'stock moves with a value need an inventory journal (source_module=inventory)');
+    END IF;
+    RETURN;
+  END IF;
+  SELECT string_agg(coalesce(x.account_id, g.account_id)::text || ':' || coalesce(x.value, 0) || '<>' || coalesce(g.net, 0), ', ') INTO v_bad
+    FROM inventory.doc_stock_values(p_doc_ids, p_reversals) x
+    FULL JOIN (SELECT v.account_id, sum(v.debit_base - v.credit_base) AS net FROM ledger.v_journal_line v
+                WHERE v.journal_id = ANY (v_j)
+                  AND v.account_id IN (SELECT y.account_id FROM inventory.doc_stock_values(p_doc_ids, p_reversals) y)
+                GROUP BY v.account_id) g ON g.account_id = x.account_id
+   WHERE coalesce(x.value, 0) <> coalesce(g.net, 0);
+  IF v_bad IS NOT NULL THEN
+    PERFORM core.raise_hk('HK_COMMERCE_GL_AMOUNT', 'inventory journal does not equal the stock move values per account: ' || v_bad);
+  END IF;
+END $$;
+CREATE OR REPLACE FUNCTION inventory.assert_stock_journal(p_journal_id uuid, p_doc_ids uuid[], p_reversals boolean DEFAULT false)
+RETURNS void
+LANGUAGE sql STABLE AS $$ SELECT inventory.assert_stock_journals(ARRAY[p_journal_id], p_doc_ids, p_reversals) $$;
 
 -- =====================================================================
 -- ۷. inventory — موتور ارزیابی (SECURITY DEFINER؛ مالک hk_inventory_definer؛ فهرست مجاز D-32)
@@ -1007,7 +1136,7 @@ DECLARE
   fixed_total numeric := 0; in_val numeric; dv numeric := 0; sv numeric := 0; st text := 'known';
   detail jsonb; src inventory.stock_move; src_total numeric; src_st text; avg numeric;
   cover numeric; est numeric; actual numeric; remaining numeric; rem_val numeric; outq numeric; val numeric;
-  cur_derived numeric; delta numeric; n integer := 0; ft record; prefer uuid;
+  cur_derived numeric; delta numeric; n integer := 0; ft record; prefer uuid; prev_st text; v_state_changed boolean := false;
 BEGIN
   SELECT * INTO p FROM inventory.cost_pool c WHERE c.id = p_move.pool_id;
   m := p.minor_unit;
@@ -1029,18 +1158,21 @@ BEGIN
     ELSIF p_move.valuation_rule IN ('source','reverse') THEN
       SELECT * INTO src FROM inventory.stock_move s
        WHERE s.tenant_id = p_move.tenant_id AND s.id = coalesce(p_move.reversal_of_move_id, p_move.cost_source_move_id);
-      SELECT coalesce(sum(l.value), 0),
-             CASE WHEN bool_or(l.cost_status = 'unknown') THEN 'unknown' WHEN bool_or(l.cost_status = 'estimated') THEN 'estimated' ELSE 'known' END
-        INTO src_total, src_st
+      SELECT coalesce(sum(l.value), 0) INTO src_total
         FROM inventory.valuation_layer l WHERE l.tenant_id = p_move.tenant_id AND l.move_id = src.id;
+      -- وضعیت مؤثر مبدأ = آخرین ارزیابی خود آن (نه بدترین لایهٔ تاریخی؛ RV-COM-01)
+      SELECT c.cost_status INTO src_st FROM inventory.move_cost_state c WHERE c.tenant_id = p_move.tenant_id AND c.move_id = src.id;
       in_val := CASE WHEN p_move.valuation_rule = 'reverse' OR q = abs(src.qty_base) THEN -src_total
                      ELSE round(-src_total * q / abs(src.qty_base), m) END;
       st := coalesce(src_st, 'known'); dv := in_val;
     ELSIF p_move.valuation_rule = 'components' THEN
-      SELECT coalesce(-sum(l.value), 0),
-             CASE WHEN bool_or(l.cost_status = 'unknown') THEN 'unknown' WHEN bool_or(l.cost_status = 'estimated') THEN 'estimated' ELSE 'known' END
-        INTO in_val, src_st
+      SELECT coalesce(-sum(l.value), 0) INTO in_val
         FROM inventory.stock_move s JOIN inventory.valuation_layer l ON l.tenant_id = s.tenant_id AND l.move_id = s.id
+       WHERE s.tenant_id = p_move.tenant_id AND s.cost_group_id = p_move.cost_group_id
+         AND s.source_doc_id = p_move.source_doc_id AND s.qty_base < 0;
+      SELECT CASE WHEN bool_or(c.cost_status = 'unknown') THEN 'unknown' WHEN bool_or(c.cost_status = 'estimated') THEN 'estimated' ELSE 'known' END
+        INTO src_st
+        FROM inventory.stock_move s JOIN inventory.move_cost_state c ON c.tenant_id = s.tenant_id AND c.move_id = s.id
        WHERE s.tenant_id = p_move.tenant_id AND s.cost_group_id = p_move.cost_group_id
          AND s.source_doc_id = p_move.source_doc_id AND s.qty_base < 0;
       st := coalesce(src_st, 'known'); dv := in_val;
@@ -1092,7 +1224,8 @@ BEGIN
       src_total := inventory.move_value(src.id);
       val := CASE WHEN p_move.valuation_rule = 'reverse' OR outq = abs(src.qty_base) THEN src_total
                   ELSE round(src_total * outq / abs(src.qty_base), m) END;
-      st := 'known';
+      SELECT c.cost_status INTO st FROM inventory.move_cost_state c WHERE c.tenant_id = p_move.tenant_id AND c.move_id = src.id;
+      st := coalesce(st, 'known');
     ELSIF p.qty > 0 THEN
       val := CASE WHEN outq = p.qty THEN p.value ELSE round(p.value * outq / p.qty, m) END;
       st := CASE WHEN outq > p.qty THEN 'estimated' ELSE 'known' END;
@@ -1123,6 +1256,8 @@ BEGIN
     SELECT coalesce(sum(l.value), 0) INTO cur_derived FROM inventory.valuation_layer l
      WHERE l.tenant_id = p_move.tenant_id AND l.move_id = p_move.id AND l.is_derived;
     delta := (dv + sv) - cur_derived;
+    SELECT c.cost_status INTO prev_st FROM inventory.move_cost_state c WHERE c.tenant_id = p_move.tenant_id AND c.move_id = p_move.id;
+    v_state_changed := prev_st IS DISTINCT FROM st;
     IF delta <> 0 THEN
       INSERT INTO inventory.valuation_layer (tenant_id, company_id, pool_id, move_id, layer_kind, is_derived, reason, value,
                                              cost_status, gl_date, fifo_detail, repost_run_id)
@@ -1130,6 +1265,10 @@ BEGIN
               greatest(p_move.move_date, coalesce(p_gl_floor, p_move.move_date)),
               CASE WHEN detail IS NOT NULL AND detail <> '[]'::jsonb THEN detail END, p_run);
       n := 1;
+    END IF;
+    -- تغییر وضعیت بدون تغییر مبلغ هم اصلاح است (verify_pool_replay آن را می‌بیند) و وابسته‌ها را کثیف می‌کند (RV-COM-01)
+    IF v_state_changed THEN n := n + 1; END IF;
+    IF delta <> 0 OR v_state_changed THEN
       -- وابسته‌ها در استخرهای دیگر (بازگشت فروش، ورود انتقال، خروجی تولید، برگشت حرکت) کثیف می‌شوند
       UPDATE inventory.cost_pool c
          SET dirty_from_date = d.move_date, dirty_from_seq = d.posting_seq, dirty_since = coalesce(c.dirty_since, now())
@@ -1145,6 +1284,11 @@ BEGIN
     END IF;
   END IF;
 
+  -- وضعیت جاری حرکت (اولیه: درج؛ بازپخش: بازنویسی اگر عوض شده)
+  INSERT INTO inventory.move_cost_state AS x (tenant_id, company_id, move_id, pool_id, cost_status)
+  VALUES (p_move.tenant_id, p_move.company_id, p_move.id, p.id, st)
+  ON CONFLICT (tenant_id, move_id) DO UPDATE SET cost_status = EXCLUDED.cost_status, pool_id = EXCLUDED.pool_id, updated_at = now()
+   WHERE x.cost_status IS DISTINCT FROM EXCLUDED.cost_status OR x.pool_id IS DISTINCT FROM EXCLUDED.pool_id;
   UPDATE inventory.cost_pool c
      SET qty = p.qty, value = p.value, deficit_qty = p.deficit_qty, deficit_value = p.deficit_value,
          last_unit_cost = p.last_unit_cost, updated_at = now()
@@ -1156,8 +1300,8 @@ END $$;
 CREATE OR REPLACE FUNCTION inventory.stock_move_before() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-  v_t uuid := inventory.require_tenant(); sku record; wh inventory.warehouse; src inventory.stock_move;
-  v_expect smallint; v_base_qty numeric; v_open date; v_bstatus text; v_bno text; v_bexp date;
+  v_t uuid := inventory.require_tenant(); sku record; wh inventory.warehouse; src inventory.stock_move; pol inventory.company_policy;
+  v_expect smallint; v_base_qty numeric; v_open date; v_bstatus text; v_bno text; v_bexp date; v_used numeric; dev record;
 BEGIN
   SELECT s.item_type, s.track_batch, s.base_uom_id, s.item_id INTO sku FROM catalog.v_sku s WHERE s.variant_id = NEW.variant_id;
   IF NOT FOUND OR sku.item_id <> NEW.item_id THEN
@@ -1190,40 +1334,82 @@ BEGIN
     PERFORM core.raise_hk('HK_INV_WAREHOUSE_INACTIVE', 'warehouse is inactive');
   END IF;
   NEW.branch_id := wh.branch_id;
-  -- برگشت (ابطال): همان کلید، مقدار قرینه، همان تاریخ
+  -- حساب GL موجودی روی حرکت (D-C13، RV-COM-17): دائمی ← الزامی و کلید طرف مقابل (پیش‌فرض نوع حرکت)؛ ادواری ← هیچ‌کدام
+  pol := inventory.policy_on(NEW.company_id, NEW.move_date);
+  IF pol.inventory_mode = 'perpetual' THEN
+    IF NEW.asset_account_id IS NULL THEN
+      PERFORM core.raise_hk('HK_INV_ASSET_ACCOUNT_REQUIRED', 'perpetual-mode moves carry the resolved inventory GL account');
+    END IF;
+    NEW.contra_posting_key := coalesce(NEW.contra_posting_key, inventory.default_contra_key(NEW.move_kind));
+  ELSIF NEW.asset_account_id IS NOT NULL OR NEW.contra_posting_key IS NOT NULL THEN
+    PERFORM core.raise_hk('HK_INV_PERIODIC_NO_GL', 'periodic-mode moves have no GL account; GL comes from the periodic close');
+  END IF;
+  -- فروش آفلاین (D-C06، RV-COM-20): فقط از دستگاه فعال همان شرکت و فقط برای سند فروش/صندوق
+  IF NEW.origin = 'offline_device' THEN
+    SELECT d.status, d.company_id INTO dev FROM core.device d WHERE d.tenant_id = v_t AND d.id = NEW.device_id;
+    IF NOT FOUND OR dev.company_id <> NEW.company_id OR dev.status NOT IN ('active','lost','revoked') THEN
+      PERFORM core.raise_hk('HK_INV_OFFLINE_DEVICE', 'offline moves need an enrolled device of the same company');
+    END IF;
+  END IF;
+  -- برگشت (ابطال): همان کلید، مقدار قرینه، همان تاریخ، همان حساب
   IF NEW.reversal_of_move_id IS NOT NULL THEN
     SELECT * INTO src FROM inventory.stock_move s WHERE s.tenant_id = v_t AND s.id = NEW.reversal_of_move_id;
     IF src.reversal_of_move_id IS NOT NULL OR src.variant_id <> NEW.variant_id OR src.warehouse_id <> NEW.warehouse_id
        OR src.batch_id IS DISTINCT FROM NEW.batch_id OR src.move_kind <> NEW.move_kind OR src.qty_base <> -NEW.qty_base
-       OR src.move_date <> NEW.move_date THEN
-      PERFORM core.raise_hk('HK_INV_REVERSAL_MISMATCH', 'reversal must mirror the original move (same key, kind, date; negated qty)');
+       OR src.move_date <> NEW.move_date OR src.asset_account_id IS DISTINCT FROM NEW.asset_account_id THEN
+      PERFORM core.raise_hk('HK_INV_REVERSAL_MISMATCH', 'reversal must mirror the original move (same key, kind, date, account; negated qty)');
+    END IF;
+    -- حرکتی که مبدأ بهای حرکت زنده‌ای است (برگشت از فروش، ورود انتقال، برگشت از خرید) پیش از آن وابسته‌ها برنمی‌گردد
+    IF EXISTS (SELECT 1 FROM inventory.stock_move d WHERE d.tenant_id = v_t AND d.cost_source_move_id = src.id
+                 AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = d.tenant_id AND r.reversal_of_move_id = d.id)) THEN
+      PERFORM core.raise_hk('HK_INV_REVERSAL_HAS_DEPENDENTS', 'reverse the moves that take their cost from this move first');
     END IF;
   END IF;
-  -- منبع بها
+  -- منبع بها: حرکت متناظر پیشین همان SKU که برگشت نخورده؛ جمع مصرف‌کننده‌های زنده ≤ مقدار مبدأ (RV-COM-05).
+  -- قفل مشورتی روی شناسهٔ مبدأ: دو برگشت/ورود هم‌زمان از یک مبدأ سریال می‌شوند.
   IF NEW.cost_source_move_id IS NOT NULL THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended('inventory.cost_source:' || NEW.cost_source_move_id::text, 0));
     SELECT * INTO src FROM inventory.stock_move s WHERE s.tenant_id = v_t AND s.id = NEW.cost_source_move_id;
     IF src.variant_id <> NEW.variant_id OR src.reversal_of_move_id IS NOT NULL OR NEW.move_date < src.move_date
        OR abs(NEW.qty_base) > abs(src.qty_base)
+       OR EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = v_t AND r.reversal_of_move_id = src.id)
        OR NOT ((NEW.move_kind = 'transfer_in' AND src.move_kind = 'transfer_out')
             OR (NEW.move_kind = 'sale_return' AND src.move_kind = 'sale_issue')
             OR (NEW.move_kind = 'purchase_return' AND src.move_kind IN ('receipt','opening'))) THEN
-      PERFORM core.raise_hk('HK_INV_COST_SOURCE', 'cost source must be the matching earlier move of the same SKU');
+      PERFORM core.raise_hk('HK_INV_COST_SOURCE', 'cost source must be the matching earlier live move of the same SKU');
+    END IF;
+    SELECT coalesce(sum(abs(s.qty_base)), 0) INTO v_used FROM inventory.stock_move s
+     WHERE s.tenant_id = v_t AND s.cost_source_move_id = NEW.cost_source_move_id AND s.reversal_of_move_id IS NULL
+       AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = s.tenant_id AND r.reversal_of_move_id = s.id);
+    IF v_used + abs(NEW.qty_base) > abs(src.qty_base) THEN
+      PERFORM core.raise_hk('HK_INV_COST_SOURCE_EXHAUSTED',
+                            format('source move %s has %s left, %s requested', src.id, abs(src.qty_base) - v_used, abs(NEW.qty_base)));
     END IF;
   END IF;
-  -- افتتاحیه: نخستین حرکت کلید است و هیچ حرکتی پیش از آن نمی‌آید
+  -- افتتاحیه: یک افتتاحیهٔ زنده برای هر کلید (افتتاحیهٔ برگشت‌خورده دوباره قابل ورود است؛ RV-COM-11) و نخستین حرکت کلید
   IF NEW.move_kind = 'opening' AND NEW.reversal_of_move_id IS NULL THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended(format('inventory.opening:%s:%s:%s:%s', NEW.company_id, NEW.warehouse_id,
+                                                          NEW.variant_id, NEW.batch_id), 0));
+    IF EXISTS (SELECT 1 FROM inventory.stock_move s
+                WHERE s.tenant_id = v_t AND s.company_id = NEW.company_id AND s.warehouse_id = NEW.warehouse_id
+                  AND s.variant_id = NEW.variant_id AND s.batch_id IS NOT DISTINCT FROM NEW.batch_id
+                  AND s.move_kind = 'opening' AND s.reversal_of_move_id IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = s.tenant_id AND r.reversal_of_move_id = s.id)) THEN
+      PERFORM core.raise_hk('HK_INV_OPENING_DUPLICATE', 'a live opening already exists for this warehouse/SKU/batch (cancel it first)');
+    END IF;
     IF EXISTS (SELECT 1 FROM inventory.stock_move s
                 WHERE s.tenant_id = v_t AND s.company_id = NEW.company_id AND s.warehouse_id = NEW.warehouse_id
                   AND s.variant_id = NEW.variant_id AND s.batch_id IS NOT DISTINCT FROM NEW.batch_id
                   AND s.move_kind <> 'opening' AND s.move_date < NEW.move_date) THEN
       PERFORM core.raise_hk('HK_INV_OPENING_NOT_FIRST', 'opening must precede every other move of the same key');
     END IF;
-  ELSE
+  ELSIF NEW.reversal_of_move_id IS NULL THEN
     SELECT min(s.move_date) INTO v_open FROM inventory.stock_move s
      WHERE s.tenant_id = v_t AND s.company_id = NEW.company_id AND s.warehouse_id = NEW.warehouse_id
        AND s.variant_id = NEW.variant_id AND s.batch_id IS NOT DISTINCT FROM NEW.batch_id
-       AND s.move_kind = 'opening' AND s.reversal_of_move_id IS NULL;
-    IF v_open IS NOT NULL AND NEW.move_date < v_open AND NEW.reversal_of_move_id IS NULL THEN
+       AND s.move_kind = 'opening' AND s.reversal_of_move_id IS NULL
+       AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = s.tenant_id AND r.reversal_of_move_id = s.id);
+    IF v_open IS NOT NULL AND NEW.move_date < v_open THEN
       PERFORM core.raise_hk('HK_INV_BEFORE_OPENING', format('move dated before the opening balance (%s)', v_open));
     END IF;
   END IF;
@@ -1238,6 +1424,9 @@ BEGIN
       PERFORM core.raise_hk('HK_INV_BATCH_EXPIRED', format('batch %s expired on %s', v_bno, v_bexp));
     END IF;
   END IF;
+  -- قفل کاربرد کالا (D-M18 بخش ۰۴، RV-MD-01): نخستین حرکت، واحد پایه/نوع/ردیابی/ضریب واحدها را ثابت می‌کند
+  UPDATE catalog.item i SET usage_locked_at = now()
+   WHERE i.tenant_id = v_t AND i.id = NEW.item_id AND i.usage_locked_at IS NULL;
   NEW.pool_id := inventory.pool_acquire(NEW.company_id, NEW.item_id, NEW.variant_id, NEW.warehouse_id, NEW.move_date);
   NEW.posting_seq := nextval('inventory.posting_seq');
   NEW.created_at := now();
@@ -1268,13 +1457,15 @@ BEGIN
     v_eff := CASE WHEN wh.kind = 'transit' THEN 'block' WHEN wh.negative_policy = 'inherit' THEN pol.negative_stock_default ELSE wh.negative_policy END;
     v_min := v_bal;
     IF v_eff = 'block' AND v_backdated THEN
-      SELECT min(x.run) INTO v_min FROM (
-        SELECT s.move_date, s.posting_seq,
-               sum(s.qty_base) OVER (ORDER BY s.move_date, s.posting_seq ROWS UNBOUNDED PRECEDING) AS run
+      -- کمینهٔ ماندهٔ جاری از نقطهٔ این حرکت به بعد = ماندهٔ فعلی − بیشینهٔ «جمع حرکت‌های پس از هر نقطه». فقط بازهٔ پس از
+      -- نقطهٔ حرکت پیمایش می‌شود (نمایهٔ stock_move_wh_point)، نه کل تاریخچهٔ کالا (RV-COM-19).
+      SELECT min(v_bal - coalesce(x.after_qty, 0)) INTO v_min FROM (
+        SELECT sum(s.qty_base) OVER (ORDER BY s.move_date DESC, s.posting_seq DESC
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS after_qty
           FROM inventory.stock_move s
          WHERE s.tenant_id = NEW.tenant_id AND s.warehouse_id = NEW.warehouse_id AND s.variant_id = NEW.variant_id
-           AND s.batch_id IS NOT DISTINCT FROM NEW.batch_id) x
-       WHERE (x.move_date, x.posting_seq) >= (NEW.move_date, NEW.posting_seq);
+           AND s.batch_id IS NOT DISTINCT FROM NEW.batch_id
+           AND (s.move_date, s.posting_seq) >= (NEW.move_date, NEW.posting_seq)) x;
     END IF;
     IF v_min < 0 THEN
       IF v_eff = 'block' AND NOT (NEW.origin = 'offline_device' AND wh.kind <> 'transit') THEN
@@ -1391,7 +1582,7 @@ END $$;
 
 CREATE OR REPLACE FUNCTION inventory.serial_move_after() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-DECLARE mv inventory.stock_move; s inventory.serial; v_ok boolean; v_wdays integer;
+DECLARE mv inventory.stock_move; s inventory.serial; v_ok boolean; v_wdays integer; orig inventory.stock_move; v_sale inventory.stock_move;
 BEGIN
   SELECT * INTO mv FROM inventory.stock_move x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.move_id;
   SELECT * INTO s FROM inventory.serial x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.serial_id FOR UPDATE;
@@ -1405,23 +1596,38 @@ BEGIN
       PERFORM core.raise_hk('HK_INV_SERIAL_STATE', format('serial %s is %s and cannot move %s here', s.serial_no, s.status,
                             CASE WHEN NEW.qty_sign > 0 THEN 'in' ELSE 'out' END));
     END IF;
+    -- تعارض آفلاین: خریدار و گارانتی قبلی حفظ و در استثنا ثبت می‌شوند (RV-X2-05)
     INSERT INTO inventory.stock_exception (tenant_id, company_id, kind, move_id, warehouse_id, variant_id, serial_id, detail)
     VALUES (NEW.tenant_id, NEW.company_id, 'serial_conflict', NEW.move_id, NEW.warehouse_id, mv.variant_id, NEW.serial_id,
-            jsonb_build_object('status_before', s.status, 'warehouse_before', s.warehouse_id));
+            jsonb_build_object('status_before', s.status, 'warehouse_before', s.warehouse_id, 'sold_to_before', s.sold_to_party_id,
+                               'warranty_start_before', s.warranty_start, 'warranty_end_before', s.warranty_end,
+                               'conflicting_party', mv.party_id));
   END IF;
+  SELECT i.warranty_days INTO v_wdays FROM catalog.item i WHERE i.tenant_id = NEW.tenant_id AND i.id = mv.item_id;
   IF NEW.qty_sign > 0 THEN
+    -- بازگشت کالای فروخته‌شده (برگشت از فروش یا ابطال فروش): گارانتی و خریدار پاک می‌شوند؛ تاریخچه در serial_move می‌ماند
     UPDATE inventory.serial SET status = 'in_stock', company_id = NEW.company_id, warehouse_id = NEW.warehouse_id,
            last_move_id = NEW.move_id, last_move_kind = mv.move_kind,
-           batch_id = coalesce(batch_id, mv.batch_id)
+           batch_id = coalesce(batch_id, mv.batch_id),
+           warranty_start = CASE WHEN mv.move_kind IN ('sale_return','sale_issue') THEN NULL ELSE warranty_start END,
+           warranty_end   = CASE WHEN mv.move_kind IN ('sale_return','sale_issue') THEN NULL ELSE warranty_end END,
+           sold_to_party_id = CASE WHEN mv.move_kind IN ('sale_return','sale_issue') THEN NULL ELSE sold_to_party_id END
+     WHERE id = s.id;
+  ELSIF NOT v_ok THEN
+    UPDATE inventory.serial SET status = 'out', warehouse_id = NULL, last_move_id = NEW.move_id, last_move_kind = mv.move_kind
      WHERE id = s.id;
   ELSE
-    SELECT i.warranty_days INTO v_wdays FROM catalog.item i WHERE i.tenant_id = NEW.tenant_id AND i.id = mv.item_id;
+    -- فروش تازه: گارانتی و خریدار؛ ابطال یک برگشت از فروش: گارانتی و خریدار فروش اصلی بازمی‌گردند
+    IF mv.move_kind = 'sale_issue' AND mv.reversal_of_move_id IS NULL THEN
+      v_sale := mv;
+    ELSIF mv.move_kind = 'sale_return' AND mv.reversal_of_move_id IS NOT NULL THEN
+      SELECT * INTO orig FROM inventory.stock_move x WHERE x.tenant_id = NEW.tenant_id AND x.id = mv.reversal_of_move_id;
+      SELECT * INTO v_sale FROM inventory.stock_move x WHERE x.tenant_id = NEW.tenant_id AND x.id = orig.cost_source_move_id;
+    END IF;
     UPDATE inventory.serial SET status = 'out', warehouse_id = NULL, last_move_id = NEW.move_id, last_move_kind = mv.move_kind,
-           warranty_start = CASE WHEN mv.move_kind = 'sale_issue' AND mv.reversal_of_move_id IS NULL AND v_wdays IS NOT NULL
-                                 THEN mv.move_date ELSE warranty_start END,
-           warranty_end   = CASE WHEN mv.move_kind = 'sale_issue' AND mv.reversal_of_move_id IS NULL AND v_wdays IS NOT NULL
-                                 THEN mv.move_date + v_wdays ELSE warranty_end END,
-           sold_to_party_id = CASE WHEN mv.move_kind = 'sale_issue' AND mv.reversal_of_move_id IS NULL THEN mv.party_id ELSE sold_to_party_id END
+           warranty_start = CASE WHEN v_sale.id IS NOT NULL AND v_wdays IS NOT NULL THEN v_sale.move_date ELSE warranty_start END,
+           warranty_end   = CASE WHEN v_sale.id IS NOT NULL AND v_wdays IS NOT NULL THEN v_sale.move_date + v_wdays ELSE warranty_end END,
+           sold_to_party_id = CASE WHEN v_sale.id IS NOT NULL THEN v_sale.party_id ELSE sold_to_party_id END
      WHERE id = s.id;
   END IF;
   RETURN NULL;
@@ -1789,6 +1995,85 @@ DROP TRIGGER IF EXISTS trg_stock_doc_line_guard ON inventory.stock_doc_line;
 CREATE TRIGGER trg_stock_doc_line_guard BEFORE INSERT OR UPDATE OR DELETE ON inventory.stock_doc_line
   FOR EACH ROW EXECUTE FUNCTION inventory.stock_doc_line_guard();
 
+-- سند انبار هنگام ثبت/ارسال/دریافت/ابطال (deferred؛ INV-INV-29، RV-COM-03): شمارهٔ همین سند، GL موجودی همین سند با مبلغ حرکت‌ها
+-- (دائمی)، و برای هر سطر حرکت‌های زندهٔ همان SKU، انبار و نوع به اندازهٔ مقدار سطر؛ ورود انتقال از خروج همان سطر.
+CREATE OR REPLACE FUNCTION inventory.stock_doc_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_bad text; v_mode text;
+BEGIN
+  IF NEW.status = 'cancelled' AND TG_OP = 'UPDATE' AND OLD.status IN ('posted','in_transit') THEN
+    IF EXISTS (SELECT 1 FROM inventory.stock_move m WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id
+                  AND m.reversal_of_move_id IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.reversal_of_move_id = m.id)) THEN
+      PERFORM core.raise_hk('HK_INV_CANCEL_STOCK', 'every stock move of a cancelled stock document must be reversed');
+    END IF;
+    PERFORM inventory.assert_gl_link(NEW.cancel_journal_id, 'inventory', NEW.id);
+    PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id, true);
+    PERFORM inventory.assert_gl_link(NEW.gl_receive_journal_id, 'inventory', NEW.id, true);
+    RETURN NULL;
+  END IF;
+  IF NOT (NEW.status IN ('in_transit','posted') AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status)) THEN RETURN NULL; END IF;
+  -- رویداد کهنه (ارسال و دریافت در یک تراکنش): رویداد بعدی همان سند وضعیت نهایی را می‌سنجد
+  IF NOT EXISTS (SELECT 1 FROM inventory.stock_doc x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.id AND x.status = NEW.status) THEN
+    RETURN NULL;
+  END IF;
+  PERFORM inventory.assert_number_link(NEW.number_issued_id, 'inventory.' || NEW.doc_type, NEW.id);
+  IF NOT EXISTS (SELECT 1 FROM inventory.stock_doc_line l WHERE l.tenant_id = NEW.tenant_id AND l.doc_id = NEW.id) THEN
+    PERFORM core.raise_hk('HK_INV_DOC_EMPTY', 'a posted stock document needs at least one line');
+  END IF;
+  -- GL: دائمی ← سند(های) موجودی همین سند با مبلغ حرکت‌ها؛ افتتاحیهٔ مهاجرت بی‌GL (CR-MG01)؛ ادواری ← بی‌سند
+  v_mode := (inventory.policy_on(NEW.company_id, NEW.doc_date)).inventory_mode;
+  IF NOT ((v_mode = 'perpetual' AND NEW.gl_status IN ('posted','not_required')) OR (v_mode = 'periodic' AND NEW.gl_status = 'not_required')) THEN
+    PERFORM core.raise_hk('HK_INV_DOC_GL', format('a %s-mode stock document cannot have gl_status %s', v_mode, NEW.gl_status));
+  END IF;
+  PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id);
+  PERFORM inventory.assert_gl_link(NEW.gl_receive_journal_id, 'inventory', NEW.id);
+  IF v_mode = 'perpetual' AND NOT (NEW.doc_type = 'opening' AND NEW.origin = 'migration' AND NEW.gl_status = 'not_required') THEN
+    PERFORM inventory.assert_stock_journals(ARRAY[NEW.gl_journal_id, NEW.gl_receive_journal_id], ARRAY[NEW.id]);
+  END IF;
+  -- سطر ↔ حرکت
+  WITH l AS (SELECT * FROM inventory.stock_doc_line x WHERE x.tenant_id = NEW.tenant_id AND x.doc_id = NEW.id),
+  e AS (
+    SELECT l.id AS line_id, l.variant_id, NEW.warehouse_id AS wh,
+           CASE WHEN NEW.doc_type = 'opening' THEN ARRAY['opening']
+                WHEN NEW.doc_type = 'production' AND l.direction = 'out' THEN ARRAY['production_out']
+                WHEN NEW.doc_type = 'production' THEN ARRAY['production_in']
+                WHEN l.direction = 'out' THEN ARRAY['adjust_out','waste','consumption']
+                ELSE ARRAY['adjust_in'] END AS kinds, l.qty_base AS q
+      FROM l WHERE NEW.doc_type <> 'transfer'
+    UNION ALL SELECT l.id, l.variant_id, NEW.warehouse_id, ARRAY['transfer_out'], l.qty_base FROM l WHERE NEW.doc_type = 'transfer'
+    UNION ALL SELECT l.id, l.variant_id, coalesce(NEW.transit_warehouse_id, NEW.to_warehouse_id), ARRAY['transfer_in'], l.qty_base
+                FROM l WHERE NEW.doc_type = 'transfer'
+    UNION ALL SELECT l.id, l.variant_id, NEW.transit_warehouse_id, ARRAY['transfer_out'], coalesce(l.received_qty_base, l.qty_base)
+                FROM l WHERE NEW.doc_type = 'transfer' AND NEW.two_step AND NEW.status = 'posted'
+    UNION ALL SELECT l.id, l.variant_id, NEW.to_warehouse_id, ARRAY['transfer_in'], coalesce(l.received_qty_base, l.qty_base)
+                FROM l WHERE NEW.doc_type = 'transfer' AND NEW.two_step AND NEW.status = 'posted'),
+  m AS (SELECT s.* FROM inventory.stock_move s WHERE s.tenant_id = NEW.tenant_id AND s.source_doc_id = NEW.id AND s.reversal_of_move_id IS NULL)
+  SELECT string_agg(x, '; ') INTO v_bad FROM (
+    SELECT format('line %s %s@%s: moved %s of %s', e.line_id, array_to_string(e.kinds, '/'), e.wh,
+                  coalesce((SELECT sum(abs(m.qty_base)) FROM m WHERE m.source_line_id = e.line_id AND m.variant_id = e.variant_id
+                              AND m.warehouse_id = e.wh AND m.move_kind = ANY (e.kinds) AND m.company_id = NEW.company_id), 0), e.q) AS x
+      FROM e
+     WHERE e.q <> coalesce((SELECT sum(abs(m.qty_base)) FROM m WHERE m.source_line_id = e.line_id AND m.variant_id = e.variant_id
+                              AND m.warehouse_id = e.wh AND m.move_kind = ANY (e.kinds) AND m.company_id = NEW.company_id), 0)
+    UNION ALL
+    SELECT format('move %s (%s) matches no line', m.id, m.move_kind) FROM m
+     WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.line_id = m.source_line_id AND e.variant_id = m.variant_id AND e.wh = m.warehouse_id
+                         AND m.move_kind = ANY (e.kinds) AND m.company_id = NEW.company_id)
+    UNION ALL
+    SELECT format('transfer_in %s is not valued from its line''s transfer_out', m.id) FROM m
+     WHERE m.move_kind = 'transfer_in' AND NOT EXISTS (
+             SELECT 1 FROM inventory.stock_move o WHERE o.tenant_id = m.tenant_id AND o.id = m.cost_source_move_id
+                AND o.source_doc_id = NEW.id AND o.source_line_id = m.source_line_id AND o.move_kind = 'transfer_out')) z;
+  IF v_bad IS NOT NULL THEN
+    PERFORM core.raise_hk('HK_INV_DOC_STOCK_LINK', 'stock moves do not match the document lines: ' || v_bad);
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_stock_doc_verify ON inventory.stock_doc;
+CREATE CONSTRAINT TRIGGER trg_stock_doc_verify AFTER INSERT OR UPDATE ON inventory.stock_doc
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION inventory.stock_doc_verify();
+
 -- انبارگردانی: draft → counting → reviewing → posted؛ لغو پیش از ثبت
 CREATE OR REPLACE FUNCTION inventory.count_session_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -1816,6 +2101,9 @@ BEGIN
   IF NEW.status = 'posted' AND EXISTS (SELECT 1 FROM inventory.count_line l WHERE l.tenant_id = NEW.tenant_id AND l.session_id = NEW.id
                                                                         AND (l.system_qty_base IS NULL OR l.counted_qty_base IS NULL)) THEN
     PERFORM core.raise_hk('HK_INV_COUNT_INCOMPLETE', 'every line needs a system snapshot and an accepted count');
+  END IF;
+  IF NEW.status = 'posted' THEN
+    PERFORM inventory.assert_number_link(NEW.number_issued_id, 'inventory.count', NEW.id);
   END IF;
   RETURN NEW;
 END $$;
@@ -1885,16 +2173,78 @@ BEGIN
       PERFORM core.raise_hk('HK_INV_PERIODIC_STATE', 'posted periodic close can only be reversed');
     END IF;
   END IF;
-  IF NEW.status = 'posted' AND NOT EXISTS (SELECT 1 FROM inventory.company_policy p
-                                            WHERE p.tenant_id = NEW.tenant_id AND p.company_id = NEW.company_id
-                                              AND p.inventory_mode = 'periodic' AND p.effective_from <= NEW.period_from) THEN
-    PERFORM core.raise_hk('HK_INV_PERIODIC_MODE', 'company is not in periodic mode for this period');
+  -- حالت ادواری در تمام دوره (یک ردیف سیاست از آغاز تا پایان؛ RV-COM-08) و دوره درون سال مالی ارجاع‌شده
+  IF NEW.status = 'posted' AND (TG_OP = 'INSERT' OR OLD.status = 'draft') THEN
+    IF (inventory.policy_on(NEW.company_id, NEW.period_from)).inventory_mode <> 'periodic'
+       OR (inventory.policy_on(NEW.company_id, NEW.period_from)).id <> (inventory.policy_on(NEW.company_id, NEW.period_to)).id THEN
+      PERFORM core.raise_hk('HK_INV_PERIODIC_MODE', 'company is not in periodic mode for the whole period');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM ledger.fiscal_year f WHERE f.tenant_id = NEW.tenant_id AND f.id = NEW.fiscal_year_id
+                     AND NEW.period_from >= f.start_date AND NEW.period_to <= f.end_date) THEN
+      PERFORM core.raise_hk('HK_INV_PERIODIC_PERIOD', 'the close period must lie inside its fiscal year');
+    END IF;
   END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_periodic_close_guard ON inventory.periodic_close;
 CREATE TRIGGER trg_periodic_close_guard BEFORE INSERT OR UPDATE OR DELETE ON inventory.periodic_close
   FOR EACH ROW EXECUTE FUNCTION inventory.periodic_close_guard();
+
+-- سطرهای بستن ادواری فقط در پیش‌نویس تغییر می‌کنند (RV-COM-07؛ تنها ورودی بخش ادواری زیردفتر)
+CREATE OR REPLACE FUNCTION inventory.periodic_close_line_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE r record; v_status text;
+BEGIN
+  r := CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+  SELECT c.status INTO v_status FROM inventory.periodic_close c WHERE c.tenant_id = r.tenant_id AND c.id = r.close_id;
+  IF v_status IS NOT NULL AND v_status <> 'draft' THEN
+    PERFORM core.raise_hk('HK_INV_PERIODIC_STATE', 'lines of a posted periodic close are immutable');
+  END IF;
+  IF TG_OP = 'UPDATE' AND (NEW.close_id <> OLD.close_id) THEN
+    PERFORM core.raise_hk('HK_INV_PERIODIC_STATE', 'a periodic close line cannot move to another close');
+  END IF;
+  RETURN r;
+END $$;
+DROP TRIGGER IF EXISTS trg_periodic_close_line_guard ON inventory.periodic_close_line;
+CREATE TRIGGER trg_periodic_close_line_guard BEFORE INSERT OR UPDATE OR DELETE ON inventory.periodic_close_line
+  FOR EACH ROW EXECUTE FUNCTION inventory.periodic_close_line_guard();
+
+-- ثبت/برگشت بستن ادواری (deferred؛ RV-COM-07، RV-COM-08، RV-COM-09): Σ سطرها = سرسند؛ سند GL از همین بستن با
+-- خالص حساب موجودی هر سطر = پایان − ابتدا و خالص inventory.cogs = cogs_value؛ برگشت = برگشت همان سند.
+CREATE OR REPLACE FUNCTION inventory.periodic_close_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE t record; v_bad text;
+BEGIN
+  IF NEW.status = 'reversed' AND TG_OP = 'UPDATE' AND OLD.status = 'posted' THEN
+    PERFORM inventory.assert_gl_link(NEW.reversal_journal_id, 'inventory', NEW.id);
+    PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id, true);
+    RETURN NULL;
+  END IF;
+  IF NEW.status <> 'posted' OR (TG_OP = 'UPDATE' AND OLD.status = 'posted') THEN RETURN NULL; END IF;
+  SELECT count(*) AS n, coalesce(sum(l.opening_value), 0) AS o, coalesce(sum(l.closing_value), 0) AS c
+    INTO t FROM inventory.periodic_close_line l WHERE l.tenant_id = NEW.tenant_id AND l.close_id = NEW.id;
+  IF t.n = 0 OR t.o <> NEW.opening_value OR t.c <> NEW.closing_value THEN
+    PERFORM core.raise_hk('HK_INV_PERIODIC_LINES', format('lines sum to opening %s / closing %s, header has %s / %s',
+                          t.o, t.c, NEW.opening_value, NEW.closing_value));
+  END IF;
+  IF NEW.basis = 'opening' THEN RETURN NULL; END IF;
+  PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id);
+  SELECT string_agg(format('%s: journal %s expected %s', x.account_id, coalesce(x.net, 0), x.expected), ', ') INTO v_bad FROM (
+    SELECT l.asset_account_id AS account_id, sum(l.closing_value - l.opening_value) AS expected,
+           (SELECT sum(v.debit_base - v.credit_base) FROM ledger.v_journal_line v
+             WHERE v.journal_id = NEW.gl_journal_id AND v.account_id = l.asset_account_id) AS net
+      FROM inventory.periodic_close_line l WHERE l.tenant_id = NEW.tenant_id AND l.close_id = NEW.id
+     GROUP BY l.asset_account_id) x
+   WHERE coalesce(x.net, 0) <> x.expected;
+  IF v_bad IS NOT NULL THEN
+    PERFORM core.raise_hk('HK_COMMERCE_GL_AMOUNT', 'periodic close journal does not move each inventory account to its closing value: ' || v_bad);
+  END IF;
+  PERFORM inventory.assert_gl_amounts(NEW.gl_journal_id, jsonb_build_object('inventory.cogs', NEW.cogs_value), 0);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_periodic_close_verify ON inventory.periodic_close;
+CREATE CONSTRAINT TRIGGER trg_periodic_close_verify AFTER INSERT OR UPDATE ON inventory.periodic_close
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION inventory.periodic_close_verify();
 
 CREATE OR REPLACE FUNCTION inventory.stock_exception_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -1928,9 +2278,12 @@ SELECT m.tenant_id, m.id AS move_id, m.company_id, m.warehouse_id, m.item_id, m.
        coalesce(sum(l.value) FILTER (WHERE NOT l.is_derived), 0) AS fixed_value,
        coalesce(sum(l.value) FILTER (WHERE l.is_derived), 0) AS derived_value,
        coalesce(sum(l.value), 0) AS total_value,
-       CASE WHEN bool_or(l.cost_status = 'unknown') THEN 'unknown' WHEN bool_or(l.cost_status = 'estimated') THEN 'estimated'
-            ELSE 'known' END AS cost_status
+       -- وضعیت جاری حرکت از آخرین ارزیابی (RV-COM-01)، نه بدترین لایهٔ تاریخی
+       coalesce(min(c.cost_status),
+                CASE WHEN bool_or(l.cost_status = 'unknown') THEN 'unknown' WHEN bool_or(l.cost_status = 'estimated') THEN 'estimated'
+                     ELSE 'known' END) AS cost_status
   FROM inventory.stock_move m
+  LEFT JOIN inventory.move_cost_state c ON c.tenant_id = m.tenant_id AND c.move_id = m.id
   LEFT JOIN inventory.valuation_layer l ON l.tenant_id = m.tenant_id AND l.move_id = m.id
  GROUP BY m.tenant_id, m.id;
 
@@ -2023,6 +2376,11 @@ LANGUAGE sql STABLE AS $$
                    WHERE sm.tenant_id = s.tenant_id AND sm.serial_id = s.id ORDER BY sm.created_at DESC, sm.id DESC LIMIT 1) x ON true
    WHERE s.company_id = p_company_id
      AND ((x.qty_sign = 1 AND (s.status <> 'in_stock' OR s.warehouse_id <> x.warehouse_id)) OR (x.qty_sign = -1 AND s.status <> 'out'))
+  UNION ALL
+  SELECT m.id, 'move has no current cost state'
+    FROM inventory.stock_move m
+   WHERE m.company_id = p_company_id
+     AND NOT EXISTS (SELECT 1 FROM inventory.move_cost_state c WHERE c.tenant_id = m.tenant_id AND c.move_id = m.id)
 $$;
 
 -- =====================================================================
@@ -2084,7 +2442,7 @@ CREATE TABLE IF NOT EXISTS sales.pricing_rule (
   row_version          integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
-  UNIQUE (tenant_id, code, version),
+  UNIQUE NULLS NOT DISTINCT (tenant_id, company_id, code, version),          -- کد هر شرکت (یا سطح مستأجر)؛ RV-COM-21
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, item_id) REFERENCES catalog.item(tenant_id, id),
   FOREIGN KEY (tenant_id, item_id, variant_id) REFERENCES catalog.item_variant(tenant_id, item_id, id),
@@ -2112,8 +2470,9 @@ CREATE TABLE IF NOT EXISTS sales.pricing_rule (
                                   AND num_nonnulls(discount_percent, discount_amount, override_price) = 0)),
   CONSTRAINT pricing_rule_item_scope CHECK (variant_id IS NULL OR item_id IS NOT NULL),
   CHECK ((source_pack IS NULL) = (source_pack_version IS NULL)),
-  -- یک نسخهٔ فعال برای هر کد در هر بازه
-  CONSTRAINT pricing_rule_one_active EXCLUDE USING gist (tenant_id WITH =, code WITH =,
+  -- یک نسخهٔ فعال برای هر (شرکت یا سطح مستأجر، کد) در هر بازه (RV-COM-21: بستهٔ صنفی در هر شرکت نصب می‌شود)
+  CONSTRAINT pricing_rule_one_active EXCLUDE USING gist (tenant_id WITH =,
+    (coalesce(company_id, '00000000-0000-0000-0000-000000000000'::uuid)) WITH =, code WITH =,
     daterange(valid_from, valid_to, '[]') WITH &&) WHERE (status = 'active')
 );
 SELECT core.enable_tenant_rls('sales.pricing_rule');
@@ -2280,7 +2639,8 @@ CREATE TABLE IF NOT EXISTS sales.delivery (
   CONSTRAINT delivery_cancel CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL AND cancel_reason IS NOT NULL)),
   CONSTRAINT delivery_return_link CHECK ((direction = 'return') = (original_delivery_id IS NOT NULL)),
   CONSTRAINT delivery_gl_link CHECK ((gl_status = 'posted') = (gl_journal_id IS NOT NULL)),
-  CONSTRAINT delivery_gl_when_posted CHECK (status = 'draft' OR gl_status <> 'pending')
+  CONSTRAINT delivery_gl_when_posted CHECK (status = 'draft' OR gl_status <> 'pending'),
+  CONSTRAINT delivery_cancel_gl CHECK (status <> 'cancelled' OR gl_status <> 'posted' OR cancel_journal_id IS NOT NULL)
 );
 SELECT core.enable_tenant_rls('sales.delivery');
 
@@ -2322,7 +2682,8 @@ CREATE TABLE IF NOT EXISTS sales.gl_batch (
   source_kind      text NOT NULL CHECK (source_kind IN ('pos_shift','manual')),
   source_ref       uuid,                 -- pos.shift (FK بین‌ماژولی در جهت pos → sales ممکن نیست؛ ارجاع نرم)
   status           text NOT NULL DEFAULT 'open' CHECK (status IN ('open','posted','cancelled')),
-  gl_journal_id    uuid,
+  gl_journal_id    uuid,                 -- سند فروش دسته (source_module='sales'): دریافتنی، درآمد، تخفیف، مالیات
+  stock_journal_id uuid,                 -- سند موجودی دسته (source_module='inventory'): بهای تمام‌شده / موجودی (RV-IT2-01)
   posted_at        timestamptz,
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now(),
@@ -2332,6 +2693,7 @@ CREATE TABLE IF NOT EXISTS sales.gl_batch (
   UNIQUE (tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, branch_id) REFERENCES core.branch(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, gl_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, stock_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   CHECK ((status = 'posted') = (gl_journal_id IS NOT NULL AND posted_at IS NOT NULL))
 );
 SELECT core.enable_tenant_rls('sales.gl_batch');
@@ -2349,6 +2711,7 @@ CREATE TABLE IF NOT EXISTS sales.invoice (
   doc_no                   text CHECK (char_length(doc_no) BETWEEN 1 AND 100),
   number_source            text NOT NULL DEFAULT 'server' CHECK (number_source IN ('server','device')),
   device_id                uuid,
+  pos_ticket_id            uuid,                  -- رسید صندوقی که شماره‌اش شمارهٔ این فاکتور است (ارجاع نرم؛ pos در L6؛ RV-IT2-06)
   original_invoice_id      uuid,                  -- ریشهٔ زنجیره (فاکتور اصلی) برای برگشت و اصلاحی
   supersedes_invoice_id    uuid,                  -- اصلاحی: نسخهٔ قبلی (اصلی یا اصلاحی قبلی)
   order_id                 uuid,
@@ -2394,9 +2757,11 @@ CREATE TABLE IF NOT EXISTS sales.invoice (
   source_ref               text CHECK (char_length(source_ref) <= 200),
   salesperson_party_id     uuid,
   gl_mode                  text NOT NULL DEFAULT 'per_document' CHECK (gl_mode IN ('per_document','batched','none')),
-  gl_journal_id            uuid,
+  gl_journal_id            uuid,                  -- سند فروش (source_module='sales')
+  stock_journal_id         uuid,                  -- سند موجودی همین فاکتور (source_module='inventory'؛ RV-IT2-01)
   gl_batch_id              uuid,
   cancel_journal_id        uuid,
+  cancel_stock_journal_id  uuid,                  -- فقط فاکتور دسته‌ای که دسته‌اش پیش‌تر ثبت شده: سند موجودی حرکت‌های برگشت
   credit_check_id          uuid,
   approval_request_id      uuid,
   posted_by                uuid,
@@ -2426,8 +2791,10 @@ CREATE TABLE IF NOT EXISTS sales.invoice (
   FOREIGN KEY (tenant_id, company_id, warehouse_id) REFERENCES inventory.warehouse(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, salesperson_party_id) REFERENCES parties.party(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, gl_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, stock_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, gl_batch_id) REFERENCES sales.gl_batch(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, cancel_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, cancel_stock_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, approval_request_id) REFERENCES core.approval_request(tenant_id, id),
   FOREIGN KEY (tenant_id, posted_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, cancelled_by) REFERENCES core.tenant_membership(tenant_id, user_id),
@@ -2436,7 +2803,10 @@ CREATE TABLE IF NOT EXISTS sales.invoice (
                                        AND (doc_kind = 'correction') = (supersedes_invoice_id IS NOT NULL)),
   CONSTRAINT invoice_number CHECK ((status <> 'draft') = (number_issued_id IS NOT NULL AND doc_no IS NOT NULL
                                                            AND posted_at IS NOT NULL AND issued_at IS NOT NULL)),
-  CONSTRAINT invoice_device_number CHECK ((number_source = 'device') = (device_id IS NOT NULL)),
+  -- شمارهٔ دستگاه = شمارهٔ رسید صندوق (RV-IT2-06): فقط کانال pos، با دستگاه و رسید مبدأ
+  CONSTRAINT invoice_device_number CHECK ((number_source = 'device') = (device_id IS NOT NULL)
+                                          AND (number_source = 'device') = (pos_ticket_id IS NOT NULL)
+                                          AND (number_source <> 'device' OR channel = 'pos')),
   CONSTRAINT invoice_cancel CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL AND cancel_reason IS NOT NULL)),
   CONSTRAINT invoice_totals CHECK (net_amount = gross_amount - line_discount_total - invoice_discount_amount
                                    AND total_amount = net_amount + vat_amount + other_tax_amount + other_levy_amount),
@@ -2450,11 +2820,14 @@ CREATE TABLE IF NOT EXISTS sales.invoice (
                                                   OR cash_amount + credit_amount = total_amount - vat_amount - other_tax_amount)),
   CONSTRAINT invoice_stock_mode CHECK (stock_mode <> 'immediate' OR warehouse_id IS NOT NULL OR doc_kind = 'correction'),
   CONSTRAINT invoice_due_date CHECK (due_date IS NULL OR due_date >= doc_date),
+  -- gl_mode='none': فاکتور صفر، یا تاریخچهٔ مهاجرت که GL آن از افتتاحیه/تاریخچهٔ ledger می‌آید (RV-COM-12، CR-MG15)
   CONSTRAINT invoice_gl_shape CHECK (status = 'draft'
        OR (gl_mode = 'per_document' AND gl_journal_id IS NOT NULL AND gl_batch_id IS NULL)
-       OR (gl_mode = 'batched' AND gl_batch_id IS NOT NULL AND gl_journal_id IS NULL)
-       OR (gl_mode = 'none' AND total_amount = 0 AND gl_journal_id IS NULL AND gl_batch_id IS NULL)),
+       OR (gl_mode = 'batched' AND gl_batch_id IS NOT NULL AND gl_journal_id IS NULL AND stock_journal_id IS NULL)
+       OR (gl_mode = 'none' AND (total_amount = 0 OR channel = 'migration') AND gl_journal_id IS NULL AND gl_batch_id IS NULL
+           AND stock_journal_id IS NULL)),
   CONSTRAINT invoice_cancel_gl CHECK (status <> 'cancelled' OR gl_mode <> 'per_document' OR cancel_journal_id IS NOT NULL),
+  CONSTRAINT invoice_cancel_stock_gl CHECK (cancel_stock_journal_id IS NULL OR (status = 'cancelled' AND gl_mode = 'batched')),
   CONSTRAINT invoice_moadian_shape CHECK (NOT moadian_required OR status = 'draft'
                                           OR (moadian_type IS NOT NULL AND moadian_pattern IS NOT NULL AND buyer_person_type IS NOT NULL))
 );
@@ -2499,6 +2872,8 @@ CREATE TABLE IF NOT EXISTS sales.invoice_line (
   moadian_unit_code       text REFERENCES ref.moadian_unit(code),
   item_title              text CHECK (item_title = core.fa_normalize_text(item_title) AND char_length(item_title) BETWEEN 1 AND 400),  -- sstt
   price_source            text NOT NULL DEFAULT 'price_list' CHECK (price_source IN ('price_list','manual','rule','contract','barcode','migration')),
+  line_kind               text NOT NULL DEFAULT 'goods' CHECK (line_kind IN ('goods','service_charge','installment_markup')),   -- حق سرویس (CR-T07)، اضافه‌بهای اقساط (RV-X3-04)
+  pos_ticket_line_id      uuid,                 -- سطر رسید صندوق مبدأ (ارجاع نرم؛ برگشت صندوق سطر فروش را با آن می‌یابد؛ RV-X2-04)
   price_list_id           uuid,
   price_entry_id          uuid,
   original_line_id        uuid,                 -- برگشت/اصلاحی ← سطر فاکتور اصلی (ریشه)
@@ -2542,6 +2917,7 @@ CREATE TABLE IF NOT EXISTS sales.invoice_line (
 );
 SELECT core.enable_tenant_rls('sales.invoice_line');
 CREATE INDEX IF NOT EXISTS invoice_line_original_idx ON sales.invoice_line (tenant_id, original_line_id) WHERE original_line_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS invoice_line_pos_line_uq ON sales.invoice_line (tenant_id, pos_ticket_line_id) WHERE pos_ticket_line_id IS NOT NULL;
 
 -- ردپای تخفیف هر سطر (قطعی و قابل ممیزی؛ همان ترتیب موتور قیمت آفلاین)
 CREATE TABLE IF NOT EXISTS sales.invoice_line_discount (
@@ -2563,6 +2939,27 @@ CREATE TABLE IF NOT EXISTS sales.invoice_line_discount (
   CHECK ((basis = 'percent') = (percent IS NOT NULL))
 );
 SELECT core.enable_tenant_rls('sales.invoice_line_discount');
+
+-- جدول اقساط فاکتور (RV-X3-03، RV-X3-04): سرویس آن را از شرایط پرداخت (parties.payment_term_line، تقویم جلالی در لایهٔ برنامه) یا
+-- طرح اقساط دستی می‌سازد؛ قسط ۱ می‌تواند پیش‌پرداخت (سررسید = تاریخ فاکتور) باشد. treasury برای هر قسط یک قلم باز با
+-- source_line_key = 'inst:<seq>' ثبت می‌کند. markup_amount سهم اضافه‌بهای اقساط در همان قسط است که در سررسید از
+-- sales.installment_unearned به sales.installment_income شناسایی می‌شود.
+CREATE TABLE IF NOT EXISTS sales.invoice_installment (
+  tenant_id      uuid NOT NULL REFERENCES core.tenant(id),
+  id             uuid NOT NULL DEFAULT uuidv7(),
+  invoice_id     uuid NOT NULL,
+  seq            smallint NOT NULL CHECK (seq BETWEEN 1 AND 360),
+  due_date       date NOT NULL,
+  amount         core.amount NOT NULL CHECK (amount > 0),
+  markup_amount  core.amount NOT NULL DEFAULT 0 CHECK (markup_amount >= 0),
+  cheque_ref     uuid,                 -- چک دریافتی همین قسط (ارجاع نرم به treasury؛ اختیاری)
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, invoice_id, seq),
+  FOREIGN KEY (tenant_id, invoice_id) REFERENCES sales.invoice(tenant_id, id) ON DELETE CASCADE,
+  CHECK (markup_amount <= amount)
+);
+SELECT core.enable_tenant_rls('sales.invoice_installment');
 
 -- سهم فروشندگان از فاکتور (پورسانت)
 CREATE TABLE IF NOT EXISTS sales.invoice_salesperson (
@@ -2728,23 +3125,27 @@ ALTER TABLE sales.invoice ADD CONSTRAINT invoice_correction_no_stock CHECK (doc_
 
 -- پیوند سند با GL: سند حسابداری باید مبدأش همین سند (یا دستهٔ آن) باشد (ویوی منتشرشدهٔ ledger)
 CREATE OR REPLACE FUNCTION sales.assert_gl_link(p_journal_id uuid, p_module text, p_doc_id uuid) RETURNS void
-LANGUAGE plpgsql STABLE AS $$
-BEGIN
-  IF p_journal_id IS NOT NULL AND NOT EXISTS (
-       SELECT 1 FROM ledger.v_journal_line v
-        WHERE v.journal_id = p_journal_id AND v.source_module = p_module AND v.source_doc_id = p_doc_id) THEN
-    PERFORM core.raise_hk('HK_COMMERCE_GL_LINK', format('journal %s does not originate from %s document %s', p_journal_id, p_module, p_doc_id));
-  END IF;
-END $$;
+LANGUAGE sql STABLE AS $$ SELECT inventory.assert_gl_link(p_journal_id, p_module, p_doc_id, false) $$;
 
 -- پیوند سند با شمارهٔ صادرشده (core.number_issued): همین سند و همین نوع
 CREATE OR REPLACE FUNCTION sales.assert_number_link(p_number_issued_id uuid, p_doc_type text, p_doc_id uuid) RETURNS void
+LANGUAGE sql STABLE AS $$ SELECT inventory.assert_number_link(p_number_issued_id, p_doc_type, p_doc_id) $$;
+
+-- مبالغ سند GL به تفکیک کلید ثبت (journal_line.posting_key): خالص بدهکار − بستانکار ارزی پایه = مقدار مورد انتظار
+-- (RV-IT2-09). p_tolerance برای سند ارزی (گرد کردن نرخ هر کلید)؛ سند ریالی دقیق است.
+CREATE OR REPLACE FUNCTION inventory.assert_gl_amounts(p_journal_id uuid, p_expected jsonb, p_tolerance numeric) RETURNS void
 LANGUAGE plpgsql STABLE AS $$
+DECLARE k text; v_act numeric; v_bad text;
 BEGIN
-  IF p_number_issued_id IS NOT NULL AND NOT EXISTS (
-       SELECT 1 FROM core.number_issued n
-        WHERE n.id = p_number_issued_id AND n.status = 'used' AND n.doc_type = p_doc_type AND n.doc_id = p_doc_id) THEN
-    PERFORM core.raise_hk('HK_COMMERCE_NUMBER_LINK', format('number %s was not issued to %s %s', p_number_issued_id, p_doc_type, p_doc_id));
+  FOR k IN SELECT jsonb_object_keys(p_expected) LOOP
+    SELECT coalesce(sum(l.debit_base - l.credit_base), 0) INTO v_act FROM ledger.journal_line l
+     WHERE l.journal_id = p_journal_id AND l.posting_key = k;
+    IF abs(v_act - (p_expected ->> k)::numeric) > p_tolerance THEN
+      v_bad := concat_ws(', ', v_bad, format('%s: journal %s expected %s', k, v_act, p_expected ->> k));
+    END IF;
+  END LOOP;
+  IF v_bad IS NOT NULL THEN
+    PERFORM core.raise_hk('HK_COMMERCE_GL_AMOUNT', 'journal amounts differ from the document: ' || v_bad);
   END IF;
 END $$;
 
@@ -2795,7 +3196,7 @@ CREATE TRIGGER trg_pricing_rule_tier_guard BEFORE INSERT OR UPDATE OR DELETE ON 
   FOR EACH ROW EXECUTE FUNCTION sales.pricing_rule_tier_guard();
 
 -- نگهبان عمومی سطر: والد باید پیش‌نویس باشد. TG_ARGV[0] = جدول والد، TG_ARGV[1] = ستون FK
-CREATE OR REPLACE FUNCTION sales.child_of_draft_guard() RETURNS trigger
+CREATE OR REPLACE FUNCTION inventory.child_of_draft_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE r jsonb; v_status text;
 BEGIN
@@ -2850,11 +3251,11 @@ CREATE TRIGGER trg_order_guard BEFORE INSERT OR UPDATE OR DELETE ON sales."order
   FOR EACH ROW EXECUTE FUNCTION sales.order_guard();
 DROP TRIGGER IF EXISTS trg_line_guard ON sales.order_line;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.order_line
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('sales."order"', 'order_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('sales."order"', 'order_id');
 
 -- نگهبان عمومی سرسند ثبت‌شدنی (حواله، فاکتور، رسید، فاکتور خرید): draft → posted → cancelled؛
 -- پس از پیش‌نویس فقط ستون‌های لغو تغییر می‌کنند. TG_ARGV: ستون‌های مجاز اضافه (کاما-جدا)
-CREATE OR REPLACE FUNCTION sales.posted_doc_guard() RETURNS trigger
+CREATE OR REPLACE FUNCTION inventory.posted_doc_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE v_changed text[]; v_allowed text[];
 BEGIN
@@ -2882,10 +3283,10 @@ END $$;
 
 DROP TRIGGER IF EXISTS trg_doc_guard ON sales.delivery;
 CREATE TRIGGER trg_doc_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.delivery
-  FOR EACH ROW EXECUTE FUNCTION sales.posted_doc_guard('');
+  FOR EACH ROW EXECUTE FUNCTION inventory.posted_doc_guard('');
 DROP TRIGGER IF EXISTS trg_line_guard ON sales.delivery_line;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.delivery_line
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('sales.delivery', 'delivery_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('sales.delivery', 'delivery_id');
 
 -- فاکتور: پیش‌شرط لغو (بدون برگشت/اصلاحی فعال). تسویهٔ باز را treasury.open_item رد می‌کند (open_item_cancel).
 CREATE OR REPLACE FUNCTION sales.invoice_cancel_guard() RETURNS trigger
@@ -2901,10 +3302,28 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS trg_doc_guard ON sales.invoice;
 CREATE TRIGGER trg_doc_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.invoice
-  FOR EACH ROW EXECUTE FUNCTION sales.posted_doc_guard('');
+  FOR EACH ROW EXECUTE FUNCTION inventory.posted_doc_guard('');
 DROP TRIGGER IF EXISTS trg_invoice_cancel_guard ON sales.invoice;
 CREATE TRIGGER trg_invoice_cancel_guard BEFORE UPDATE ON sales.invoice
   FOR EACH ROW EXECUTE FUNCTION sales.invoice_cancel_guard();
+
+-- رقم اعشار snapshot سند = رقم اعشار ارز در ref.currency؛ صورتحساب مؤدیان v1 فقط ریالی (مبالغ ریالی عدد صحیح؛ RV-COM-16)
+CREATE OR REPLACE FUNCTION inventory.doc_currency_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_minor smallint;
+BEGIN
+  SELECT c.minor_unit INTO v_minor FROM ref.currency c WHERE c.code = NEW.currency;
+  IF NEW.currency_minor IS DISTINCT FROM v_minor THEN
+    PERFORM core.raise_hk('HK_COMMERCE_CURRENCY_MINOR', format('currency_minor %s does not match %s (%s)', NEW.currency_minor, NEW.currency, v_minor));
+  END IF;
+  IF TG_TABLE_SCHEMA = 'sales' AND (to_jsonb(NEW) ->> 'moadian_required')::boolean AND NEW.currency <> 'IRR' THEN
+    PERFORM core.raise_hk('HK_SALES_MOADIAN_CURRENCY', 'v1 Moadian invoices are issued in rials (IRR); foreign-currency Moadian bodies are v2');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_currency_guard ON sales.invoice;
+CREATE TRIGGER trg_currency_guard BEFORE INSERT OR UPDATE OF currency, currency_minor, moadian_required ON sales.invoice
+  FOR EACH ROW EXECUTE FUNCTION inventory.doc_currency_guard();
 
 -- سطر فاکتور: فقط در پیش‌نویس؛ رقم اعشار = سرسند؛ اجازهٔ تخفیف/تغییر قیمت از کالا
 CREATE OR REPLACE FUNCTION sales.invoice_line_guard() RETURNS trigger
@@ -2915,6 +3334,10 @@ BEGIN
   SELECT * INTO h FROM sales.invoice i WHERE i.tenant_id = NEW.tenant_id AND i.id = NEW.invoice_id;
   IF NEW.currency_minor <> h.currency_minor THEN
     PERFORM core.raise_hk('HK_SALES_LINE_MINOR', 'line currency_minor must equal the invoice');
+  END IF;
+  -- مبلغ واحد (fee) با دقت ارز: ریال عدد صحیح است (RV-COM-16)
+  IF NEW.unit_price <> trunc(NEW.unit_price, NEW.currency_minor) THEN
+    PERFORM core.raise_hk('HK_SALES_UNIT_PRICE_MINOR', format('unit price %s has more decimals than %s allows', NEW.unit_price, h.currency));
   END IF;
   SELECT s.allow_discount, s.allow_price_override, s.item_type INTO sku FROM catalog.v_sku s WHERE s.variant_id = NEW.variant_id;
   IF NOT sku.allow_discount AND NEW.discount_amount > 0 THEN
@@ -2929,11 +3352,19 @@ BEGIN
   IF h.doc_kind = 'invoice' AND NEW.original_line_id IS NOT NULL THEN
     PERFORM core.raise_hk('HK_SALES_ORIGINAL_LINE_REQUIRED', 'original_line_id is only for returns/corrections');
   END IF;
+  -- حق سرویس (CR-T07): سطر کالای غیرانباری (خدمت) که درآمدش در کلید sales.service_charge ثبت می‌شود
+  IF NEW.line_kind = 'service_charge' AND sku.item_type = 'stock' THEN
+    PERFORM core.raise_hk('HK_SALES_SERVICE_CHARGE_LINE', 'a service-charge line uses a non-stock (service) item');
+  END IF;
+  -- سطر رسید صندوق فقط در فاکتور صندوق (RV-X2-04): برگشت صندوق سطر فروش را با همین ارجاع می‌یابد
+  IF NEW.pos_ticket_line_id IS NOT NULL AND h.channel <> 'pos' THEN
+    PERFORM core.raise_hk('HK_SALES_POS_LINE', 'pos_ticket_line_id is only for POS-channel invoices');
+  END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_line_guard ON sales.invoice_line;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.invoice_line
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('sales.invoice', 'invoice_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('sales.invoice', 'invoice_id');
 DROP TRIGGER IF EXISTS trg_line_rules ON sales.invoice_line;
 CREATE TRIGGER trg_line_rules BEFORE INSERT OR UPDATE ON sales.invoice_line
   FOR EACH ROW EXECUTE FUNCTION sales.invoice_line_guard();
@@ -2956,7 +3387,10 @@ CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.invoice
   FOR EACH ROW EXECUTE FUNCTION sales.invoice_line_child_guard();
 DROP TRIGGER IF EXISTS trg_line_guard ON sales.invoice_salesperson;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.invoice_salesperson
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('sales.invoice', 'invoice_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('sales.invoice', 'invoice_id');
+DROP TRIGGER IF EXISTS trg_line_guard ON sales.invoice_installment;
+CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON sales.invoice_installment
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('sales.invoice', 'invoice_id');
 
 -- سطر جاری یک سطر اصلی (پس از آخرین اصلاحی ثبت‌شده)
 CREATE OR REPLACE FUNCTION sales.current_line(p_original_line_id uuid) RETURNS sales.invoice_line
@@ -2981,21 +3415,128 @@ LANGUAGE sql STABLE AS $$
    LIMIT 1
 $$;
 
+-- مبالغ مورد انتظار سند GL فروش یک فاکتور به تفکیک کلید ثبت (خالص بدهکار − بستانکار، ارز پایه؛ ۰۵ §۵-۶؛ RV-IT2-09).
+-- سطرهای موجودی و بهای تمام‌شده در سند جدای inventory می‌آیند (RV-IT2-01).
+CREATE OR REPLACE FUNCTION sales.invoice_gl_expected(p_inv sales.invoice) RETURNS jsonb
+LANGUAGE plpgsql STABLE AS $$
+DECLARE r numeric := p_inv.exchange_rate; bm smallint := inventory.company_minor(p_inv.company_id); a record; b record; prev sales.invoice;
+BEGIN
+  SELECT coalesce(sum(gross_amount) FILTER (WHERE line_kind = 'goods'), 0) AS g,
+         coalesce(sum(gross_amount) FILTER (WHERE line_kind = 'service_charge'), 0) AS sc,
+         coalesce(sum(net_amount) FILTER (WHERE line_kind = 'installment_markup'), 0) AS mk,
+         coalesce(sum(discount_amount) FILTER (WHERE line_kind <> 'installment_markup'), 0) AS d, coalesce(sum(vat_amount), 0) AS v,
+         coalesce(sum(other_tax_amount), 0) AS ot, coalesce(sum(other_levy_amount), 0) AS ol
+    INTO a FROM sales.invoice_line WHERE tenant_id = p_inv.tenant_id AND invoice_id = p_inv.id;
+  IF p_inv.doc_kind = 'correction' THEN
+    SELECT * INTO prev FROM sales.invoice WHERE tenant_id = p_inv.tenant_id AND id = p_inv.supersedes_invoice_id;
+    SELECT coalesce(sum(gross_amount) FILTER (WHERE line_kind = 'goods'), 0) AS g,
+           coalesce(sum(gross_amount) FILTER (WHERE line_kind = 'service_charge'), 0) AS sc,
+           coalesce(sum(net_amount) FILTER (WHERE line_kind = 'installment_markup'), 0) AS mk,
+           coalesce(sum(discount_amount) FILTER (WHERE line_kind <> 'installment_markup'), 0) AS d, coalesce(sum(vat_amount), 0) AS v,
+           coalesce(sum(other_tax_amount), 0) AS ot, coalesce(sum(other_levy_amount), 0) AS ol
+      INTO b FROM sales.invoice_line WHERE tenant_id = prev.tenant_id AND invoice_id = prev.id;
+    RETURN jsonb_build_object('sales.receivable', p_inv.total_base - prev.total_base, 'sales.returns', 0,
+             'sales.revenue', -round((a.g - b.g) * r, bm), 'sales.service_charge', -round((a.sc - b.sc) * r, bm),
+             'sales.installment_unearned', -round((a.mk - b.mk) * r, bm),
+             'sales.discount', round((a.d - b.d) * r, bm), 'tax.vat_payable', -round((a.v - b.v) * r, bm),
+             'tax.other_tax_payable', -round((a.ot - b.ot) * r, bm), 'tax.levy_payable', -round((a.ol - b.ol) * r, bm));
+  ELSIF p_inv.doc_kind = 'return' THEN
+    RETURN jsonb_build_object('sales.receivable', -p_inv.total_base, 'sales.revenue', 0,
+             'sales.returns', round(a.g * r, bm), 'sales.service_charge', round(a.sc * r, bm),
+             'sales.installment_unearned', round(a.mk * r, bm),
+             'sales.discount', -round(a.d * r, bm), 'tax.vat_payable', round(a.v * r, bm),
+             'tax.other_tax_payable', round(a.ot * r, bm), 'tax.levy_payable', round(a.ol * r, bm));
+  END IF;
+  RETURN jsonb_build_object('sales.receivable', p_inv.total_base, 'sales.returns', 0,
+           'sales.revenue', -round(a.g * r, bm), 'sales.service_charge', -round(a.sc * r, bm),
+           'sales.installment_unearned', -round(a.mk * r, bm),
+           'sales.discount', round(a.d * r, bm), 'tax.vat_payable', -round(a.v * r, bm),
+           'tax.other_tax_payable', -round(a.ot * r, bm), 'tax.levy_payable', -round(a.ol * r, bm));
+END $$;
+
+-- جمع و قرینهٔ نگاشت‌های کلید ← مبلغ
+CREATE OR REPLACE FUNCTION sales.gl_negate(p jsonb) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$ SELECT coalesce(jsonb_object_agg(e.key, -(e.value::numeric)), '{}'::jsonb) FROM jsonb_each_text(p) e $$;
+CREATE OR REPLACE FUNCTION sales.gl_add(a jsonb, b jsonb) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT coalesce(jsonb_object_agg(k, coalesce((a ->> k)::numeric, 0) + coalesce((b ->> k)::numeric, 0)), '{}'::jsonb)
+    FROM (SELECT jsonb_object_keys(coalesce(a, '{}'::jsonb)) AS k UNION SELECT jsonb_object_keys(coalesce(b, '{}'::jsonb))) x
+$$;
+
+-- رواداری مبلغ GL: سند به ارز پایه دقیق؛ سند ارزی یک واحد خرد پایه برای هر کلید (گرد کردن تبدیل)
+CREATE OR REPLACE FUNCTION inventory.gl_tolerance(p_company_id uuid, p_currency char(3)) RETURNS numeric
+LANGUAGE sql STABLE AS $$
+  SELECT CASE WHEN co.base_currency = p_currency THEN 0 ELSE power(10::numeric, -inventory.company_minor(p_company_id)) END
+    FROM core.company co WHERE co.id = p_company_id
+$$;
+
+-- حرکت انبار سطرهای کالای انباری یک سند فروش/خرید: نوع، SKU، انبار و شرکت درست و جمع مقدار = مقدار سطر؛ هیچ حرکت بی‌سطر
+-- (RV-COM-04). p_lines: jsonb آرایهٔ {id, variant_id, warehouse_id, qty_base, stock(bool), bom(bool)}.
+CREATE OR REPLACE FUNCTION inventory.assert_doc_moves(p_doc_id uuid, p_company_id uuid, p_kind text, p_lines jsonb, p_code text)
+RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+DECLARE v_bad text;
+BEGIN
+  WITH l AS (SELECT (x->>'id')::uuid AS id, (x->>'variant_id')::uuid AS variant_id, (x->>'warehouse_id')::uuid AS warehouse_id,
+                    (x->>'qty_base')::numeric AS qty_base, (x->>'stock')::boolean AS stock, coalesce((x->>'bom')::boolean, false) AS bom
+               FROM jsonb_array_elements(p_lines) x),
+       m AS (SELECT s.* FROM inventory.stock_move s
+              WHERE s.source_doc_id = p_doc_id AND s.reversal_of_move_id IS NULL)
+  SELECT string_agg(e, '; ') INTO v_bad FROM (
+    SELECT format('line %s: moved %s of %s', l.id,
+                  coalesce((SELECT sum(abs(m.qty_base)) FROM m WHERE m.source_line_id = l.id AND m.move_kind = p_kind
+                              AND m.variant_id = l.variant_id AND m.warehouse_id = l.warehouse_id AND m.company_id = p_company_id), 0),
+                  l.qty_base) AS e
+      FROM l WHERE l.stock
+       AND l.qty_base <> coalesce((SELECT sum(abs(m.qty_base)) FROM m WHERE m.source_line_id = l.id AND m.move_kind = p_kind
+                                    AND m.variant_id = l.variant_id AND m.warehouse_id = l.warehouse_id AND m.company_id = p_company_id), 0)
+    UNION ALL
+    SELECT format('move %s (%s) matches no line of the document', m.id, m.move_kind)
+      FROM m
+     WHERE NOT EXISTS (SELECT 1 FROM l WHERE l.id = m.source_line_id AND m.company_id = p_company_id
+                         AND ((l.stock AND m.move_kind = p_kind AND m.variant_id = l.variant_id AND m.warehouse_id = l.warehouse_id)
+                              OR (NOT l.stock AND l.bom AND m.move_kind = 'backflush' AND p_kind = 'sale_issue')))) x;
+  IF v_bad IS NOT NULL THEN
+    PERFORM core.raise_hk(p_code, 'stock moves do not match the document lines: ' || v_bad);
+  END IF;
+END $$;
+
 -- راستی‌آزمایی هنگام ثبت (deferred؛ پس از درج همهٔ سطرها، تخفیف‌ها، حرکت‌ها و سند GL در همان تراکنش)
 CREATE OR REPLACE FUNCTION sales.invoice_verify() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-  t record; root sales.invoice; prev sales.invoice; rl record; ol sales.invoice_line; cur sales.invoice_line;
-  v_sum numeric; v_bad integer; v_batch text; v_share numeric;
+  t record; root sales.invoice; prev sales.invoice; rl record; ol sales.invoice_line; cur sales.invoice_line; g record;
+  v_sum numeric; v_bad integer; v_batch text; v_share numeric; v_tol numeric; v_bm smallint; v_lines jsonb;
+  v_prev_q numeric; v_prev_ld numeric; v_prev_ia numeric; v_exp_ld numeric; v_exp_ia numeric;
 BEGIN
+  v_tol := inventory.gl_tolerance(NEW.company_id, NEW.currency);
+  v_bm := inventory.company_minor(NEW.company_id);
   IF NEW.status = 'cancelled' AND TG_OP = 'UPDATE' AND OLD.status = 'posted' THEN
-    -- ابطال: هر حرکت انبار سند برگشت خورده باشد و سند GL ابطال به این فاکتور اشاره کند
+    -- ابطال: هر حرکت انبار سند برگشت خورده باشد و GL برگردد (RV-COM-02)
     IF EXISTS (SELECT 1 FROM inventory.stock_move m WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id
                   AND m.reversal_of_move_id IS NULL
                   AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.reversal_of_move_id = m.id)) THEN
       PERFORM core.raise_hk('HK_SALES_CANCEL_STOCK', 'every stock move of a cancelled invoice must be reversed');
     END IF;
-    PERFORM sales.assert_gl_link(NEW.cancel_journal_id, 'sales', NEW.id);
+    IF NEW.gl_mode = 'per_document' THEN
+      PERFORM inventory.assert_gl_link(NEW.cancel_journal_id, 'sales', NEW.id);
+      PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'sales', NEW.id, true);
+      PERFORM inventory.assert_gl_link(NEW.stock_journal_id, 'inventory', NEW.id, true);
+    ELSIF NEW.gl_mode = 'batched' THEN
+      SELECT b.status INTO v_batch FROM sales.gl_batch b WHERE b.tenant_id = NEW.tenant_id AND b.id = NEW.gl_batch_id FOR SHARE;
+      IF v_batch = 'posted' THEN
+        -- دستهٔ ثبت‌شده برگشت‌پذیر نیست: فاکتور سند فروش و موجودی برگشتی خودش را می‌خواهد
+        IF NEW.cancel_journal_id IS NULL THEN
+          PERFORM core.raise_hk('HK_SALES_BATCH_CANCEL_GL', 'cancelling an invoice of a posted GL batch needs its own reversing journal');
+        END IF;
+        PERFORM inventory.assert_gl_link(NEW.cancel_journal_id, 'sales', NEW.id);
+        PERFORM inventory.assert_gl_amounts(NEW.cancel_journal_id, sales.gl_negate(sales.invoice_gl_expected(NEW)), v_tol);
+        PERFORM inventory.assert_gl_link(NEW.cancel_stock_journal_id, 'inventory', NEW.id);
+        PERFORM inventory.assert_stock_journal(NEW.cancel_stock_journal_id, ARRAY[NEW.id], true);
+      ELSIF NEW.cancel_journal_id IS NOT NULL OR NEW.cancel_stock_journal_id IS NOT NULL THEN
+        PERFORM core.raise_hk('HK_SALES_BATCH_CANCEL_GL', 'an invoice of an open batch is simply left out of the batch journal');
+      END IF;
+    END IF;
     RETURN NULL;
   END IF;
   IF NEW.status <> 'posted' OR (TG_OP = 'UPDATE' AND OLD.status = 'posted') THEN RETURN NULL; END IF;
@@ -3009,8 +3550,9 @@ BEGIN
     INTO t FROM sales.invoice_line WHERE tenant_id = NEW.tenant_id AND invoice_id = NEW.id;
   IF t.n = 0 THEN PERFORM core.raise_hk('HK_SALES_EMPTY', 'a posted invoice needs at least one line'); END IF;
   IF t.gross <> NEW.gross_amount OR t.ld <> NEW.line_discount_total OR t.ia <> NEW.invoice_discount_amount
-     OR t.vat <> NEW.vat_amount OR t.ot <> NEW.other_tax_amount OR t.ol <> NEW.other_levy_amount OR t.tot <> NEW.total_amount THEN
-    PERFORM core.raise_hk('HK_SALES_TOTALS', 'header totals must equal the sum of lines (including allocated invoice discount)');
+     OR t.vat <> NEW.vat_amount OR t.ot <> NEW.other_tax_amount OR t.ol <> NEW.other_levy_amount OR t.tot <> NEW.total_amount
+     OR NEW.total_base <> round(NEW.total_amount * NEW.exchange_rate, v_bm) THEN
+    PERFORM core.raise_hk('HK_SALES_TOTALS', 'header totals must equal the sum of lines (including allocated invoice discount) and total_base its conversion');
   END IF;
   -- ردپای تخفیف = تخفیف سطر
   SELECT count(*) INTO v_bad FROM sales.invoice_line l
@@ -3023,6 +3565,21 @@ BEGIN
   -- سهم فروشندگان
   SELECT sum(share_percent) INTO v_share FROM sales.invoice_salesperson WHERE tenant_id = NEW.tenant_id AND invoice_id = NEW.id;
   IF v_share IS NOT NULL AND v_share <> 100 THEN PERFORM core.raise_hk('HK_SALES_SHARES', 'salesperson shares must sum to 100'); END IF;
+  -- اقساط (RV-X3-03/04): Σ اقساط = کل فاکتور؛ سررسیدها نه پیش از فاکتور و غیرنزولی؛ Σ اضافه‌بها = خالص سطرهای اضافه‌بهای اقساط
+  IF EXISTS (SELECT 1 FROM sales.invoice_installment x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id)
+     OR EXISTS (SELECT 1 FROM sales.invoice_line x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id AND x.line_kind = 'installment_markup') THEN
+    IF NEW.settlement_method = 'cash'
+       OR (SELECT coalesce(sum(x.amount), 0) FROM sales.invoice_installment x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id) <> NEW.total_amount
+       OR (SELECT coalesce(sum(x.markup_amount), 0) FROM sales.invoice_installment x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id)
+          <> (SELECT coalesce(sum(x.net_amount), 0) FROM sales.invoice_line x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id
+                AND x.line_kind = 'installment_markup')
+       OR EXISTS (SELECT 1 FROM sales.invoice_installment x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id
+                    AND (x.due_date < NEW.doc_date
+                         OR x.due_date < (SELECT max(y.due_date) FROM sales.invoice_installment y
+                                           WHERE y.tenant_id = x.tenant_id AND y.invoice_id = x.invoice_id AND y.seq < x.seq))) THEN
+      PERFORM core.raise_hk('HK_SALES_INSTALLMENTS', 'installments must sum to the invoice total (and its markup lines), on non-decreasing dates from the invoice date');
+    END IF;
+  END IF;
   -- مؤدیان: شناسهٔ کالا و واحد هر سطر؛ خریدار نوع ۱
   IF NEW.moadian_required THEN
     IF t.missing_moadian > 0 THEN PERFORM core.raise_hk('HK_SALES_MOADIAN_FIELDS', 'every line needs sstid and moadian unit code'); END IF;
@@ -3036,76 +3593,167 @@ BEGIN
       PERFORM core.raise_hk('HK_SALES_MOADIAN_SETTLEMENT', 'type-2/3 invoices are cash only');
     END IF;
   END IF;
-  -- شماره و GL
-  PERFORM sales.assert_number_link(NEW.number_issued_id, 'sales.' || NEW.doc_kind, NEW.id);
-  IF NEW.gl_mode = 'per_document' THEN PERFORM sales.assert_gl_link(NEW.gl_journal_id, 'sales', NEW.id); END IF;
-  IF NEW.gl_mode = 'batched' THEN
-    SELECT b.status INTO v_batch FROM sales.gl_batch b WHERE b.tenant_id = NEW.tenant_id AND b.id = NEW.gl_batch_id;
+  -- شماره: سرور ← سری sales.<نوع> همین فاکتور؛ دستگاه ← شمارهٔ رسید صندوق مبدأ از همان دستگاه (RV-IT2-06)
+  IF NEW.number_source = 'device' THEN
+    IF NOT EXISTS (SELECT 1 FROM core.number_issued n
+                    WHERE n.id = NEW.number_issued_id AND n.status = 'used' AND n.doc_type = 'pos.ticket'
+                      AND n.doc_id = NEW.pos_ticket_id AND n.device_id = NEW.device_id) THEN
+      PERFORM core.raise_hk('HK_COMMERCE_NUMBER_LINK', format('device number %s was not issued by device %s to POS ticket %s',
+                            NEW.number_issued_id, NEW.device_id, NEW.pos_ticket_id));
+    END IF;
+  ELSE
+    PERFORM inventory.assert_number_link(NEW.number_issued_id, 'sales.' || NEW.doc_kind, NEW.id);
+  END IF;
+  -- GL: سند فروش (مبالغ به تفکیک کلید) و سند موجودی جدا (RV-IT2-01، RV-IT2-09)
+  IF NEW.gl_mode = 'per_document' THEN
+    PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'sales', NEW.id);
+    PERFORM inventory.assert_gl_amounts(NEW.gl_journal_id, sales.invoice_gl_expected(NEW), v_tol);
+    PERFORM inventory.assert_gl_link(NEW.stock_journal_id, 'inventory', NEW.id);
+    PERFORM inventory.assert_stock_journal(NEW.stock_journal_id, ARRAY[NEW.id]);
+  ELSIF NEW.gl_mode = 'batched' THEN
+    -- FOR SHARE با UPDATE ثبت دسته تعارض دارد و وضعیت متعهدشده را دوباره می‌خواند (RV-COM-15)
+    SELECT b.status INTO v_batch FROM sales.gl_batch b WHERE b.tenant_id = NEW.tenant_id AND b.id = NEW.gl_batch_id FOR SHARE;
     IF v_batch <> 'open' THEN PERFORM core.raise_hk('HK_SALES_BATCH_CLOSED', 'invoice can join only an open GL batch'); END IF;
   END IF;
-  -- برگشت از فروش: ارجاع به سطر اصلی، همان قیمت واحد و نرخ (مؤدیان ins=4)، مقدار ≤ باقی‌ماندهٔ قابل برگشت
+  -- برگشت و اصلاحی: مرجع فاکتور اصلی ثبت‌شدهٔ همان مشتری (یا جانشین ادغام او)، همان ارز، تاریخ نه پیش‌تر
   IF NEW.doc_kind IN ('return','correction') THEN
     SELECT * INTO root FROM sales.invoice r WHERE r.tenant_id = NEW.tenant_id AND r.id = NEW.original_invoice_id;
-    IF root.doc_kind <> 'invoice' OR root.status <> 'posted' OR root.customer_party_id <> NEW.customer_party_id
-       OR root.currency <> NEW.currency OR NEW.doc_date < root.doc_date THEN
+    IF root.doc_kind <> 'invoice' OR root.status <> 'posted' OR root.currency <> NEW.currency OR NEW.doc_date < root.doc_date
+       OR (root.customer_party_id <> NEW.customer_party_id
+           AND NOT EXISTS (SELECT 1 FROM parties.party p WHERE p.tenant_id = NEW.tenant_id AND p.id = root.customer_party_id
+                             AND p.merged_into_id = NEW.customer_party_id)) THEN
       PERFORM core.raise_hk('HK_SALES_ORIGINAL_INVOICE', 'reference must be a posted original invoice of the same customer and currency, dated earlier');
     END IF;
   END IF;
+  -- برگشت از فروش (مؤدیان ins=4): همان SKU، واحد، قیمت واحد، نرخ، شناسهٔ کالا و واحد مؤدیان؛ مقدار ≤ باقی‌مانده؛ تخفیف = سهم
+  -- نسبی تخفیف سطر جاری (قطع به رقم ارز؛ باقیماندهٔ آخرین برگشت؛ RV-X2-03)
   IF NEW.doc_kind = 'return' THEN
-    FOR rl IN SELECT * FROM sales.invoice_line x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id LOOP
-      SELECT * INTO ol FROM sales.invoice_line o WHERE o.tenant_id = rl.tenant_id AND o.id = rl.original_line_id FOR NO KEY UPDATE;
-      IF ol.invoice_id <> root.id OR ol.variant_id <> rl.variant_id OR ol.uom_id <> rl.uom_id THEN
+    FOR g IN SELECT x.original_line_id, sum(x.qty) AS q, sum(x.line_discount_amount) AS ld, sum(x.invoice_discount_alloc) AS ia
+               FROM sales.invoice_line x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id GROUP BY x.original_line_id LOOP
+      SELECT * INTO ol FROM sales.invoice_line o WHERE o.tenant_id = NEW.tenant_id AND o.id = g.original_line_id FOR NO KEY UPDATE;
+      IF ol.invoice_id IS DISTINCT FROM root.id THEN
         PERFORM core.raise_hk('HK_SALES_RETURN_LINE', 'return line must reference a line of the original invoice with the same SKU and unit');
       END IF;
       cur := sales.current_line(ol.id);
-      IF cur.unit_price <> rl.unit_price OR cur.vat_rate <> rl.vat_rate THEN
-        PERFORM core.raise_hk('HK_SALES_RETURN_PRICE', 'return keeps the current unit price and VAT rate of the sold line');
+      FOR rl IN SELECT * FROM sales.invoice_line x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id AND x.original_line_id = ol.id LOOP
+        IF ol.variant_id <> rl.variant_id OR ol.uom_id <> rl.uom_id OR rl.line_kind <> ol.line_kind
+           OR cur.sstid IS DISTINCT FROM rl.sstid OR cur.moadian_unit_code IS DISTINCT FROM rl.moadian_unit_code THEN
+          PERFORM core.raise_hk('HK_SALES_RETURN_LINE', 'return line must reference a line of the original invoice with the same SKU, unit and Moadian item id');
+        END IF;
+        IF cur.unit_price <> rl.unit_price OR cur.vat_rate <> rl.vat_rate THEN
+          PERFORM core.raise_hk('HK_SALES_RETURN_PRICE', 'return keeps the current unit price and VAT rate of the sold line');
+        END IF;
+      END LOOP;
+      SELECT coalesce(sum(x.qty), 0), coalesce(sum(x.line_discount_amount), 0), coalesce(sum(x.invoice_discount_alloc), 0)
+        INTO v_prev_q, v_prev_ld, v_prev_ia
+        FROM sales.invoice_line x JOIN sales.invoice i ON i.tenant_id = x.tenant_id AND i.id = x.invoice_id
+       WHERE x.tenant_id = NEW.tenant_id AND x.original_line_id = ol.id AND i.doc_kind = 'return' AND i.status = 'posted' AND i.id <> NEW.id;
+      IF v_prev_q + g.q > cur.qty THEN
+        PERFORM core.raise_hk('HK_SALES_RETURN_QTY', format('returned %s exceeds sold %s', v_prev_q + g.q, cur.qty));
       END IF;
-      SELECT coalesce(sum(x.qty), 0) INTO v_sum FROM sales.invoice_line x JOIN sales.invoice i ON i.tenant_id = x.tenant_id AND i.id = x.invoice_id
-       WHERE x.tenant_id = rl.tenant_id AND x.original_line_id = ol.id AND i.doc_kind = 'return' AND i.status = 'posted';
-      IF v_sum > ol.qty THEN
-        PERFORM core.raise_hk('HK_SALES_RETURN_QTY', format('returned %s exceeds sold %s', v_sum, ol.qty));
+      v_exp_ld := CASE WHEN v_prev_q + g.q = cur.qty THEN cur.line_discount_amount
+                       ELSE trunc(cur.line_discount_amount * (v_prev_q + g.q) / cur.qty, cur.currency_minor) END
+                - CASE WHEN v_prev_q = cur.qty THEN cur.line_discount_amount
+                       ELSE trunc(cur.line_discount_amount * v_prev_q / cur.qty, cur.currency_minor) END;
+      v_exp_ia := CASE WHEN v_prev_q + g.q = cur.qty THEN cur.invoice_discount_alloc
+                       ELSE trunc(cur.invoice_discount_alloc * (v_prev_q + g.q) / cur.qty, cur.currency_minor) END
+                - CASE WHEN v_prev_q = cur.qty THEN cur.invoice_discount_alloc
+                       ELSE trunc(cur.invoice_discount_alloc * v_prev_q / cur.qty, cur.currency_minor) END;
+      IF g.ld <> v_exp_ld OR g.ia <> v_exp_ia THEN
+        PERFORM core.raise_hk('HK_SALES_RETURN_DISCOUNT',
+                              format('return discount must be the proportional share of the sold line (line %s/%s, invoice %s/%s)',
+                                     g.ld, v_exp_ld, g.ia, v_exp_ia));
       END IF;
     END LOOP;
   END IF;
-  -- اصلاحی (ins=2): نسخهٔ قبلی ثبت‌شده و آخرین؛ خریدار، نوع، الگو و نرخ ثابت؛ مقدار کالای انباری ثابت
+  -- اصلاحی (ins=2): نسخهٔ قبلی ثبت‌شده و آخرین؛ خریدار (شخص و تصویر هویتی ارسالی)، نوع، الگو، شناسهٔ کالا، واحد و نرخ ثابت؛
+  -- مقدار کالای انباری ثابت (RV-COM-14)
   IF NEW.doc_kind = 'correction' THEN
     SELECT * INTO prev FROM sales.invoice p WHERE p.tenant_id = NEW.tenant_id AND p.id = NEW.supersedes_invoice_id;
     IF prev.status <> 'posted' OR coalesce(prev.original_invoice_id, prev.id) <> NEW.original_invoice_id
-       OR prev.customer_party_id <> NEW.customer_party_id OR prev.moadian_type IS DISTINCT FROM NEW.moadian_type
-       OR prev.moadian_pattern IS DISTINCT FROM NEW.moadian_pattern THEN
-      PERFORM core.raise_hk('HK_SALES_CORRECTION_SCOPE', 'correction keeps buyer, type and pattern of the latest posted version');
+       OR (prev.customer_party_id <> NEW.customer_party_id
+           AND NOT EXISTS (SELECT 1 FROM parties.party p WHERE p.tenant_id = NEW.tenant_id AND p.id = prev.customer_party_id
+                             AND p.merged_into_id = NEW.customer_party_id))
+       OR prev.moadian_type IS DISTINCT FROM NEW.moadian_type OR prev.moadian_pattern IS DISTINCT FROM NEW.moadian_pattern
+       OR prev.buyer_person_type IS DISTINCT FROM NEW.buyer_person_type OR prev.buyer_economic_code IS DISTINCT FROM NEW.buyer_economic_code
+       OR prev.buyer_national_id IS DISTINCT FROM NEW.buyer_national_id OR prev.buyer_postal_code IS DISTINCT FROM NEW.buyer_postal_code
+       OR prev.buyer_branch_code IS DISTINCT FROM NEW.buyer_branch_code OR prev.buyer_passport_no IS DISTINCT FROM NEW.buyer_passport_no THEN
+      PERFORM core.raise_hk('HK_SALES_CORRECTION_SCOPE', 'correction keeps buyer (party and identity snapshot), type and pattern of the latest posted version');
     END IF;
     FOR rl IN SELECT x.*, s.item_type FROM sales.invoice_line x JOIN catalog.v_sku s ON s.variant_id = x.variant_id
               WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id LOOP
       cur := sales.version_line(prev.id, rl.original_line_id);
       SELECT * INTO ol FROM sales.invoice_line o WHERE o.tenant_id = rl.tenant_id AND o.id = rl.original_line_id;
       IF ol.invoice_id <> root.id OR cur.id IS NULL OR cur.variant_id <> rl.variant_id OR cur.vat_rate <> rl.vat_rate
-         OR (rl.item_type = 'stock' AND cur.qty <> rl.qty) THEN
-        PERFORM core.raise_hk('HK_SALES_CORRECTION_LINE', 'correction keeps SKU and VAT rate; quantity of stock items changes only by return');
+         OR cur.sstid IS DISTINCT FROM rl.sstid OR cur.moadian_unit_code IS DISTINCT FROM rl.moadian_unit_code
+         OR cur.line_kind <> rl.line_kind OR (rl.item_type = 'stock' AND cur.qty <> rl.qty) THEN
+        PERFORM core.raise_hk('HK_SALES_CORRECTION_LINE', 'correction keeps SKU, Moadian item id/unit and VAT rate; quantity of stock items changes only by return');
       END IF;
     END LOOP;
   END IF;
-  -- انبار: هر سطر کالای انباری با تحویل فوری دقیقاً به اندازهٔ مقدار حرکت دارد
-  IF NEW.stock_mode = 'immediate' THEN
-    SELECT count(*) INTO v_bad FROM sales.invoice_line l JOIN catalog.v_sku s ON s.variant_id = l.variant_id
-     WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id AND s.item_type = 'stock'
-       AND l.qty_base <> coalesce((SELECT sum(abs(m.qty_base)) FROM inventory.stock_move m
-                                   WHERE m.tenant_id = l.tenant_id AND m.source_doc_id = NEW.id AND m.source_line_id = l.id
-                                     AND m.reversal_of_move_id IS NULL
-                                     AND m.move_kind = CASE WHEN NEW.doc_kind = 'return' THEN 'sale_return' ELSE 'sale_issue' END), 0);
-    IF v_bad > 0 THEN PERFORM core.raise_hk('HK_SALES_STOCK_LINK', 'stock lines must have matching stock moves'); END IF;
+  -- انبار (RV-COM-04): کالای انباری بدون حرکت فقط در اصلاحی و تاریخچهٔ مهاجرت؛ حرکت هر سطر با همان SKU، انبار و نوع
+  SELECT jsonb_agg(jsonb_build_object('id', l.id, 'variant_id', l.variant_id, 'warehouse_id', coalesce(l.warehouse_id, NEW.warehouse_id),
+                                      'qty_base', l.qty_base, 'stock', s.item_type = 'stock', 'bom', l.bom_id IS NOT NULL))
+    INTO v_lines FROM sales.invoice_line l JOIN catalog.v_sku s ON s.variant_id = l.variant_id
+   WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id;
+  IF NEW.stock_mode = 'none' AND NEW.doc_kind <> 'correction' AND NEW.channel <> 'migration'
+     AND EXISTS (SELECT 1 FROM jsonb_array_elements(v_lines) x WHERE (x->>'stock')::boolean) THEN
+    PERFORM core.raise_hk('HK_SALES_STOCK_MODE', 'stock items move stock: stock_mode none is only for corrections and migrated history');
   END IF;
+  IF NEW.stock_mode = 'immediate' THEN
+    PERFORM inventory.assert_doc_moves(NEW.id, NEW.company_id, CASE WHEN NEW.doc_kind = 'return' THEN 'sale_return' ELSE 'sale_issue' END,
+                                       v_lines, 'HK_SALES_STOCK_LINK');
+    -- برگشت به بهای خروج اصلی: مبدأ بها = حرکت خروج زندهٔ سطر اصلی (اگر بود)؛ وگرنه بهای صریح (input)
+    IF NEW.doc_kind = 'return' AND EXISTS (
+         SELECT 1 FROM inventory.stock_move m JOIN sales.invoice_line x ON x.tenant_id = m.tenant_id AND x.id = m.source_line_id
+          WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id AND m.reversal_of_move_id IS NULL
+            AND NOT (
+                  (m.valuation_rule = 'source' AND EXISTS (
+                     SELECT 1 FROM inventory.stock_move o WHERE o.tenant_id = m.tenant_id AND o.id = m.cost_source_move_id
+                        AND o.source_line_id = x.original_line_id AND o.move_kind = 'sale_issue'))
+               OR (m.valuation_rule = 'input' AND NOT EXISTS (
+                     SELECT 1 FROM inventory.stock_move o WHERE o.tenant_id = m.tenant_id AND o.source_line_id = x.original_line_id
+                        AND o.move_kind = 'sale_issue' AND o.reversal_of_move_id IS NULL)))) THEN
+      PERFORM core.raise_hk('HK_SALES_RETURN_COST', 'a sales return restocks at the original issue cost (cost source = the sold line''s issue move)');
+    END IF;
+  ELSIF NEW.stock_mode = 'via_delivery' THEN
+    -- هر سطر کالای انباری از سطر حوالهٔ ثبت‌شدهٔ همین مشتری و SKU؛ جمع فاکتورشده ≤ تحویل‌شده
+    FOR rl IN SELECT x.* FROM sales.invoice_line x JOIN catalog.v_sku s ON s.variant_id = x.variant_id
+               WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id AND s.item_type = 'stock' LOOP
+      PERFORM 1 FROM sales.delivery_line dl WHERE dl.tenant_id = rl.tenant_id AND dl.id = rl.delivery_line_id FOR NO KEY UPDATE;
+      IF NOT EXISTS (SELECT 1 FROM sales.delivery_line dl JOIN sales.delivery d ON d.tenant_id = dl.tenant_id AND d.id = dl.delivery_id
+                      WHERE dl.tenant_id = rl.tenant_id AND dl.id = rl.delivery_line_id AND d.status = 'posted'
+                        AND d.company_id = NEW.company_id AND dl.variant_id = rl.variant_id
+                        AND d.direction = CASE WHEN NEW.doc_kind = 'return' THEN 'return' ELSE 'out' END
+                        AND (d.customer_party_id = NEW.customer_party_id
+                             OR EXISTS (SELECT 1 FROM parties.party p WHERE p.tenant_id = d.tenant_id AND p.id = d.customer_party_id
+                                          AND p.merged_into_id = NEW.customer_party_id)))
+         OR (SELECT coalesce(sum(x.qty_base), 0) FROM sales.invoice_line x JOIN sales.invoice i ON i.tenant_id = x.tenant_id AND i.id = x.invoice_id
+              WHERE x.tenant_id = rl.tenant_id AND x.delivery_line_id = rl.delivery_line_id AND i.status = 'posted')
+            > (SELECT dl.qty_base FROM sales.delivery_line dl WHERE dl.tenant_id = rl.tenant_id AND dl.id = rl.delivery_line_id) THEN
+        PERFORM core.raise_hk('HK_SALES_DELIVERY_LINK', 'via-delivery lines bill posted delivery lines of the same customer and SKU, at most once');
+      END IF;
+    END LOOP;
+  END IF;
+  -- فروش آفلاین فقط از کانال صندوق و همان دستگاه (RV-COM-20)
+  IF EXISTS (SELECT 1 FROM inventory.stock_move m WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id
+                AND m.origin = 'offline_device' AND (NEW.channel <> 'pos' OR m.device_id IS DISTINCT FROM NEW.device_id)) THEN
+    PERFORM core.raise_hk('HK_SALES_OFFLINE_ORIGIN', 'offline-device stock moves belong only to POS invoices of the same device');
+  END IF;
+  -- قفل کاربرد کالا (D-M18، RV-MD-01): فروش کالای غیرانباری (خدمت، منو) هم کالا را قفل می‌کند
+  UPDATE catalog.item i SET usage_locked_at = now()
+   WHERE i.tenant_id = NEW.tenant_id AND i.usage_locked_at IS NULL
+     AND i.id IN (SELECT l.item_id FROM sales.invoice_line l WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id);
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_invoice_verify ON sales.invoice;
 CREATE CONSTRAINT TRIGGER trg_invoice_verify AFTER INSERT OR UPDATE ON sales.invoice
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sales.invoice_verify();
 
--- حواله: شماره، GL و حرکت انبار
+-- حواله: شماره، GL موجودی (دائمی)، حرکت انبار، سقف برگشت (RV-COM-04، RV-COM-05، RV-COM-22)
 CREATE OR REPLACE FUNCTION sales.delivery_verify() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_bad integer;
+DECLARE v_lines jsonb; v_mode text; rl record;
 BEGIN
   IF NEW.status = 'cancelled' AND TG_OP = 'UPDATE' AND OLD.status = 'posted' THEN
     IF EXISTS (SELECT 1 FROM inventory.stock_move m WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id
@@ -3113,19 +3761,50 @@ BEGIN
                   AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.reversal_of_move_id = m.id)) THEN
       PERFORM core.raise_hk('HK_SALES_CANCEL_STOCK', 'every stock move of a cancelled delivery must be reversed');
     END IF;
+    IF EXISTS (SELECT 1 FROM sales.invoice_line x JOIN sales.delivery_line dl ON dl.tenant_id = x.tenant_id AND dl.id = x.delivery_line_id
+                 JOIN sales.invoice i ON i.tenant_id = x.tenant_id AND i.id = x.invoice_id
+                WHERE dl.tenant_id = NEW.tenant_id AND dl.delivery_id = NEW.id AND i.status = 'posted') THEN
+      PERFORM core.raise_hk('HK_SALES_CANCEL_HAS_DEPENDENTS', 'cancel the invoices of this delivery first');
+    END IF;
+    PERFORM inventory.assert_gl_link(NEW.cancel_journal_id, 'inventory', NEW.id);
+    PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id, true);
     RETURN NULL;
   END IF;
   IF NEW.status <> 'posted' OR (TG_OP = 'UPDATE' AND OLD.status = 'posted') THEN RETURN NULL; END IF;
-  PERFORM sales.assert_number_link(NEW.number_issued_id, 'sales.delivery', NEW.id);
-  PERFORM sales.assert_gl_link(NEW.gl_journal_id, 'sales', NEW.id);
-  SELECT count(*) INTO v_bad FROM sales.delivery_line l
-   WHERE l.tenant_id = NEW.tenant_id AND l.delivery_id = NEW.id
-     AND l.qty_base <> coalesce((SELECT sum(abs(m.qty_base)) FROM inventory.stock_move m
-                                 WHERE m.tenant_id = l.tenant_id AND m.source_doc_id = NEW.id AND m.source_line_id = l.id
-                                   AND m.reversal_of_move_id IS NULL), 0);
-  IF v_bad > 0 OR NOT EXISTS (SELECT 1 FROM sales.delivery_line l WHERE l.tenant_id = NEW.tenant_id AND l.delivery_id = NEW.id) THEN
+  PERFORM inventory.assert_number_link(NEW.number_issued_id, 'sales.delivery', NEW.id);
+  -- دائمی: بهای تمام‌شده هنگام تحویل شناسایی می‌شود (سند موجودی همین حواله)؛ ادواری: بی‌سند
+  v_mode := (inventory.policy_on(NEW.company_id, NEW.doc_date)).inventory_mode;
+  IF NOT ((v_mode = 'perpetual' AND NEW.gl_status IN ('posted','not_required')) OR (v_mode = 'periodic' AND NEW.gl_status = 'not_required')) THEN
+    PERFORM core.raise_hk('HK_SALES_DELIVERY_GL', format('a %s-mode delivery cannot have gl_status %s', v_mode, NEW.gl_status));
+  END IF;
+  PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id);
+  -- دائمی: سند موجودی = ارزش خروج‌ها (بی‌سند فقط اگر ارزش صفر است)
+  IF v_mode = 'perpetual' THEN PERFORM inventory.assert_stock_journal(NEW.gl_journal_id, ARRAY[NEW.id]); END IF;
+  -- رسید مرجوعی: هر سطر از سطر حوالهٔ اصلی همان حواله و SKU؛ جمع برگشت‌ها ≤ تحویل‌شده
+  IF NEW.direction = 'return' THEN
+    FOR rl IN SELECT * FROM sales.delivery_line x WHERE x.tenant_id = NEW.tenant_id AND x.delivery_id = NEW.id LOOP
+      PERFORM 1 FROM sales.delivery_line o WHERE o.tenant_id = rl.tenant_id AND o.id = rl.original_line_id FOR NO KEY UPDATE;
+      IF NOT EXISTS (SELECT 1 FROM sales.delivery_line o WHERE o.tenant_id = rl.tenant_id AND o.id = rl.original_line_id
+                       AND o.delivery_id = NEW.original_delivery_id AND o.variant_id = rl.variant_id)
+         OR (SELECT coalesce(sum(x.qty_base), 0) FROM sales.delivery_line x JOIN sales.delivery d ON d.tenant_id = x.tenant_id AND d.id = x.delivery_id
+              WHERE x.tenant_id = rl.tenant_id AND x.original_line_id = rl.original_line_id AND d.status = 'posted' AND d.direction = 'return')
+            > (SELECT o.qty_base FROM sales.delivery_line o WHERE o.tenant_id = rl.tenant_id AND o.id = rl.original_line_id) THEN
+        PERFORM core.raise_hk('HK_SALES_RETURN_QTY', 'a return delivery references lines of its original delivery and cannot exceed them');
+      END IF;
+    END LOOP;
+    IF NOT EXISTS (SELECT 1 FROM sales.delivery o WHERE o.tenant_id = NEW.tenant_id AND o.id = NEW.original_delivery_id
+                     AND o.status = 'posted' AND o.direction = 'out' AND o.customer_party_id = NEW.customer_party_id) THEN
+      PERFORM core.raise_hk('HK_SALES_ORIGINAL_INVOICE', 'a return delivery references a posted delivery of the same customer');
+    END IF;
+  END IF;
+  SELECT jsonb_agg(jsonb_build_object('id', l.id, 'variant_id', l.variant_id, 'warehouse_id', NEW.warehouse_id, 'qty_base', l.qty_base,
+                                      'stock', true))
+    INTO v_lines FROM sales.delivery_line l WHERE l.tenant_id = NEW.tenant_id AND l.delivery_id = NEW.id;
+  IF v_lines IS NULL THEN
     PERFORM core.raise_hk('HK_SALES_STOCK_LINK', 'each delivery line needs stock moves of the same quantity');
   END IF;
+  PERFORM inventory.assert_doc_moves(NEW.id, NEW.company_id, CASE WHEN NEW.direction = 'return' THEN 'sale_return' ELSE 'sale_issue' END,
+                                     v_lines, 'HK_SALES_STOCK_LINK');
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_delivery_verify ON sales.delivery;
@@ -3146,12 +3825,33 @@ BEGIN
                                             AND i.status <> 'cancelled') THEN
     PERFORM core.raise_hk('HK_SALES_BATCH_CLOSED', 'a batch with live invoices cannot be cancelled; post it');
   END IF;
-  IF NEW.status = 'posted' THEN PERFORM sales.assert_gl_link(NEW.gl_journal_id, 'sales', NEW.id); END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_gl_batch_guard ON sales.gl_batch;
 CREATE TRIGGER trg_gl_batch_guard BEFORE UPDATE OR DELETE ON sales.gl_batch
   FOR EACH ROW EXECUTE FUNCTION sales.gl_batch_guard();
+
+-- ثبت دسته (deferred؛ RV-COM-15): سند فروش دسته = Σ مبالغ فاکتورهای ثبت‌شدهٔ عضو (هر کلید)، سند موجودی = ارزش حرکت‌های آن‌ها.
+-- فاکتوری که هم‌زمان به دسته می‌پیوندد یا پیش از این بررسی متعهد شده (و در Σ می‌آید) یا روی FOR SHARE منتظر می‌ماند و رد می‌شود.
+CREATE OR REPLACE FUNCTION sales.gl_batch_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_exp jsonb := '{}'::jsonb; v_ids uuid[]; i sales.invoice; v_tol numeric := 0;
+BEGIN
+  IF NEW.status <> 'posted' OR (TG_OP = 'UPDATE' AND OLD.status = 'posted') THEN RETURN NULL; END IF;
+  PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'sales', NEW.id);
+  FOR i IN SELECT * FROM sales.invoice x WHERE x.tenant_id = NEW.tenant_id AND x.gl_batch_id = NEW.id AND x.status = 'posted' LOOP
+    v_exp := sales.gl_add(v_exp, sales.invoice_gl_expected(i));
+    v_ids := v_ids || i.id;
+    v_tol := greatest(v_tol, inventory.gl_tolerance(i.company_id, i.currency));
+  END LOOP;
+  PERFORM inventory.assert_gl_amounts(NEW.gl_journal_id, v_exp, v_tol * greatest(cardinality(v_ids), 1));
+  PERFORM inventory.assert_gl_link(NEW.stock_journal_id, 'inventory', NEW.id);
+  PERFORM inventory.assert_stock_journal(NEW.stock_journal_id, coalesce(v_ids, '{}'::uuid[]));
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_gl_batch_verify ON sales.gl_batch;
+CREATE CONSTRAINT TRIGGER trg_gl_batch_verify AFTER INSERT OR UPDATE ON sales.gl_batch
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sales.gl_batch_verify();
 
 CREATE OR REPLACE FUNCTION sales.commission_entry_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -3244,6 +3944,7 @@ CREATE TABLE IF NOT EXISTS purchase."order" (
   expected_date        date,
   warehouse_id         uuid,
   total_amount         core.amount NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
+  origin               text NOT NULL DEFAULT 'manual' CHECK (origin IN ('manual','api','assistant','migration','reorder')),   -- C-AS-12
   approval_request_id  uuid,
   notes                text CHECK (notes = core.fa_normalize_text(notes)),
   confirmed_at         timestamptz,
@@ -3351,7 +4052,8 @@ CREATE TABLE IF NOT EXISTS purchase.receipt (
   CONSTRAINT receipt_number CHECK ((status <> 'draft') = (number_issued_id IS NOT NULL AND doc_no IS NOT NULL AND posted_at IS NOT NULL)),
   CONSTRAINT receipt_cancel CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL AND cancel_reason IS NOT NULL)),
   CONSTRAINT receipt_gl_link CHECK ((gl_status = 'posted') = (gl_journal_id IS NOT NULL)),
-  CONSTRAINT receipt_gl_when_posted CHECK (status = 'draft' OR gl_status <> 'pending')
+  CONSTRAINT receipt_gl_when_posted CHECK (status = 'draft' OR gl_status <> 'pending'),
+  CONSTRAINT receipt_cancel_gl CHECK (status <> 'cancelled' OR gl_status <> 'posted' OR cancel_journal_id IS NOT NULL)
 );
 SELECT core.enable_tenant_rls('purchase.receipt');
 
@@ -3421,7 +4123,8 @@ CREATE TABLE IF NOT EXISTS purchase.invoice (
   amount_unit            core.amount_unit,                  -- واحد ورودی برای ورود از مهاجرت/Excel
   channel                text NOT NULL DEFAULT 'manual' CHECK (channel IN ('manual','moadian_inbox','migration','api')),
   gl_status              text NOT NULL DEFAULT 'pending' CHECK (gl_status IN ('pending','posted','not_required')),
-  gl_journal_id          uuid,
+  gl_journal_id          uuid,                  -- سند خرید (source_module='purchase'): پرداختنی، مالیات خرید، GRNI/هزینه
+  stock_journal_id       uuid,                  -- سند موجودی حرکت‌های همین فاکتور (source_module='inventory'؛ RV-IT2-01)
   cancel_journal_id      uuid,
   approval_request_id    uuid,
   posted_by              uuid,
@@ -3446,11 +4149,14 @@ CREATE TABLE IF NOT EXISTS purchase.invoice (
   FOREIGN KEY (tenant_id, company_id, warehouse_id) REFERENCES inventory.warehouse(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, payment_term_id) REFERENCES parties.payment_term(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, gl_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, stock_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, cancel_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, approval_request_id) REFERENCES core.approval_request(tenant_id, id),
   FOREIGN KEY (tenant_id, posted_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, cancelled_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership(tenant_id, user_id),
+  -- بی‌سند GL فقط تاریخچهٔ مهاجرت یا فاکتور صفر (RV-COM-12)
+  CONSTRAINT pinv_gl_not_required CHECK (gl_status <> 'not_required' OR channel = 'migration' OR total_amount = 0),
   CONSTRAINT pinv_return_link CHECK ((doc_kind = 'return') = (original_invoice_id IS NOT NULL)),
   CONSTRAINT pinv_number CHECK ((status <> 'draft') = (number_issued_id IS NOT NULL AND doc_no IS NOT NULL AND posted_at IS NOT NULL)),
   CONSTRAINT pinv_cancel CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL AND cancel_reason IS NOT NULL)),
@@ -3741,29 +4447,32 @@ CREATE TRIGGER trg_order_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase."or
   FOR EACH ROW EXECUTE FUNCTION purchase.order_guard();
 DROP TRIGGER IF EXISTS trg_line_guard ON purchase.order_line;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.order_line
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('purchase."order"', 'order_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('purchase."order"', 'order_id');
 
 DROP TRIGGER IF EXISTS trg_doc_guard ON purchase.receipt;
 CREATE TRIGGER trg_doc_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.receipt
-  FOR EACH ROW EXECUTE FUNCTION sales.posted_doc_guard('');
+  FOR EACH ROW EXECUTE FUNCTION inventory.posted_doc_guard('');
 DROP TRIGGER IF EXISTS trg_line_guard ON purchase.receipt_line;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.receipt_line
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('purchase.receipt', 'receipt_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('purchase.receipt', 'receipt_id');
 DROP TRIGGER IF EXISTS trg_doc_guard ON purchase.invoice;
 CREATE TRIGGER trg_doc_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.invoice
-  FOR EACH ROW EXECUTE FUNCTION sales.posted_doc_guard('');
+  FOR EACH ROW EXECUTE FUNCTION inventory.posted_doc_guard('');
+DROP TRIGGER IF EXISTS trg_currency_guard ON purchase.invoice;
+CREATE TRIGGER trg_currency_guard BEFORE INSERT OR UPDATE OF currency, currency_minor ON purchase.invoice
+  FOR EACH ROW EXECUTE FUNCTION inventory.doc_currency_guard();
 DROP TRIGGER IF EXISTS trg_line_guard ON purchase.invoice_line;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.invoice_line
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('purchase.invoice', 'invoice_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('purchase.invoice', 'invoice_id');
 DROP TRIGGER IF EXISTS trg_line_guard ON purchase.invoice_charge;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.invoice_charge
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('purchase.invoice', 'invoice_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('purchase.invoice', 'invoice_id');
 DROP TRIGGER IF EXISTS trg_doc_guard ON purchase.landed_cost_voucher;
 CREATE TRIGGER trg_doc_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.landed_cost_voucher
-  FOR EACH ROW EXECUTE FUNCTION sales.posted_doc_guard('');
+  FOR EACH ROW EXECUTE FUNCTION inventory.posted_doc_guard('');
 DROP TRIGGER IF EXISTS trg_line_guard ON purchase.landed_cost_line;
 CREATE TRIGGER trg_line_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.landed_cost_line
-  FOR EACH ROW EXECUTE FUNCTION sales.child_of_draft_guard('purchase.landed_cost_voucher', 'voucher_id');
+  FOR EACH ROW EXECUTE FUNCTION inventory.child_of_draft_guard('purchase.landed_cost_voucher', 'voucher_id');
 
 -- تسهیم: فقط وقتی سند مادرِ هزینه پیش‌نویس است
 CREATE OR REPLACE FUNCTION purchase.cost_allocation_guard() RETURNS trigger
@@ -3788,20 +4497,27 @@ DROP TRIGGER IF EXISTS trg_cost_allocation_guard ON purchase.cost_allocation;
 CREATE TRIGGER trg_cost_allocation_guard BEFORE INSERT OR UPDATE OR DELETE ON purchase.cost_allocation
   FOR EACH ROW EXECUTE FUNCTION purchase.cost_allocation_guard();
 
--- فاکتور خرید هنگام ثبت: جمع‌ها، تسهیم کامل هزینه‌های سرمایه‌ای، برگشت ≤ خرید، شماره، GL، حرکت انبار
+-- فاکتور خرید هنگام ثبت: جمع‌ها، تسهیم کامل هزینه‌های سرمایه‌ای، برگشت ≤ خرید، پیوند رسید، شماره، GL، حرکت انبار
 CREATE OR REPLACE FUNCTION purchase.invoice_verify() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE t record; v_bad integer; orig purchase.invoice; rl record; v_sum numeric;
+DECLARE t record; v_bad integer; orig purchase.invoice; rl record; v_sum numeric; v_tol numeric; v_bm smallint; v_s int; v_lines jsonb;
+        v_recv numeric; v_inv numeric; v_ret numeric;
 BEGIN
+  v_tol := inventory.gl_tolerance(NEW.company_id, NEW.currency);
+  v_bm := inventory.company_minor(NEW.company_id);
   IF NEW.status = 'cancelled' AND TG_OP = 'UPDATE' AND OLD.status = 'posted' THEN
+    IF EXISTS (SELECT 1 FROM purchase.invoice x WHERE x.tenant_id = NEW.tenant_id AND x.original_invoice_id = NEW.id AND x.status = 'posted') THEN
+      PERFORM core.raise_hk('HK_PUR_CANCEL_HAS_DEPENDENTS', 'cancel its posted returns first');
+    END IF;
     IF EXISTS (SELECT 1 FROM inventory.stock_move m WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id
                   AND m.reversal_of_move_id IS NULL
                   AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.reversal_of_move_id = m.id)) THEN
       PERFORM core.raise_hk('HK_PUR_CANCEL_STOCK', 'every stock move of a cancelled invoice must be reversed');
     END IF;
-    IF EXISTS (SELECT 1 FROM purchase.invoice x WHERE x.tenant_id = NEW.tenant_id AND x.original_invoice_id = NEW.id AND x.status = 'posted') THEN
-      PERFORM core.raise_hk('HK_PUR_CANCEL_HAS_DEPENDENTS', 'cancel its posted returns first');
-    END IF;
+    -- ابطال: سند ابطال از همین فاکتور و اسناد خرید و موجودی آن برگشت خورده‌اند (RV-COM-02)
+    PERFORM inventory.assert_gl_link(NEW.cancel_journal_id, 'purchase', NEW.id);
+    PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'purchase', NEW.id, true);
+    PERFORM inventory.assert_gl_link(NEW.stock_journal_id, 'inventory', NEW.id, true);
     RETURN NULL;
   END IF;
   IF NEW.status <> 'posted' OR (TG_OP = 'UPDATE' AND OLD.status = 'posted') THEN RETURN NULL; END IF;
@@ -3811,8 +4527,9 @@ BEGIN
   IF t.n = 0 THEN PERFORM core.raise_hk('HK_PUR_EMPTY', 'a posted purchase invoice needs at least one line'); END IF;
   IF t.gross <> NEW.gross_amount OR t.disc <> NEW.discount_amount OR t.vat <> NEW.vat_amount OR t.ot <> NEW.other_tax_amount
      OR NEW.charges_amount <> coalesce((SELECT sum(c.amount) FROM purchase.invoice_charge c WHERE c.tenant_id = NEW.tenant_id AND c.invoice_id = NEW.id), 0)
-     OR NEW.charges_vat_amount <> coalesce((SELECT sum(c.vat_amount) FROM purchase.invoice_charge c WHERE c.tenant_id = NEW.tenant_id AND c.invoice_id = NEW.id), 0) THEN
-    PERFORM core.raise_hk('HK_PUR_TOTALS', 'header totals must equal the sum of lines and charges');
+     OR NEW.charges_vat_amount <> coalesce((SELECT sum(c.vat_amount) FROM purchase.invoice_charge c WHERE c.tenant_id = NEW.tenant_id AND c.invoice_id = NEW.id), 0)
+     OR NEW.total_base <> round(NEW.total_amount * NEW.exchange_rate, v_bm) THEN
+    PERFORM core.raise_hk('HK_PUR_TOTALS', 'header totals must equal the sum of lines and charges, and total_base its conversion');
   END IF;
   -- هزینهٔ سرمایه‌ای کامل تسهیم شود و فقط روی سطرهای همین فاکتور یا رسیدهای آن
   SELECT count(*) INTO v_bad FROM purchase.invoice_charge c
@@ -3828,12 +4545,24 @@ BEGIN
                AND coalesce(il.invoice_id, rcl.invoice_id) IS DISTINCT FROM NEW.id) THEN
     PERFORM core.raise_hk('HK_PUR_CHARGE_ALLOCATION', 'charges can be allocated only to this invoice''s lines or their receipts');
   END IF;
-  PERFORM sales.assert_number_link(NEW.number_issued_id, 'purchase.' || NEW.doc_kind, NEW.id);
-  PERFORM sales.assert_gl_link(NEW.gl_journal_id, 'purchase', NEW.id);
+  PERFORM inventory.assert_number_link(NEW.number_issued_id, 'purchase.' || NEW.doc_kind, NEW.id);
+  -- GL: سند خرید با پرداختنی (= کل) و مالیات خرید (= مالیات سطرها + هزینه‌ها) به تفکیک کلید (RV-IT2-09)؛ سند موجودی جدا (RV-IT2-01)
+  PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'purchase', NEW.id);
+  IF NEW.gl_status = 'posted' THEN
+    v_s := CASE WHEN NEW.doc_kind = 'return' THEN -1 ELSE 1 END;
+    PERFORM inventory.assert_gl_amounts(NEW.gl_journal_id,
+              jsonb_build_object('purchase.payable', -v_s * NEW.total_base,
+                                 'tax.vat_receivable', v_s * round((NEW.vat_amount + NEW.charges_vat_amount) * NEW.exchange_rate, v_bm)),
+              v_tol);
+  END IF;
+  PERFORM inventory.assert_gl_link(NEW.stock_journal_id, 'inventory', NEW.id);
+  IF NEW.gl_status = 'posted' THEN PERFORM inventory.assert_stock_journal(NEW.stock_journal_id, ARRAY[NEW.id]); END IF;
   IF NEW.doc_kind = 'return' THEN
     SELECT * INTO orig FROM purchase.invoice o WHERE o.tenant_id = NEW.tenant_id AND o.id = NEW.original_invoice_id;
-    IF orig.doc_kind <> 'invoice' OR orig.status <> 'posted' OR orig.supplier_party_id <> NEW.supplier_party_id
-       OR orig.currency <> NEW.currency OR NEW.doc_date < orig.doc_date THEN
+    IF orig.doc_kind <> 'invoice' OR orig.status <> 'posted' OR orig.currency <> NEW.currency OR NEW.doc_date < orig.doc_date
+       OR (orig.supplier_party_id <> NEW.supplier_party_id
+           AND NOT EXISTS (SELECT 1 FROM parties.party p WHERE p.tenant_id = NEW.tenant_id AND p.id = orig.supplier_party_id
+                             AND p.merged_into_id = NEW.supplier_party_id)) THEN
       PERFORM core.raise_hk('HK_PUR_ORIGINAL_INVOICE', 'return must reference a posted purchase invoice of the same supplier and currency');
     END IF;
     FOR rl IN SELECT * FROM purchase.invoice_line x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id LOOP
@@ -3850,15 +4579,77 @@ BEGIN
       END IF;
     END LOOP;
   END IF;
-  IF NEW.stock_mode = 'immediate' THEN
+  -- پیوند رسید (D-C21، RV-COM-06): سطر فاکتور از رسید ثبت‌شدهٔ همان شرکت، تأمین‌کننده، ارز و SKU؛ Σ صورتحساب‌شده (منهای برگشت‌ها)
+  -- ≤ دریافت‌شده؛ قفل سطر رسید هم‌زمانی دو فاکتور را سریال می‌کند
+  IF NEW.doc_kind = 'invoice' THEN
+    FOR rl IN SELECT * FROM purchase.invoice_line x WHERE x.tenant_id = NEW.tenant_id AND x.invoice_id = NEW.id AND x.receipt_line_id IS NOT NULL LOOP
+      PERFORM 1 FROM purchase.receipt_line r WHERE r.tenant_id = rl.tenant_id AND r.id = rl.receipt_line_id FOR NO KEY UPDATE;
+      IF NOT EXISTS (SELECT 1 FROM purchase.receipt_line r JOIN purchase.receipt h ON h.tenant_id = r.tenant_id AND h.id = r.receipt_id
+                      WHERE r.tenant_id = rl.tenant_id AND r.id = rl.receipt_line_id AND h.status = 'posted'
+                        AND h.company_id = NEW.company_id AND h.currency = NEW.currency AND r.variant_id = rl.variant_id
+                        AND (h.supplier_party_id = NEW.supplier_party_id
+                             OR EXISTS (SELECT 1 FROM parties.party p WHERE p.tenant_id = h.tenant_id AND p.id = h.supplier_party_id
+                                          AND p.merged_into_id = NEW.supplier_party_id))) THEN
+        PERFORM core.raise_hk('HK_PUR_RECEIPT_LINK', 'an invoice line bills a posted receipt line of the same company, supplier, currency and SKU');
+      END IF;
+      SELECT r.qty_base INTO v_recv FROM purchase.receipt_line r WHERE r.tenant_id = rl.tenant_id AND r.id = rl.receipt_line_id;
+      SELECT coalesce(sum(x.qty_base), 0) INTO v_inv FROM purchase.invoice_line x JOIN purchase.invoice i ON i.tenant_id = x.tenant_id AND i.id = x.invoice_id
+       WHERE x.tenant_id = rl.tenant_id AND x.receipt_line_id = rl.receipt_line_id AND i.status = 'posted' AND i.doc_kind = 'invoice';
+      SELECT coalesce(sum(y.qty_base), 0) INTO v_ret FROM purchase.invoice_line y JOIN purchase.invoice j ON j.tenant_id = y.tenant_id AND j.id = y.invoice_id
+        JOIN purchase.invoice_line x ON x.tenant_id = y.tenant_id AND x.id = y.original_line_id
+       WHERE y.tenant_id = rl.tenant_id AND x.receipt_line_id = rl.receipt_line_id AND j.status = 'posted' AND j.doc_kind = 'return';
+      IF v_inv - v_ret > v_recv THEN
+        PERFORM core.raise_hk('HK_PUR_RECEIPT_OVERBILLED', format('receipt line billed %s of %s received', v_inv - v_ret, v_recv));
+      END IF;
+    END LOOP;
+  END IF;
+  -- انبار (RV-COM-04)
+  SELECT jsonb_agg(jsonb_build_object('id', l.id, 'variant_id', l.variant_id, 'warehouse_id', coalesce(l.warehouse_id, NEW.warehouse_id),
+                                      'qty_base', l.qty_base, 'stock', s.item_type = 'stock' AND NEW.stock_mode = 'immediate'))
+    INTO v_lines FROM purchase.invoice_line l JOIN catalog.v_sku s ON s.variant_id = l.variant_id
+   WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id;
+  IF NEW.stock_mode = 'none' AND NEW.channel <> 'migration' AND EXISTS (
+       SELECT 1 FROM purchase.invoice_line l JOIN catalog.v_sku s ON s.variant_id = l.variant_id
+        WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id AND s.item_type = 'stock') THEN
+    PERFORM core.raise_hk('HK_PUR_STOCK_MODE', 'stock items move stock: stock_mode none is only for migrated history');
+  END IF;
+  IF NEW.stock_mode = 'via_receipt' AND EXISTS (
+       SELECT 1 FROM purchase.invoice_line l JOIN catalog.v_sku s ON s.variant_id = l.variant_id
+        WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id AND s.item_type = 'stock' AND l.receipt_line_id IS NULL
+          AND NEW.doc_kind = 'invoice') THEN
+    PERFORM core.raise_hk('HK_PUR_RECEIPT_LINK', 'a via-receipt invoice bills every stock line against a receipt line');
+  END IF;
+  PERFORM inventory.assert_doc_moves(NEW.id, NEW.company_id, CASE WHEN NEW.doc_kind = 'return' THEN 'purchase_return' ELSE 'receipt' END,
+                                     v_lines, 'HK_PUR_STOCK_LINK');
+  IF NEW.stock_mode = 'immediate' AND NEW.doc_kind = 'invoice' THEN
+    -- خرید مستقیم: ارزش ورود = خالص سطر به ارز پایه + هزینه‌های سرمایه‌ای تسهیم‌شده به همان سطر
     SELECT count(*) INTO v_bad FROM purchase.invoice_line l JOIN catalog.v_sku s ON s.variant_id = l.variant_id
      WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id AND s.item_type = 'stock'
-       AND l.qty_base <> coalesce((SELECT sum(abs(m.qty_base)) FROM inventory.stock_move m
-                                   WHERE m.tenant_id = l.tenant_id AND m.source_doc_id = NEW.id AND m.source_line_id = l.id
-                                     AND m.reversal_of_move_id IS NULL
-                                     AND m.move_kind = CASE WHEN NEW.doc_kind = 'return' THEN 'purchase_return' ELSE 'receipt' END), 0);
-    IF v_bad > 0 THEN PERFORM core.raise_hk('HK_PUR_STOCK_LINK', 'stock lines must have matching stock moves'); END IF;
+       AND round(l.net_amount * NEW.exchange_rate, v_bm)
+           + coalesce((SELECT sum(a.amount_base) FROM purchase.cost_allocation a WHERE a.tenant_id = l.tenant_id AND a.target_invoice_line_id = l.id), 0)
+           <> coalesce((SELECT sum(v.value) FROM inventory.stock_move m JOIN inventory.valuation_layer v ON v.tenant_id = m.tenant_id AND v.move_id = m.id
+                         WHERE m.tenant_id = l.tenant_id AND m.source_doc_id = NEW.id AND m.source_line_id = l.id
+                           AND m.reversal_of_move_id IS NULL AND v.reason = 'move'), 0);
+    IF v_bad > 0 THEN
+      PERFORM core.raise_hk('HK_PUR_STOCK_VALUE', 'receipt move value must equal the line net plus its capitalized charges (base currency)');
+    END IF;
   END IF;
+  IF NEW.stock_mode = 'immediate' AND NEW.doc_kind = 'return' AND EXISTS (
+       SELECT 1 FROM inventory.stock_move m JOIN purchase.invoice_line x ON x.tenant_id = m.tenant_id AND x.id = m.source_line_id
+         JOIN purchase.invoice_line o ON o.tenant_id = x.tenant_id AND o.id = x.original_line_id
+        WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id AND m.reversal_of_move_id IS NULL
+          AND NOT (
+                (m.valuation_rule = 'source' AND EXISTS (
+                   SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.id = m.cost_source_move_id
+                      AND r.move_kind = 'receipt' AND r.source_line_id IN (o.id, o.receipt_line_id)))
+             OR (m.valuation_rule = 'pool_out' AND NOT EXISTS (
+                   SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.move_kind = 'receipt'
+                      AND r.source_line_id IN (o.id, o.receipt_line_id) AND r.reversal_of_move_id IS NULL)))) THEN
+    PERFORM core.raise_hk('HK_PUR_RETURN_COST', 'a purchase return relieves stock at the receipt cost (cost source = the purchased line''s receipt move)');
+  END IF;
+  UPDATE catalog.item i SET usage_locked_at = now()
+   WHERE i.tenant_id = NEW.tenant_id AND i.usage_locked_at IS NULL
+     AND i.id IN (SELECT l.item_id FROM purchase.invoice_line l WHERE l.tenant_id = NEW.tenant_id AND l.invoice_id = NEW.id);
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_invoice_verify ON purchase.invoice;
@@ -3867,30 +4658,46 @@ CREATE CONSTRAINT TRIGGER trg_invoice_verify AFTER INSERT OR UPDATE ON purchase.
 
 CREATE OR REPLACE FUNCTION purchase.receipt_verify() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_bad integer;
+DECLARE v_bad integer; v_lines jsonb; v_mode text;
 BEGIN
   IF NEW.status = 'cancelled' AND TG_OP = 'UPDATE' AND OLD.status = 'posted' THEN
+    IF EXISTS (SELECT 1 FROM purchase.invoice_line il JOIN purchase.receipt_line rl ON rl.tenant_id = il.tenant_id AND rl.id = il.receipt_line_id
+                 JOIN purchase.invoice i ON i.tenant_id = il.tenant_id AND i.id = il.invoice_id
+                WHERE rl.tenant_id = NEW.tenant_id AND rl.receipt_id = NEW.id AND i.status = 'posted') THEN
+      PERFORM core.raise_hk('HK_PUR_CANCEL_HAS_DEPENDENTS', 'cancel the invoices of this receipt first');
+    END IF;
     IF EXISTS (SELECT 1 FROM inventory.stock_move m WHERE m.tenant_id = NEW.tenant_id AND m.source_doc_id = NEW.id
                   AND m.reversal_of_move_id IS NULL
-                  AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.reversal_of_move_id = m.id))
-       OR EXISTS (SELECT 1 FROM purchase.invoice_line il JOIN purchase.receipt_line rl ON rl.tenant_id = il.tenant_id AND rl.id = il.receipt_line_id
-                    JOIN purchase.invoice i ON i.tenant_id = il.tenant_id AND i.id = il.invoice_id
-                   WHERE rl.tenant_id = NEW.tenant_id AND rl.receipt_id = NEW.id AND i.status = 'posted') THEN
-      PERFORM core.raise_hk('HK_PUR_CANCEL_STOCK', 'reverse every stock move and cancel invoices of this receipt first');
+                  AND NOT EXISTS (SELECT 1 FROM inventory.stock_move r WHERE r.tenant_id = m.tenant_id AND r.reversal_of_move_id = m.id)) THEN
+      PERFORM core.raise_hk('HK_PUR_CANCEL_STOCK', 'reverse every stock move of this receipt first');
     END IF;
+    PERFORM inventory.assert_gl_link(NEW.cancel_journal_id, 'inventory', NEW.id);
+    PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id, true);
     RETURN NULL;
   END IF;
   IF NEW.status <> 'posted' OR (TG_OP = 'UPDATE' AND OLD.status = 'posted') THEN RETURN NULL; END IF;
-  PERFORM sales.assert_number_link(NEW.number_issued_id, 'purchase.receipt', NEW.id);
-  PERFORM sales.assert_gl_link(NEW.gl_journal_id, 'purchase', NEW.id);
-  SELECT count(*) INTO v_bad FROM purchase.receipt_line l
-   WHERE l.tenant_id = NEW.tenant_id AND l.receipt_id = NEW.id
-     AND l.qty_base <> coalesce((SELECT sum(m.qty_base) FROM inventory.stock_move m
-                                 WHERE m.tenant_id = l.tenant_id AND m.source_doc_id = NEW.id AND m.source_line_id = l.id
-                                   AND m.move_kind = 'receipt' AND m.reversal_of_move_id IS NULL), 0);
-  IF v_bad > 0 OR NOT EXISTS (SELECT 1 FROM purchase.receipt_line l WHERE l.tenant_id = NEW.tenant_id AND l.receipt_id = NEW.id) THEN
+  PERFORM inventory.assert_number_link(NEW.number_issued_id, 'purchase.receipt', NEW.id);
+  -- دائمی: سند موجودی (بد موجودی / بس GRNI) = ارزش رسید؛ ادواری: بی‌سند
+  v_mode := (inventory.policy_on(NEW.company_id, NEW.doc_date)).inventory_mode;
+  IF NOT ((v_mode = 'perpetual' AND NEW.gl_status IN ('posted','not_required')) OR (v_mode = 'periodic' AND NEW.gl_status = 'not_required')) THEN
+    PERFORM core.raise_hk('HK_PUR_RECEIPT_GL', format('a %s-mode receipt cannot have gl_status %s', v_mode, NEW.gl_status));
+  END IF;
+  PERFORM inventory.assert_gl_link(NEW.gl_journal_id, 'inventory', NEW.id);
+  IF v_mode = 'perpetual' THEN PERFORM inventory.assert_stock_journal(NEW.gl_journal_id, ARRAY[NEW.id]); END IF;
+  SELECT jsonb_agg(jsonb_build_object('id', l.id, 'variant_id', l.variant_id, 'warehouse_id', NEW.warehouse_id, 'qty_base', l.qty_base,
+                                      'stock', true))
+    INTO v_lines FROM purchase.receipt_line l WHERE l.tenant_id = NEW.tenant_id AND l.receipt_id = NEW.id;
+  IF v_lines IS NULL THEN
     PERFORM core.raise_hk('HK_PUR_STOCK_LINK', 'each receipt line needs a receipt stock move of the same quantity');
   END IF;
+  PERFORM inventory.assert_doc_moves(NEW.id, NEW.company_id, 'receipt', v_lines, 'HK_PUR_STOCK_LINK');
+  -- ارزش ورود = ارزش پایهٔ سطر رسید
+  SELECT count(*) INTO v_bad FROM purchase.receipt_line l
+   WHERE l.tenant_id = NEW.tenant_id AND l.receipt_id = NEW.id
+     AND l.value_base <> coalesce((SELECT sum(v.value) FROM inventory.stock_move m JOIN inventory.valuation_layer v ON v.tenant_id = m.tenant_id AND v.move_id = m.id
+                                    WHERE m.tenant_id = l.tenant_id AND m.source_doc_id = NEW.id AND m.source_line_id = l.id
+                                      AND m.reversal_of_move_id IS NULL AND v.reason = 'move'), 0);
+  IF v_bad > 0 THEN PERFORM core.raise_hk('HK_PUR_STOCK_VALUE', 'receipt move value must equal the receipt line base value'); END IF;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_receipt_verify ON purchase.receipt;
@@ -3927,6 +4734,59 @@ BEGIN
   END LOOP;
 END $$;
 
+-- ---------- شخص ادغام‌شده (CR-06 بخش ۰۴؛ RV-IT-04) ----------
+-- سند تازه یا پیش‌نویس (و ثبت پیش‌نویس) به شخص بازنده اشاره نمی‌کند (HK_PARTY_MERGED)؛ سند ثبت‌شده به بازنده اشاره می‌ماند و ابطال،
+-- برگشت‌حرکت و برگشت پورسانت آن آزاد است. برگشت/اصلاحی سند بازنده با جانشین او ثبت می‌شود (invoice_verify).
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT * FROM (VALUES
+      ('sales','order','customer_party_id','draft'), ('sales','order','salesperson_party_id','draft'),
+      ('sales','delivery','customer_party_id','draft'), ('sales','invoice','customer_party_id','draft'),
+      ('sales','invoice','salesperson_party_id','draft'), ('purchase','order','supplier_party_id','draft'),
+      ('purchase','receipt','supplier_party_id','draft'), ('purchase','invoice','supplier_party_id','draft'),
+      ('sales','invoice_line','salesperson_party_id','always'), ('sales','invoice_salesperson','party_id','always'),
+      ('sales','pricing_rule','party_id','not_retired'), ('sales','commission_assignment','party_id','insert'),
+      ('sales','commission_entry','party_id','not_reversal'), ('sales','credit_check','party_id','insert'),
+      ('purchase','moadian_inbox_invoice','supplier_party_id','changed'), ('inventory','batch','supplier_party_id','changed'),
+      ('inventory','serial','warranty_provider_party_id','changed'), ('inventory','stock_move','party_id','not_reversal')
+    ) AS v(sch, tbl, col, mode) LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I.%I', 'trg_party_guard_' || r.col, r.sch, r.tbl);
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I.%I', 'trg_party_guard_upd_' || r.col, r.sch, r.tbl);
+    EXECUTE format('CREATE TRIGGER %I BEFORE INSERT ON %I.%I FOR EACH ROW %s EXECUTE FUNCTION parties.child_party_guard(%L)',
+                   'trg_party_guard_' || r.col, r.sch, r.tbl,
+                   CASE WHEN r.mode = 'not_reversal' AND r.tbl = 'stock_move' THEN 'WHEN (NEW.reversal_of_move_id IS NULL)'
+                        WHEN r.mode = 'not_reversal' THEN 'WHEN (NEW.reversal_of_id IS NULL)' ELSE '' END, r.col);
+    IF r.mode IN ('draft','always','not_retired','changed') THEN
+      EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE ON %I.%I FOR EACH ROW %s EXECUTE FUNCTION parties.child_party_guard(%L)',
+                     'trg_party_guard_upd_' || r.col, r.sch, r.tbl,
+                     CASE r.mode WHEN 'draft' THEN 'WHEN (OLD.status = ''draft'')'
+                                 WHEN 'not_retired' THEN 'WHEN (NEW.status <> ''retired'')'
+                                 WHEN 'changed' THEN format('WHEN (NEW.%I IS DISTINCT FROM OLD.%I)', r.col, r.col)
+                                 ELSE '' END, r.col);
+    END IF;
+  END LOOP;
+END $$;
+
+-- ---------- دفاع لایهٔ دوم دستیار (10:C-AS-02، C-AS-11): ثبت قطعی در تراکنش assistant/assistant_confirm رد می‌شود ----------
+-- پیش‌نویس (مثلاً سفارش خرید با origin='assistant') آزاد است؛ درج حرکت/پورسانت و هر گذار سند به غیرپیش‌نویس نه.
+DO $$
+DECLARE r record;
+BEGIN
+  IF to_regprocedure('core.forbid_actor_via()') IS NULL THEN RETURN; END IF;
+  FOR r IN SELECT * FROM (VALUES ('inventory.stock_move'), ('inventory.serial_move'), ('sales.commission_entry')) v(tbl) LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS "0_actor_via_guard" ON %s', r.tbl);
+    EXECUTE format('CREATE TRIGGER "0_actor_via_guard" BEFORE INSERT ON %s FOR EACH ROW EXECUTE FUNCTION core.forbid_actor_via()', r.tbl);
+  END LOOP;
+  FOR r IN SELECT * FROM (VALUES ('inventory.stock_doc'), ('inventory.count_session'), ('inventory.periodic_close'), ('sales.delivery'),
+                                 ('sales.invoice'), ('sales."order"'), ('sales.gl_batch'), ('purchase."order"'), ('purchase.receipt'),
+                                 ('purchase.invoice')) v(tbl) LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS "0_actor_via_guard" ON %s', r.tbl);
+    EXECUTE format('CREATE TRIGGER "0_actor_via_guard" BEFORE INSERT OR UPDATE ON %s FOR EACH ROW WHEN (NEW.status NOT IN (''draft'',''open'')) '
+                   'EXECUTE FUNCTION core.forbid_actor_via()', r.tbl);
+  END LOOP;
+END $$;
+
 -- ویو: کالای دریافتی صورتحساب‌نشده (GRNI)
 CREATE OR REPLACE VIEW purchase.v_receipt_line_unbilled WITH (security_invoker = true) AS
 SELECT rl.tenant_id, r.company_id, r.id AS receipt_id, rl.id AS receipt_line_id, r.supplier_party_id, rl.variant_id,
@@ -3943,6 +4803,7 @@ SELECT rl.tenant_id, r.company_id, r.id AS receipt_id, rl.id AS receipt_line_id,
 CREATE OR REPLACE FUNCTION inventory.rebuild_derived(p_company_id uuid) RETURNS integer
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE v_t uuid := inventory.require_tenant(); v_run uuid; p record; v_first record; n integer := 0; v_added integer;
+        v_snap jsonb; v_bad integer;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM core.company c WHERE c.tenant_id = v_t AND c.id = p_company_id) THEN
     PERFORM core.raise_hk('HK_INV_COMPANY_NOT_FOUND', 'company not found in the current tenant');
@@ -3955,16 +4816,33 @@ BEGIN
   SELECT min(m.move_date) AS d INTO v_first FROM inventory.stock_move m WHERE m.tenant_id = v_t AND m.company_id = p_company_id;
   INSERT INTO inventory.repost_run (tenant_id, company_id, trigger_reason, gl_floor_date)
   VALUES (v_t, p_company_id, 'integrity', coalesce(v_first.d, current_date)) RETURNING id INTO v_run;
-  FOR p IN SELECT c.id FROM inventory.cost_pool c WHERE c.tenant_id = v_t AND c.company_id = p_company_id ORDER BY c.id LOOP
+  -- استخرهای «کثیف» هنگام صدور (بازارزیابی در صف بود؛ RV-COM-18): فقط حرکت‌های پیش از نقطهٔ کثیف باید بی‌اصلاح بازتولید شوند؛
+  -- اصلاح‌های از نقطهٔ کثیف به بعد همان کار معوق job است که این‌جا در همین run انجام می‌شود (سرویس قلاب، GL لایه‌های run را مثل
+  -- ValuationService.repost ثبت می‌کند).
+  FOR p IN SELECT c.id, c.dirty_from_date, c.dirty_from_seq FROM inventory.cost_pool c
+            WHERE c.tenant_id = v_t AND c.company_id = p_company_id ORDER BY c.id LOOP
     DELETE FROM inventory.pool_checkpoint k WHERE k.tenant_id = v_t AND k.pool_id = p.id;
     SELECT s.move_date, s.posting_seq INTO v_first FROM inventory.stock_move s
      WHERE s.tenant_id = v_t AND s.pool_id = p.id ORDER BY s.move_date, s.posting_seq LIMIT 1;
     IF FOUND THEN
+      SELECT coalesce(jsonb_object_agg(c.move_id::text, c.cost_status), '{}'::jsonb) INTO v_snap
+        FROM inventory.move_cost_state c JOIN inventory.stock_move s ON s.tenant_id = c.tenant_id AND s.id = c.move_id
+       WHERE c.tenant_id = v_t AND s.pool_id = p.id
+         AND (p.dirty_from_date IS NULL OR (s.move_date, s.posting_seq) < (p.dirty_from_date, p.dirty_from_seq));
       UPDATE inventory.cost_pool SET dirty_from_date = v_first.move_date, dirty_from_seq = v_first.posting_seq, dirty_since = now()
        WHERE id = p.id;
       v_added := inventory.repost_pool(p.id, v_run, v_first.move_date);
-      IF v_added > 0 THEN
-        PERFORM core.raise_hk('HK_INV_REBUILD_MISMATCH', format('pool %s replay disagrees with imported layers (%s corrections)', p.id, v_added));
+      SELECT (SELECT count(*) FROM inventory.valuation_layer l JOIN inventory.stock_move s ON s.tenant_id = l.tenant_id AND s.id = l.move_id
+               WHERE l.tenant_id = v_t AND l.repost_run_id = v_run AND l.pool_id = p.id
+                 AND (p.dirty_from_date IS NULL OR (s.move_date, s.posting_seq) < (p.dirty_from_date, p.dirty_from_seq)))
+           + (SELECT count(*) FROM inventory.stock_move s
+               LEFT JOIN inventory.move_cost_state c ON c.tenant_id = s.tenant_id AND c.move_id = s.id
+               WHERE s.tenant_id = v_t AND s.pool_id = p.id
+                 AND (p.dirty_from_date IS NULL OR (s.move_date, s.posting_seq) < (p.dirty_from_date, p.dirty_from_seq))
+                 AND (v_snap ->> s.id::text) IS DISTINCT FROM c.cost_status)
+        INTO v_bad;
+      IF v_bad > 0 THEN
+        PERFORM core.raise_hk('HK_INV_REBUILD_MISMATCH', format('pool %s replay disagrees with imported layers (%s corrections)', p.id, v_bad));
       END IF;
     END IF;
     n := n + 1;
@@ -3988,13 +4866,14 @@ GRANT SELECT, INSERT ON inventory.stock_move, inventory.serial_move, inventory.c
 GRANT UPDATE (notes, warranty_provider_party_id) ON inventory.serial TO hk_app;
 GRANT SELECT, INSERT, UPDATE ON inventory.repost_run TO hk_app;
 GRANT SELECT ON inventory.valuation_layer, inventory.cost_pool, inventory.fifo_layer, inventory.pool_checkpoint,
-  inventory.stock_balance, inventory.stock_exception TO hk_app;
+  inventory.stock_balance, inventory.stock_exception, inventory.move_cost_state TO hk_app;
 GRANT UPDATE (status, resolved_by, resolved_at, resolution_note) ON inventory.stock_exception TO hk_app;
 GRANT USAGE ON SEQUENCE inventory.posting_seq TO hk_app;
 
 -- hk_inventory_definer: کمینهٔ لازم برای موتور
 GRANT SELECT ON ALL TABLES IN SCHEMA inventory TO hk_inventory_definer;
-GRANT INSERT, UPDATE, DELETE ON inventory.cost_pool, inventory.fifo_layer, inventory.pool_checkpoint, inventory.stock_balance TO hk_inventory_definer;
+GRANT INSERT, UPDATE, DELETE ON inventory.cost_pool, inventory.fifo_layer, inventory.pool_checkpoint, inventory.stock_balance,
+  inventory.move_cost_state TO hk_inventory_definer;
 GRANT INSERT ON inventory.valuation_layer, inventory.stock_exception TO hk_inventory_definer;
 GRANT INSERT, UPDATE ON inventory.repost_run TO hk_inventory_definer;
 GRANT UPDATE ON inventory.serial TO hk_inventory_definer;
@@ -4002,7 +4881,7 @@ GRANT SELECT ON core.company, ref.currency, catalog.item TO hk_inventory_definer
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON sales.pricing_rule, sales.pricing_rule_tier, sales."order", sales.order_line, sales.delivery,
   sales.delivery_line, sales.gl_batch, sales.invoice, sales.invoice_line, sales.invoice_line_discount, sales.invoice_salesperson,
-  sales.commission_plan, sales.commission_rule, sales.commission_assignment TO hk_app;
+  sales.commission_plan, sales.commission_rule, sales.commission_assignment, sales.invoice_installment TO hk_app;
 GRANT SELECT, INSERT ON sales.credit_check, sales.commission_entry TO hk_app;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON purchase."order", purchase.order_line, purchase.receipt, purchase.receipt_line, purchase.invoice,
@@ -4026,10 +4905,19 @@ INSERT INTO ledger.posting_key (key, owner_module, expected_account_types, is_re
   ('purchase.landed_cost_clearing',  'purchase',  '{liability,asset}',  false, 'واسط هزینه‌های جانبی خرید', '1.0'),
   ('inventory.waste',                'inventory', '{expense}',          false, 'ضایعات کالا', '1.0'),
   ('inventory.internal_consumption', 'inventory', '{expense}',          false, 'مصرف داخلی کالا', '1.0'),
-  ('inventory.opening_stock',        'inventory', '{expense}',          false, 'موجودی ابتدای دوره (بستن ادواری)', '1.0'),
   ('sales.commission_expense',       'sales',     '{expense}',          false, 'هزینهٔ پورسانت فروش', '1.0'),
-  ('sales.commission_payable',       'sales',     '{liability}',        false, 'پورسانت پرداختنی', '1.0')
+  ('sales.commission_payable',       'sales',     '{liability}',        false, 'پورسانت پرداختنی', '1.0'),
+  ('sales.service_charge',           'sales',     '{income}',           false, 'حق سرویس (رستوران)', '1.0'),   -- CR-T07
+  ('sales.installment_unearned',     'sales',     '{liability}',        false, 'درآمد اقساطی تحقق‌نیافته', '1.0'),   -- RV-X3-04
+  ('sales.installment_income',       'sales',     '{income}',           false, 'درآمد فروش اقساطی', '1.0')
 ON CONFLICT (key) DO NOTHING;
+
+-- نگاشت پیش‌فرض موقت کلیدهای فروش اقساطی در قالب ir.general تا ledger حساب‌های اختصاصی (درآمد تحقق‌نیافتهٔ اقساط/درآمد فروش
+-- اقساطی) را به قالب بیفزاید و این دو ردیف را مالک شود (درخواست §۱۳)؛ بی‌آن پوشش قالب (HK_LEDGER_TEMPLATE_COVERAGE) رد می‌شود.
+INSERT INTO ledger.coa_template_posting_rule (template_code, template_version, posting_key, account_code)
+SELECT 'ir.general', 1, x.k, x.a FROM (VALUES ('sales.installment_unearned', '3301'), ('sales.installment_income', '6101')) x(k, a)
+ WHERE EXISTS (SELECT 1 FROM ledger.coa_template t WHERE t.code = 'ir.general' AND t.version = 1)
+   AND NOT EXISTS (SELECT 1 FROM ledger.coa_template_posting_rule r WHERE r.template_code = 'ir.general' AND r.template_version = 1 AND r.posting_key = x.k);
 
 INSERT INTO ledger.subledger_source (subledger_kind, owner_module, balance_function, dim_slot, compare_txn, introduced_in)
 VALUES ('inventory', 'inventory', 'inventory.ledger_subledger_stock', NULL, false, '1.0')
@@ -4134,13 +5022,19 @@ INSERT INTO core.event_subscriber (subscriber, ordered, max_attempts, requires_w
   ('inventory.party_merge',  true,  25, false, '1.0'),
   ('sales.party_merge',      true,  25, false, '1.0'),
   ('purchase.party_merge',   true,  25, false, '1.0'),
-  ('inventory.year_close',   true,  25, false, '1.0')
+  ('inventory.year_close',   true,  25, false, '1.0'),
+  ('inventory.pos_waste',    true,  25, false, '1.0')
 ON CONFLICT DO NOTHING;
+-- نام رویدادها همان نام منتشرشدهٔ مالک است (core.outbox_fanout تطبیق دقیق دارد): ledger.fiscal_year.closed (۰۳ §۵-۱۳؛ RV-LEDGER-10)،
+-- pos.order.line_wasted (۰۶ §۵-۲۱؛ RV-TP-14). نام نادرست قدیمی پاک می‌شود.
+DELETE FROM core.event_subscription WHERE event_type = 'ledger.year.closed' AND subscriber = 'inventory.year_close';
 INSERT INTO core.event_subscription (event_type, subscriber) VALUES
   ('parties.party.merged',       'inventory.party_merge'),
   ('parties.party.merged',       'sales.party_merge'),
   ('parties.party.merged',       'purchase.party_merge'),
-  ('ledger.year.closed',         'inventory.year_close')
+  ('ledger.fiscal_year.closed',  'inventory.year_close'),
+  ('ledger.fiscal_year.reopened','inventory.year_close'),
+  ('pos.order.line_wasted',      'inventory.pos_waste')
 ON CONFLICT DO NOTHING;
 
 INSERT INTO core.custom_field_entity (entity_type, module, table_name, json_column, max_fields, description_key) VALUES
@@ -4166,6 +5060,7 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('inventory','stock_move',            'inventory', 'rows', 528, '{}', '{}', 'verbatim; import hook calls setval(inventory.posting_seq) and rebuild_derived'),
   ('inventory','serial_move',           'inventory', 'rows', 530, '{}', '{}', NULL),
   ('inventory','valuation_layer',       'inventory', 'rows', 532, '{}', '{}', 'verbatim; replay must reproduce it (HK_INV_REBUILD_MISMATCH otherwise)'),
+  ('inventory','move_cost_state',       'inventory', 'rows', 533, '{}', '{}', 'verbatim; replay must reproduce each move''s current cost status'),
   ('inventory','fifo_layer',            'inventory', 'skip', 0,   '{}', '{}', 'derived; rebuilt by inventory.rebuild_derived'),
   ('inventory','pool_checkpoint',       'inventory', 'skip', 0,   '{}', '{}', 'derived; recreated by the checkpoint job'),
   ('inventory','stock_balance',         'inventory', 'skip', 0,   '{}', '{}', 'derived; rebuilt by inventory.rebuild_derived'),
@@ -4186,6 +5081,7 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('sales','invoice_line',              'sales', 'rows', 618, '{}', '{}', NULL),
   ('sales','invoice_line_discount',     'sales', 'rows', 620, '{}', '{}', NULL),
   ('sales','invoice_salesperson',       'sales', 'rows', 622, '{}', '{}', NULL),
+  ('sales','invoice_installment',       'sales', 'rows', 624, '{}', '{}', NULL),
   ('sales','commission_plan',           'sales', 'rows', 626, '{}', '{}', NULL),
   ('sales','commission_rule',           'sales', 'rows', 628, '{}', '{}', NULL),
   ('sales','commission_assignment',     'sales', 'rows', 630, '{}', '{}', NULL),

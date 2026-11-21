@@ -51,13 +51,75 @@ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
   SELECT lower(substring(p_url FROM '^[A-Za-z][A-Za-z0-9+.-]*://([^/:?#@]+)'))
 $$;
 
--- اثرانگشت مقصد داده (اپراتور + میزبان + محل داده). مدل در آن نیست: عوض شدن مدلِ همان اپراتور رضایت تازه نمی‌خواهد،
--- عوض شدن مقصد داده می‌خواهد. همتای پایتون: hesabketab.assistant.domain.provider.fingerprint (بردار در آزمون).
-CREATE OR REPLACE FUNCTION assistant.provider_fingerprint(p_operator text, p_base_url text, p_data_location text) RETURNS text
+-- شکل متعارف نام اپراتور برای اثرانگشت (RV-AST-20): فقط فاصلهٔ ASCII دو سر بریده و فقط حروف ASCII کوچک می‌شوند.
+-- lower() پایگاه داده و str.lower() پایتون برای نویسه‌هایی مثل «İ» متفاوت‌اند؛ پس هیچ‌کدام به کار نمی‌رود. نویسهٔ کنترل،
+-- tab و فاصله‌های یونیکد (NBSP و …) در ستون operator با CHECK رد می‌شوند تا دو همتا هرگز ورودی مبهم نبینند.
+CREATE OR REPLACE FUNCTION assistant.canon_operator(p text) RETURNS text
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-  SELECT encode(sha256(convert_to('hkllm1|' || lower(btrim(p_operator)) || '|' || coalesce(assistant.url_host(p_base_url), '')
-                                  || '|' || p_data_location, 'UTF8')), 'hex')
+  SELECT translate(btrim(p, ' '), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
 $$;
+
+-- نام اپراتور قابل نمایش و بدون نویسهٔ مبهم (کنترل، tab، فاصله‌های یونیکد غیر ASCII، bidi، zero-width به‌جز ZWNJ)
+CREATE OR REPLACE FUNCTION assistant.is_clean_operator(p text) RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT p !~ '[\u0001-\u001F\u007F-   -​‍-‏ -  -⁯　﻿]'
+$$;
+
+-- اثرانگشت مقصد داده، نسخهٔ hkllm2 (RV-AST-16): اپراتور + میزبان + محل داده + مدل.
+-- مدل در مقصد غیر خصوصی (iran، other) بخشی از مقصد است، چون واسط‌های داخلی مدل داخلی و مدل خارجیِ بازفروش‌شده را روی
+-- همان میزبان و با نام مدل متفاوت ارائه می‌کنند (پژوهش ۰۷ §۲-۸-۱)؛ پس عوض شدن مدل رضایت تازه می‌خواهد. در مقصد خصوصی
+-- (lan مستأجر On-prem، cell_private اپراتور) داده از شبکهٔ خصوصی بیرون نمی‌رود و مدل در اثرانگشت نیست.
+-- همتای پایتون: hesabketab.assistant.domain.provider.fingerprint؛ بردار مشترک: tests/assistant_fingerprint_v2.json.
+CREATE OR REPLACE FUNCTION assistant.provider_fingerprint(p_operator text, p_base_url text, p_data_location text, p_model text)
+RETURNS text LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT encode(sha256(convert_to('hkllm2|' || assistant.canon_operator(p_operator) || '|' || coalesce(assistant.url_host(p_base_url), '')
+                                  || '|' || p_data_location || '|'
+                                  || CASE WHEN p_data_location IN ('lan', 'cell_private') THEN '' ELSE p_model END, 'UTF8')), 'hex')
+$$;
+
+-- متن امن پاسخ دستیار (RV-AST-09): بدون نویسهٔ کنترل (به‌جز \t \n \r)، bidi override و isolate، و zero-width به‌جز ZWNJ.
+-- عمداً نرمال‌سازی fa-norm-v1 نیست: پاسخ همان رشتهٔ stream‌شده است (فاصله، ارقام و تورفتگی Markdown دست نمی‌خورند).
+CREATE OR REPLACE FUNCTION assistant.is_safe_text(p text) RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT p !~ '[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F​‍⁠‪-‮⁦-⁩﻿]'
+$$;
+
+-- تبدیل متن به واحد مبلغ برای ستون‌های تولیدی (ورودی enum در PostgreSQL STABLE است؛ برچسب‌های این enum ثابت‌اند)
+CREATE OR REPLACE FUNCTION assistant.to_amount_unit(p text) RETURNS core.amount_unit
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT p::core.amount_unit
+$$;
+
+-- آرایهٔ متن از آرایهٔ JSON (برای ستون‌های تولیدی سیاست). NULL یا null ⇒ آرایهٔ خالی؛ هر شکل دیگر ⇒ خطا (fail-closed).
+CREATE OR REPLACE FUNCTION assistant.jsonb_text_array(p jsonb) RETURNS text[]
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE v text[];
+BEGIN
+  IF p IS NULL OR jsonb_typeof(p) = 'null' THEN RETURN '{}'; END IF;
+  IF jsonb_typeof(p) <> 'array' THEN
+    PERFORM core.raise_hk('HK_AST_POLICY_DOCUMENT', format('expected a JSON array, got %s', jsonb_typeof(p)));
+  END IF;
+  SELECT coalesce(array_agg(x ORDER BY o), '{}') INTO v FROM jsonb_array_elements_text(p) WITH ORDINALITY AS e(x, o);
+  RETURN v;
+END $$;
+
+-- هزینه به ریال صحیح برای سنجهٔ ai.cost پلتفرم (RV-AST-11): IRR ×۱، IRT ×۱۰، IRR_NEW × ضریب حذف صفر از موتور قواعد
+-- (پارامتر تاریخ‌دار currency.redenomination.factor ⚠؛ این‌جا هرگز ثابت نیست و فراخوان آن را می‌دهد). گرد کردن: سقف
+-- (ceil) به ریال صحیح، تا هزینه هرگز کمتر از واقع شمرده نشود.
+CREATE OR REPLACE FUNCTION assistant.cost_to_irr(p_cost numeric, p_unit core.amount_unit, p_redenomination_factor numeric DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+BEGIN
+  IF p_cost IS NULL OR p_unit IS NULL THEN RETURN NULL; END IF;
+  IF p_cost < 0 THEN
+    PERFORM core.raise_hk('HK_AST_COST_UNIT', format('negative cost %s', p_cost));
+  END IF;
+  IF p_unit = 'IRR' THEN RETURN ceil(p_cost)::bigint; END IF;
+  IF p_unit = 'IRT' THEN RETURN ceil(p_cost * 10)::bigint; END IF;
+  IF p_redenomination_factor IS NULL OR p_redenomination_factor <= 0 THEN
+    PERFORM core.raise_hk('HK_AST_COST_UNIT', 'IRR_NEW cost needs the dated redenomination factor from the rules engine');
+  END IF;
+  RETURN ceil(p_cost * p_redenomination_factor)::bigint;
+END $$;
 
 -- تاریخ امروز مستأجر (منطقهٔ زمانی core.tenant)
 CREATE OR REPLACE FUNCTION assistant.tenant_today(p_tenant uuid) RETURNS date
@@ -75,6 +137,50 @@ $$;
 CREATE OR REPLACE FUNCTION assistant.jsonb_sha256(p jsonb) RETURNS bytea
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
   SELECT sha256(convert_to(p::text, 'UTF8'))
+$$;
+
+-- سقف‌های هم‌زمانی و بودجه با «قفل ردیف، سپس شمارش یا خواندن تازه» اجبار می‌شوند. این فقط در READ COMMITTED درست است
+-- (هر دستور snapshot تازه دارد)؛ در REPEATABLE READ شمارش زیر قفل کار هم‌زمانِ commit‌شده را نمی‌بیند (RV-AST-04).
+-- پس درج اجرا و دور در هر سطح جداسازی دیگر رد می‌شود (fail-closed).
+CREATE OR REPLACE FUNCTION assistant.require_read_committed() RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    PERFORM core.raise_hk('HK_AST_ISOLATION',
+      format('assistant runs and rounds are created only at READ COMMITTED (found %s)', current_setting('transaction_isolation')));
+  END IF;
+END $$;
+
+-- توقیف قانونی فعالی که این داده را می‌پوشاند (RV-AST-02): مستأجر؛ شرکت؛ شخص (subject_type='user')؛ یا خود منبع.
+-- هر پاک‌سازی و حذف این اسکیما (نگهداری، حذف دادهٔ شخصی، سنجش ۴۰۰روزه) همین گزاره را به کار می‌برد (INV-RET-02).
+CREATE OR REPLACE FUNCTION assistant.held(p_tenant uuid, p_company uuid, p_user uuid, p_resource_type text, p_resource_id uuid)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM core.legal_hold h
+                  WHERE h.tenant_id = p_tenant AND h.released_at IS NULL
+                    AND (h.scope = 'tenant'
+                         OR (h.scope = 'company'  AND h.company_id = p_company)
+                         OR (h.scope = 'subject'  AND h.subject_type = 'user' AND h.subject_id = p_user)
+                         OR (h.scope = 'resource' AND h.resource_type = p_resource_type AND h.resource_id = p_resource_id)))
+$$;
+
+-- هدف سیستمی تراکنش بدون کاربر (RV-AST-01، RV-X4-09). «نبودِ app.user_id» دیگر به‌معنای «زمینهٔ سیستمی» نیست: دیدن محتوای
+-- گفت‌وگو بدون کاربر فقط با GUC ثبت‌شدهٔ hk.assistant_system (R-GUC؛ ModuleSpec.gucs دستیار) ممکن است و آن را فقط این‌ها
+-- می‌گذارند: توابع purge_threads / erase_user_content / expire_proposals (بند SET خود تابع، فقط در طول همان فراخوانی) و قلاب
+-- صدور برای جابه‌جایی جایگاه با مقدار 'placement_move:<export_id>' که پایگاه داده با core.tenant_export می‌سنجد.
+-- زیر ورود به‌جای کاربر هیچ هدف سیستمی پذیرفته نیست (owner_visible و توابع نگهداری آن را جدا رد می‌کنند).
+CREATE OR REPLACE FUNCTION assistant.system_purpose() RETURNS text
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+  SELECT CASE WHEN core.current_user_id() IS NULL AND core.current_tenant_id() IS NOT NULL
+              THEN nullif(current_setting('hk.assistant_system', true), '') END
+$$;
+
+-- صدور در حال اجرای «جابه‌جایی جایگاه» (SaaS به SaaS) که کارمند پلتفرم خواسته است؛ بستهٔ آن به مستأجر داده نمی‌شود.
+CREATE OR REPLACE FUNCTION assistant.placement_export_ok() RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM core.tenant_export e
+                  WHERE e.tenant_id = core.current_tenant_id()
+                    AND 'placement_move:' || e.id::text = assistant.system_purpose()
+                    AND e.purpose = 'move_placement' AND e.status = 'running' AND e.requested_by_staff_id IS NOT NULL)
 $$;
 
 -- تریگر عمومی: در تراکنشی که از مدل آغاز شده (app.actor_via='assistant') هیچ نوشتنی در این اسکیما مجاز نیست.
@@ -147,7 +253,8 @@ CREATE TABLE IF NOT EXISTS assistant.tool (
 --   read_optional  فیلدهای اضافه (مثلاً بها) فقط اگر کاربر دارد؛ وگرنه پوشانده می‌شوند (فقط فعل read)
 --   materialize    فقط هنگام تأیید انسانی پیشنهاد اعمال می‌شود (فعل create یا send؛ فقط ابزار پیشنهاد)
 -- بدون FK به core.permission: مجوز ماژول‌های دیگر با همگام‌سازی کاتالوگ می‌آید؛ catalog_lint نبودش را گزارش می‌کند
--- و در زمان اجرا مجوزِ نبوده یعنی ابزار در دسترس نیست (fail-closed).
+-- و در زمان اجرا مجوزِ نبوده یعنی ابزار در دسترس نیست (fail-closed): v_permission_ceiling و tool_call_guard فقط مجوزهای
+-- ثبت‌شده، غیرمنسوخ و غیر critical را می‌پذیرند و تریگر assistant_ceiling_guard روی core.permission critical شدن آن‌ها را رد می‌کند.
 CREATE TABLE IF NOT EXISTS assistant.tool_permission (
   tool_code        text NOT NULL REFERENCES assistant.tool(code),
   permission_code  text NOT NULL CHECK (permission_code ~ '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,3}$'),
@@ -221,6 +328,22 @@ DROP TRIGGER IF EXISTS tool_permission_guard ON assistant.tool_permission;
 CREATE TRIGGER tool_permission_guard BEFORE INSERT OR UPDATE ON assistant.tool_permission
   FOR EACH ROW EXECUTE FUNCTION assistant.tool_permission_guard();
 
+-- طرف دیگر همان قاعده (RV-X1-08): مجوزی که در سقف دستیار آمده، بعداً هم نمی‌تواند critical ثبت یا critical شود.
+-- tool_permission به core.permission FK ندارد (مجوز ماژول‌های دیگر ممکن است بعداً ثبت شود)، پس قاعده باید روی کاتالوگ
+-- هسته هم بنشیند. جهت DAG درست است: assistant (L8) به core وابسته است (هم‌شکل نگهبان ledger روی core.company).
+CREATE OR REPLACE FUNCTION assistant.permission_risk_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.risk = 'critical' AND EXISTS (SELECT 1 FROM assistant.tool_permission tp WHERE tp.permission_code = NEW.code) THEN
+    PERFORM core.raise_hk('HK_AST_CEILING_CRITICAL',
+      format('permission %s is in the assistant ceiling and can never be critical; remove it from the tool registry first', NEW.code));
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS assistant_ceiling_guard ON core.permission;
+CREATE TRIGGER assistant_ceiling_guard BEFORE INSERT OR UPDATE OF risk ON core.permission
+  FOR EACH ROW EXECUTE FUNCTION assistant.permission_risk_guard();
+
 CREATE OR REPLACE FUNCTION assistant.prompt_suggestion_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -239,29 +362,41 @@ CREATE TRIGGER prompt_suggestion_guard BEFORE INSERT OR UPDATE ON assistant.prom
 CREATE TABLE IF NOT EXISTS assistant.tenant_policy (
   tenant_id               uuid NOT NULL REFERENCES core.tenant(id),
   id                      uuid NOT NULL DEFAULT uuidv7(),
-  policy_version          bigint NOT NULL CHECK (policy_version >= 1),
   source                  text NOT NULL CHECK (source IN ('desired_state','license','dev_fixture')),
+  -- سند متعارف بلوک assistant (AssistantDesiredState، §۵-۲ سند) همان‌گونه که امضا شده است. همهٔ ستون‌های سیاست پایین
+  -- «تولیدی» از همین سند‌اند (RV-AST-10): هیچ نویسنده‌ای، حتی hk_app، نمی‌تواند ستونی بنویسد که با سندِ امضاشده‌ای که
+  -- دروازه دوباره می‌سنجد فرق کند. کلید ناموجود یا نوع نادرست ⇒ NULL یا خطا ⇒ رد درج (fail-closed).
   document                jsonb NOT NULL CHECK (jsonb_typeof(document) = 'object'),
   document_sha256         bytea GENERATED ALWAYS AS (assistant.jsonb_sha256(document)) STORED,
   signature               bytea NOT NULL CHECK (octet_length(signature) = 64),          -- Ed25519 روی سند متعارف
   signer_kid              text NOT NULL CHECK (char_length(signer_kid) BETWEEN 3 AND 80),
-  entitled                boolean NOT NULL,                                               -- پلن یا لایسنس
-  platform_enabled        boolean NOT NULL,                                               -- کلید قطع مستأجر در پنل مالک
-  kill_reason             text CHECK (kill_reason IS NULL OR char_length(kill_reason) BETWEEN 3 AND 300),
-  features                text[] NOT NULL DEFAULT '{}'
+  policy_version          bigint GENERATED ALWAYS AS ((document->>'policy_version')::bigint) STORED NOT NULL CHECK (policy_version >= 1),
+  entitled                boolean GENERATED ALWAYS AS ((document->>'entitled')::boolean) STORED NOT NULL,   -- پلن یا لایسنس
+  platform_enabled        boolean GENERATED ALWAYS AS ((document->>'enabled')::boolean) STORED NOT NULL,    -- کلید قطع مستأجر در پنل مالک
+  kill_reason             text GENERATED ALWAYS AS (document->>'kill_reason') STORED
+                          CHECK (kill_reason IS NULL OR char_length(kill_reason) BETWEEN 3 AND 300),
+  features                text[] GENERATED ALWAYS AS (assistant.jsonb_text_array(document->'features')) STORED NOT NULL
                           CHECK (features <@ ARRAY['chat','proposals','migration_mapping','voice','ocr','insights']::text[]),
-  profile_code            text CHECK (profile_code ~ '^[a-z][a-z0-9_.-]{1,60}$'),
-  profile_version         integer CHECK (profile_version >= 1),
-  profile_fingerprint     text CHECK (profile_fingerprint ~ '^[0-9a-f]{64}$'),
-  secondary_fingerprints  text[] NOT NULL DEFAULT '{}' CHECK (assistant.all_hex64(secondary_fingerprints) AND cardinality(secondary_fingerprints) <= 4),
-  allow_tenant_provider   boolean NOT NULL DEFAULT false,
-  tenant_monthly_tokens   bigint CHECK (tenant_monthly_tokens > 0),                       -- NULL = نامحدود
-  tenant_monthly_cost     core.amount CHECK (tenant_monthly_cost > 0),
-  cost_unit               core.amount_unit NOT NULL DEFAULT 'IRR',
-  user_monthly_tokens     bigint CHECK (user_monthly_tokens > 0),
-  max_concurrent_runs     smallint NOT NULL DEFAULT 3 CHECK (max_concurrent_runs BETWEEN 1 AND 100),
-  max_rounds              smallint NOT NULL DEFAULT 6 CHECK (max_rounds BETWEEN 1 AND 16),
-  max_tool_calls          smallint NOT NULL DEFAULT 12 CHECK (max_tool_calls BETWEEN 1 AND 32),
+  profile_code            text GENERATED ALWAYS AS (document#>>'{profile,code}') STORED CHECK (profile_code ~ '^[a-z][a-z0-9_.-]{1,60}$'),
+  profile_version         integer GENERATED ALWAYS AS ((document#>>'{profile,version}')::integer) STORED CHECK (profile_version >= 1),
+  profile_fingerprint     text GENERATED ALWAYS AS (document#>>'{profile,fingerprint}') STORED CHECK (profile_fingerprint ~ '^[0-9a-f]{64}$'),
+  secondary_fingerprints  text[] GENERATED ALWAYS AS (assistant.jsonb_text_array(document->'secondary_fingerprints')) STORED NOT NULL
+                          CHECK (assistant.all_hex64(secondary_fingerprints) AND cardinality(secondary_fingerprints) <= 4),
+  allow_tenant_provider   boolean GENERATED ALWAYS AS (coalesce((document->>'allow_tenant_provider')::boolean, false)) STORED NOT NULL,
+  tenant_monthly_tokens   bigint GENERATED ALWAYS AS ((document#>>'{quotas,tenant_monthly_tokens}')::bigint) STORED
+                          CHECK (tenant_monthly_tokens > 0),                              -- NULL = نامحدود
+  tenant_monthly_cost     numeric(24,4) GENERATED ALWAYS AS ((document#>>'{quotas,tenant_monthly_cost}')::numeric(24,4)) STORED
+                          CHECK (tenant_monthly_cost > 0),
+  cost_unit               core.amount_unit GENERATED ALWAYS AS (assistant.to_amount_unit(coalesce(document#>>'{quotas,cost_unit}', 'IRR'))) STORED NOT NULL,
+  user_monthly_tokens     bigint GENERATED ALWAYS AS ((document#>>'{quotas,user_monthly_tokens}')::bigint) STORED
+                          CHECK (user_monthly_tokens > 0),
+  max_concurrent_runs     smallint GENERATED ALWAYS AS (coalesce((document#>>'{quotas,max_concurrent_runs}')::smallint, 3)) STORED NOT NULL
+                          CHECK (max_concurrent_runs BETWEEN 1 AND 100),
+  -- دست‌کم ۲: دورهای ۱..max_rounds-1 ابزار دارند و دور max_rounds همیشه پاسخ نهایی بی‌ابزار است (RV-AST-08)
+  max_rounds              smallint GENERATED ALWAYS AS (coalesce((document#>>'{quotas,max_rounds}')::smallint, 6)) STORED NOT NULL
+                          CHECK (max_rounds BETWEEN 2 AND 16),
+  max_tool_calls          smallint GENERATED ALWAYS AS (coalesce((document#>>'{quotas,max_tool_calls}')::smallint, 12)) STORED NOT NULL
+                          CHECK (max_tool_calls BETWEEN 1 AND 32),
   applied_at              timestamptz NOT NULL DEFAULT now(),
   updated_at              timestamptz NOT NULL DEFAULT now(),
   row_version             integer NOT NULL DEFAULT 1,
@@ -282,9 +417,10 @@ BEGIN
     IF NEW.tenant_id <> OLD.tenant_id OR NEW.id <> OLD.id THEN
       PERFORM core.raise_hk('HK_AST_POLICY_VERSION', 'tenant policy identity is immutable');
     END IF;
-    IF NEW.policy_version <= OLD.policy_version THEN
+    -- ستون تولیدی در تریگر BEFORE هنوز محاسبه نشده است؛ نسخه از خود سند خوانده می‌شود
+    IF (NEW.document->>'policy_version')::bigint IS NULL OR (NEW.document->>'policy_version')::bigint <= OLD.policy_version THEN
       PERFORM core.raise_hk('HK_AST_POLICY_VERSION',
-        format('policy_version must increase (%s -> %s); replayed or stale desired state', OLD.policy_version, NEW.policy_version));
+        format('policy_version must increase (%s -> %s); replayed or stale desired state', OLD.policy_version, NEW.document->>'policy_version'));
     END IF;
     NEW.applied_at := now();
   END IF;
@@ -306,7 +442,7 @@ CREATE TABLE IF NOT EXISTS assistant.tenant_provider (
   tenant_id               uuid NOT NULL REFERENCES core.tenant(id),
   id                      uuid NOT NULL DEFAULT uuidv7(),
   display_name            text NOT NULL CHECK (char_length(display_name) BETWEEN 2 AND 80),
-  operator                text NOT NULL CHECK (char_length(btrim(operator)) BETWEEN 2 AND 120),
+  operator                text NOT NULL CHECK (char_length(btrim(operator)) BETWEEN 2 AND 120 AND assistant.is_clean_operator(operator)),
   data_location           text NOT NULL CHECK (data_location IN ('lan','iran','other')),
   base_url                text NOT NULL CHECK (char_length(base_url) <= 300
                             AND base_url ~ '^https?://[A-Za-z0-9.-]+(:[0-9]{2,5})?(/[A-Za-z0-9._~/-]*)?$'),
@@ -323,7 +459,7 @@ CREATE TABLE IF NOT EXISTS assistant.tenant_provider (
   price_unit              core.amount_unit NOT NULL DEFAULT 'IRR',
   input_price_per_mtok    core.amount NOT NULL DEFAULT 0 CHECK (input_price_per_mtok >= 0),
   output_price_per_mtok   core.amount NOT NULL DEFAULT 0 CHECK (output_price_per_mtok >= 0),
-  fingerprint             text GENERATED ALWAYS AS (assistant.provider_fingerprint(operator, base_url, data_location)) STORED,
+  fingerprint             text GENERATED ALWAYS AS (assistant.provider_fingerprint(operator, base_url, data_location, model)) STORED,
   status                  text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','active','disabled')),
   last_probe_at           timestamptz,
   last_probe_ok           boolean,
@@ -337,8 +473,10 @@ CREATE TABLE IF NOT EXISTS assistant.tenant_provider (
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, updated_by) REFERENCES core.tenant_membership(tenant_id, user_id),
-  CHECK (base_url ~ '^https://' OR allow_private_network),
-  CHECK (data_location <> 'lan' OR allow_private_network),
+  -- R-AI بند ۶ و INV-SEC-04 (RV-X1-09، RV-AST-15): http فقط برای سرور LAN خود مشتری؛ شبکهٔ خصوصی دقیقاً یعنی lan.
+  -- مقصد 'iran' یا 'other' همیشه https است و هرگز به شبکهٔ خصوصی نمی‌رسد. lan فقط در On-prem (تریگر).
+  CONSTRAINT tenant_provider_http_lan_only CHECK (base_url ~ '^https://' OR data_location = 'lan'),
+  CONSTRAINT tenant_provider_private_is_lan CHECK (allow_private_network = (data_location = 'lan')),
   CHECK ((auth_header = 'none') = (api_key_sealed IS NULL)),
   CHECK (total_timeout_ms >= first_token_timeout_ms),
   CHECK (status <> 'active' OR (last_probe_ok IS TRUE AND last_probe_at IS NOT NULL))
@@ -348,8 +486,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS tenant_provider_one_active ON assistant.tenant
 
 CREATE OR REPLACE FUNCTION assistant.tenant_provider_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_allowed boolean;
+DECLARE v_allowed boolean; v_deployment text;
 BEGIN
+  -- شبکهٔ خصوصی و http فقط برای نصب On-prem (RV-AST-15، RV-X1-09): در SaaS نشانی خصوصی درون شبکهٔ سلول اپراتور است
+  -- و کلاینت خروجی SaaS هرگز به آن نمی‌رسد (INV-SEC-04). دفاع لایهٔ دوم در کنار allowlist خروجی.
+  IF NEW.allow_private_network OR NEW.data_location = 'lan' OR NEW.base_url !~ '^https://' THEN
+    SELECT t.deployment INTO v_deployment FROM core.tenant t WHERE t.id = NEW.tenant_id;
+    IF v_deployment IS DISTINCT FROM 'onprem' THEN
+      PERFORM core.raise_hk('HK_AST_PRIVATE_NETWORK',
+        format('a LAN or http provider is allowed only for an on-prem installation (deployment=%s)', coalesce(v_deployment, '?')));
+    END IF;
+  END IF;
   IF TG_OP = 'UPDATE' THEN
     IF NEW.tenant_id <> OLD.tenant_id OR NEW.id <> OLD.id OR NEW.created_by <> OLD.created_by OR NEW.created_at <> OLD.created_at THEN
       PERFORM core.raise_hk('HK_AST_PROVIDER_STATE', 'provider identity columns are immutable');
@@ -418,6 +565,7 @@ CREATE TABLE IF NOT EXISTS assistant.consent (
 );
 SELECT core.enable_tenant_rls('assistant.consent');
 CREATE UNIQUE INDEX IF NOT EXISTS consent_one_active ON assistant.consent (tenant_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS consent_superseded_by_idx ON assistant.consent (tenant_id, superseded_by) WHERE superseded_by IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION assistant.consent_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -477,22 +625,31 @@ DROP TRIGGER IF EXISTS consent_guard ON assistant.consent;
 CREATE TRIGGER consent_guard BEFORE INSERT OR UPDATE ON assistant.consent FOR EACH ROW EXECUTE FUNCTION assistant.consent_guard();
 
 -- =====================================================================
--- ۶. دورهٔ مصرف (سقف توکن و هزینه برای مستأجر و هر کاربر). مقدار مصرف‌شده ستون نیست؛ از llm_call مشتق می‌شود.
+-- ۶. دورهٔ مصرف (سقف توکن و هزینه برای مستأجر و هر کاربر).
+--    شمارنده‌های جاری (RV-AST-12) فقط با تریگر llm_call و زیر همان قفل ردیف نگهداری می‌شوند؛ usage_totals() تعریف مرجع
+--    «مصرف» از جمع llm_call است و usage_drift() برابری آن دو را می‌سنجد (آزمون و job شبانه؛ هر انحراف هشدار Sev-2).
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS assistant.usage_period (
-  tenant_id     uuid NOT NULL REFERENCES core.tenant(id),
-  id            uuid NOT NULL DEFAULT uuidv7(),
-  scope         text NOT NULL CHECK (scope IN ('tenant','user')),
-  user_id       uuid,
-  period_start  date NOT NULL,
-  period_end    date NOT NULL,                                 -- انحصاری
-  token_limit   bigint CHECK (token_limit > 0),                -- NULL = بی‌سقف
-  cost_limit    core.amount CHECK (cost_limit > 0),
-  cost_unit     core.amount_unit NOT NULL DEFAULT 'IRR',
-  limit_source  text NOT NULL CHECK (limit_source IN ('policy','setting','unlimited')),
-  created_at    timestamptz NOT NULL DEFAULT now(),
-  updated_at    timestamptz NOT NULL DEFAULT now(),
-  row_version   integer NOT NULL DEFAULT 1,
+  tenant_id         uuid NOT NULL REFERENCES core.tenant(id),
+  id                uuid NOT NULL DEFAULT uuidv7(),
+  scope             text NOT NULL CHECK (scope IN ('tenant','user')),
+  user_id           uuid,
+  period_start      date NOT NULL,
+  period_end        date NOT NULL,                                 -- انحصاری
+  token_limit       bigint CHECK (token_limit > 0),                -- NULL = بی‌سقف
+  cost_limit        core.amount CHECK (cost_limit > 0),
+  cost_unit         core.amount_unit NOT NULL DEFAULT 'IRR',
+  limit_source      text NOT NULL CHECK (limit_source IN ('policy','setting','unlimited')),
+  -- شمارنده‌ها: رزرو دورهای در جریان و مصرف واقعی دورهای پایان‌یافته (committed = in_flight + charged)
+  tokens_in_flight  bigint NOT NULL DEFAULT 0 CHECK (tokens_in_flight >= 0),
+  tokens_charged    bigint NOT NULL DEFAULT 0 CHECK (tokens_charged >= 0),
+  cost_in_flight    numeric(28,4) NOT NULL DEFAULT 0 CHECK (cost_in_flight >= 0),
+  cost_charged      numeric(28,4) NOT NULL DEFAULT 0 CHECK (cost_charged >= 0),
+  calls             bigint NOT NULL DEFAULT 0 CHECK (calls >= 0),
+  calls_in_flight   integer NOT NULL DEFAULT 0 CHECK (calls_in_flight >= 0),
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  row_version       integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE NULLS NOT DISTINCT (tenant_id, scope, user_id, period_start),
@@ -500,24 +657,71 @@ CREATE TABLE IF NOT EXISTS assistant.usage_period (
   CHECK ((scope = 'user') = (user_id IS NOT NULL)),
   CHECK (period_end > period_start AND period_end <= period_start + 62),
   CHECK ((limit_source = 'unlimited') = (token_limit IS NULL AND cost_limit IS NULL)),
+  CHECK ((calls_in_flight = 0) = (tokens_in_flight = 0) AND calls_in_flight <= calls),
   EXCLUDE USING gist (tenant_id WITH =, scope WITH =,
                       (coalesce(user_id, '00000000-0000-0000-0000-000000000000'::uuid)) WITH =,
                       daterange(period_start, period_end, '[)') WITH &&)
 );
 SELECT core.enable_tenant_rls('assistant.usage_period');
+CREATE INDEX IF NOT EXISTS usage_period_user_idx ON assistant.usage_period (tenant_id, user_id);
 
 CREATE OR REPLACE FUNCTION assistant.usage_period_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE p assistant.tenant_policy; v_tok_cap bigint; v_limits_changed boolean;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     IF OLD.period_end >= current_date - 400 THEN
       PERFORM core.raise_hk('HK_AST_RETENTION', 'usage periods are kept at least 400 days after they end');
     END IF;
+    IF assistant.held(OLD.tenant_id, NULL, OLD.user_id, 'assistant.usage_period', OLD.id) THEN
+      PERFORM core.raise_hk('HK_AST_LEGAL_HOLD', 'a legal hold covers this usage period');
+    END IF;
     RETURN OLD;
   END IF;
-  IF (NEW.tenant_id, NEW.id, NEW.scope, NEW.user_id, NEW.period_start, NEW.period_end, NEW.cost_unit, NEW.created_at)
-     IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.scope, OLD.user_id, OLD.period_start, OLD.period_end, OLD.cost_unit, OLD.created_at) THEN
-    PERFORM core.raise_hk('HK_AST_USAGE_IMMUTABLE', 'only the limits of a usage period may change');
+  IF TG_OP = 'INSERT' THEN
+    IF (NEW.tokens_in_flight, NEW.tokens_charged, NEW.cost_in_flight, NEW.cost_charged, NEW.calls, NEW.calls_in_flight)
+       IS DISTINCT FROM (0::bigint, 0::bigint, 0::numeric, 0::numeric, 0::bigint, 0) THEN
+      PERFORM core.raise_hk('HK_AST_USAGE_IMMUTABLE', 'a usage period starts with zero counters');
+    END IF;
+    v_limits_changed := true;
+  ELSE
+    IF (NEW.tenant_id, NEW.id, NEW.scope, NEW.user_id, NEW.period_start, NEW.period_end, NEW.cost_unit, NEW.created_at)
+       IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.scope, OLD.user_id, OLD.period_start, OLD.period_end, OLD.cost_unit, OLD.created_at) THEN
+      PERFORM core.raise_hk('HK_AST_USAGE_IMMUTABLE', 'only the limits of a usage period may change');
+    END IF;
+    v_limits_changed := (NEW.token_limit, NEW.cost_limit, NEW.limit_source) IS DISTINCT FROM (OLD.token_limit, OLD.cost_limit, OLD.limit_source);
+    IF (NEW.tokens_in_flight, NEW.tokens_charged, NEW.cost_in_flight, NEW.cost_charged, NEW.calls, NEW.calls_in_flight)
+       IS DISTINCT FROM (OLD.tokens_in_flight, OLD.tokens_charged, OLD.cost_in_flight, OLD.cost_charged, OLD.calls, OLD.calls_in_flight) THEN
+      -- فقط تریگر سنجش llm_call (عمق ≥ ۲) و بدون تغییر هم‌زمان سقف؛ row_version و updated_at سنجش را عوض نمی‌کند
+      IF pg_trigger_depth() < 2 OR v_limits_changed THEN
+        PERFORM core.raise_hk('HK_AST_USAGE_IMMUTABLE', 'usage counters are maintained only by model-call metering');
+      END IF;
+      NEW.row_version := OLD.row_version; NEW.updated_at := OLD.updated_at;
+      RETURN NEW;
+    END IF;
+    IF v_limits_changed AND OLD.period_end <= assistant.tenant_today(OLD.tenant_id) THEN
+      PERFORM core.raise_hk('HK_AST_USAGE_IMMUTABLE', 'limits of an ended usage period are history');
+    END IF;
+  END IF;
+  -- سقف ردیف هرگز از سیاست امضاشده بیشتر نیست (RV-AST-10): NULL یعنی بی‌سقف و فقط وقتی مجاز است که سیاست هم سقف نداشته باشد.
+  IF v_limits_changed THEN
+    SELECT * INTO p FROM assistant.tenant_policy WHERE tenant_id = NEW.tenant_id;
+    IF NOT FOUND THEN
+      PERFORM core.raise_hk('HK_AST_USAGE_LIMIT', 'usage periods need the tenant assistant policy');
+    END IF;
+    IF NEW.cost_unit <> p.cost_unit THEN
+      PERFORM core.raise_hk('HK_AST_USAGE_LIMIT', format('usage cost unit %s differs from the policy unit %s', NEW.cost_unit, p.cost_unit));
+    END IF;
+    v_tok_cap := CASE NEW.scope WHEN 'tenant' THEN p.tenant_monthly_tokens ELSE p.user_monthly_tokens END;
+    IF v_tok_cap IS NOT NULL AND (NEW.token_limit IS NULL OR NEW.token_limit > v_tok_cap) THEN
+      PERFORM core.raise_hk('HK_AST_USAGE_LIMIT',
+        format('%s token limit %s exceeds the signed policy limit %s', NEW.scope, coalesce(NEW.token_limit::text, 'unlimited'), v_tok_cap));
+    END IF;
+    IF p.tenant_monthly_cost IS NOT NULL
+       AND ((NEW.scope = 'tenant' AND NEW.cost_limit IS NULL) OR NEW.cost_limit > p.tenant_monthly_cost) THEN
+      PERFORM core.raise_hk('HK_AST_USAGE_LIMIT',
+        format('%s cost limit %s exceeds the signed policy limit %s', NEW.scope, coalesce(NEW.cost_limit::text, 'unlimited'), p.tenant_monthly_cost));
+    END IF;
   END IF;
   RETURN NEW;
 END $$;
@@ -525,7 +729,7 @@ DROP TRIGGER IF EXISTS "0_via_assistant" ON assistant.usage_period;
 CREATE TRIGGER "0_via_assistant" BEFORE INSERT OR UPDATE OR DELETE ON assistant.usage_period
   FOR EACH ROW EXECUTE FUNCTION assistant.forbid_via_assistant();
 DROP TRIGGER IF EXISTS usage_period_guard ON assistant.usage_period;
-CREATE TRIGGER usage_period_guard BEFORE UPDATE OR DELETE ON assistant.usage_period
+CREATE TRIGGER usage_period_guard BEFORE INSERT OR UPDATE OR DELETE ON assistant.usage_period
   FOR EACH ROW EXECUTE FUNCTION assistant.usage_period_guard();
 DROP TRIGGER IF EXISTS trg_touch ON assistant.usage_period;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON assistant.usage_period FOR EACH ROW EXECUTE FUNCTION core.touch_row();
@@ -549,6 +753,7 @@ CREATE TABLE IF NOT EXISTS assistant.thread (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, id, user_id),
+  UNIQUE (tenant_id, id, user_id, company_id),                  -- اجرا و پیشنهاد هم‌شرکت رشته‌اند (RV-AST-14)
   FOREIGN KEY (tenant_id, user_id) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id)
 );
@@ -556,12 +761,18 @@ SELECT core.enable_tenant_rls('assistant.thread');
 CREATE INDEX IF NOT EXISTS thread_owner_idx ON assistant.thread (tenant_id, user_id, last_activity_at DESC);
 CREATE INDEX IF NOT EXISTS thread_created_idx ON assistant.thread (tenant_id, created_at);
 
--- فقط صاحب رشته (یا زمینهٔ سیستمی بدون کاربر: نگهداری، انقضا، حذف دادهٔ شخصی، صدور) ردیف را می‌بیند. ساختن فقط با صاحب.
+-- فقط صاحب رشته محتوا را می‌بیند (D-AS-18، INV-AI-14). استثنا فقط هدف سیستمی ثبت‌شده است (assistant.system_purpose):
+-- نگهداری، حذف دادهٔ شخصی، انقضای پیشنهاد، و صدور جابه‌جایی جایگاهی که پایگاه داده آن را در core.tenant_export می‌بیند.
+-- «تراکنش بدون کاربر» به‌تنهایی هیچ محتوایی نمی‌بیند (صدور .hkx، job دیگر، ورود پشتیبان بدون کاربر هدف؛ RV-AST-01، RV-X4-09)
+-- و زیر ورود به‌جای کاربر، حتی محتوای خودِ کاربر هدف دیده نمی‌شود.
 CREATE OR REPLACE FUNCTION assistant.owner_visible(p_user uuid) RETURNS boolean
-LANGUAGE sql STABLE PARALLEL SAFE AS $$
-  SELECT p_user = core.current_user_id() OR core.current_user_id() IS NULL
+LANGUAGE sql STABLE AS $$
+  SELECT NOT assistant.impersonating()
+     AND (p_user = core.current_user_id()
+          OR assistant.system_purpose() IN ('retention', 'erasure', 'proposal_expiry')
+          OR (assistant.system_purpose() LIKE 'placement\_move:%' AND assistant.placement_export_ok()))
 $$;
--- policy محدودکنندهٔ «فقط صاحب» برای هر جدول محتوا: درج فقط با خود صاحب؛ خواندن، تغییر و حذف با صاحب یا زمینهٔ سیستمی
+-- policy محدودکنندهٔ «فقط صاحب» برای هر جدول محتوا: درج فقط با خود صاحب؛ خواندن، تغییر و حذف با صاحب یا هدف سیستمی
 CREATE OR REPLACE FUNCTION assistant.enable_owner_only(tbl regclass) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -570,7 +781,8 @@ BEGIN
   EXECUTE format('DROP POLICY IF EXISTS owner_update ON %s', tbl);
   EXECUTE format('DROP POLICY IF EXISTS owner_delete ON %s', tbl);
   EXECUTE format('CREATE POLICY owner_select ON %s AS RESTRICTIVE FOR SELECT USING (assistant.owner_visible(user_id))', tbl);
-  EXECUTE format('CREATE POLICY owner_insert ON %s AS RESTRICTIVE FOR INSERT WITH CHECK (user_id = core.current_user_id())', tbl);
+  EXECUTE format('CREATE POLICY owner_insert ON %s AS RESTRICTIVE FOR INSERT WITH CHECK (user_id = core.current_user_id() '
+                 'AND NOT assistant.impersonating())', tbl);
   EXECUTE format('CREATE POLICY owner_update ON %s AS RESTRICTIVE FOR UPDATE USING (assistant.owner_visible(user_id)) '
                  'WITH CHECK (assistant.owner_visible(user_id))', tbl);
   EXECUTE format('CREATE POLICY owner_delete ON %s AS RESTRICTIVE FOR DELETE USING (assistant.owner_visible(user_id))', tbl);
@@ -639,12 +851,15 @@ CREATE TABLE IF NOT EXISTS assistant.run (
   lease_expires_at     timestamptz NOT NULL,
   cancel_requested_at  timestamptz,
   finished_at          timestamptz,
-  error_code           text CHECK (error_code ~ '^assistant\.[a-z_]+(\.[a-z_]+){1,3}$'),
+  error_code           text CHECK (error_code ~ '^assistant\.[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,3}$'),   -- ارقام مجاز (http_5xx؛ RV-AST-03)
   request_id           text CHECK (char_length(request_id) <= 80),
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, id, user_id),
-  FOREIGN KEY (tenant_id, thread_id, user_id) REFERENCES assistant.thread(tenant_id, id, user_id) ON DELETE SET NULL (thread_id),
+  UNIQUE (tenant_id, id, user_id, company_id),
+  -- اجرا هم‌کاربر و هم‌شرکت رشتهٔ خودش است (RV-AST-14)؛ حذف رشته فقط thread_id را تهی می‌کند
+  FOREIGN KEY (tenant_id, thread_id, user_id, company_id) REFERENCES assistant.thread(tenant_id, id, user_id, company_id)
+    ON DELETE SET NULL (thread_id),
   FOREIGN KEY (tenant_id, user_id) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, consent_id) REFERENCES assistant.consent(tenant_id, id),
@@ -661,6 +876,11 @@ SELECT core.enable_tenant_rls('assistant.run');
 CREATE UNIQUE INDEX IF NOT EXISTS run_one_running_per_user ON assistant.run (tenant_id, user_id) WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS run_thread_idx ON assistant.run (tenant_id, thread_id);
 CREATE INDEX IF NOT EXISTS run_time_idx ON assistant.run (tenant_id, started_at);
+-- نمایهٔ پشتیبان FKهای درون اسکیما (RV-AST-13): حذف آبشاری و پاک‌سازی بدون پویش کامل
+CREATE INDEX IF NOT EXISTS run_tenant_usage_idx ON assistant.run (tenant_id, tenant_usage_id);
+CREATE INDEX IF NOT EXISTS run_user_usage_idx ON assistant.run (tenant_id, user_usage_id);
+CREATE INDEX IF NOT EXISTS run_consent_idx ON assistant.run (tenant_id, consent_id);
+CREATE INDEX IF NOT EXISTS run_tenant_provider_idx ON assistant.run (tenant_id, tenant_provider_id) WHERE tenant_provider_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION assistant.run_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -672,10 +892,14 @@ BEGIN
     IF OLD.status = 'running' OR OLD.finished_at >= now() - interval '400 days' THEN
       PERFORM core.raise_hk('HK_AST_RETENTION', 'runs are metering records kept at least 400 days after they finish');
     END IF;
+    IF assistant.held(OLD.tenant_id, OLD.company_id, OLD.user_id, 'assistant.run', OLD.id) THEN
+      PERFORM core.raise_hk('HK_AST_LEGAL_HOLD', 'a legal hold covers this run');
+    END IF;
     RETURN OLD;
   END IF;
 
   IF TG_OP = 'INSERT' THEN
+    PERFORM assistant.require_read_committed();
     IF assistant.impersonating() THEN
       PERFORM core.raise_hk('HK_AST_IMPERSONATION', 'the assistant is not available under impersonation');
     END IF;
@@ -724,7 +948,9 @@ BEGIN
       IF NOT p.allow_tenant_provider OR tp.status IS DISTINCT FROM 'active' OR tp.fingerprint <> NEW.provider_fingerprint THEN
         PERFORM core.raise_hk('HK_AST_PROVIDER', 'tenant provider is not active, not allowed, or does not match the run');
       END IF;
-    ELSIF NOT (NEW.provider_fingerprint = p.profile_fingerprint OR NEW.provider_fingerprint = ANY (p.secondary_fingerprints)) THEN
+    -- NULL-safe (RV-AST-07): سیاست بدون پروفایل پلتفرم هیچ اجرای platform نمی‌پذیرد
+    ELSIF NOT (coalesce(NEW.provider_fingerprint = p.profile_fingerprint, false)
+               OR NEW.provider_fingerprint = ANY (p.secondary_fingerprints)) THEN
       PERFORM core.raise_hk('HK_AST_PROVIDER', 'platform provider does not match the tenant policy');
     END IF;
 
@@ -795,6 +1021,40 @@ CREATE TRIGGER "0_via_assistant" BEFORE INSERT OR UPDATE OR DELETE ON assistant.
 DROP TRIGGER IF EXISTS run_guard ON assistant.run;
 CREATE TRIGGER run_guard BEFORE INSERT OR UPDATE OR DELETE ON assistant.run FOR EACH ROW EXECUTE FUNCTION assistant.run_guard();
 
+-- رویداد سنجش (RV-AST-11، D-AS-16): پایان «هر» اجرا، در همان تراکنش گذار running → پایانی، رویداد assistant.run.metered را در
+-- outbox می‌نویسد؛ پس مسیر موفق، شکست، مسدودی، لغو و reaper همه سنجیده می‌شوند و هیچ کد برنامه‌ای نمی‌تواند آن را جا بیندازد.
+-- شناسهٔ رویداد قطعی است (md5 اجرا) پس تکرار ناممکن است. payload فقط از جدول‌های سنجش (run، llm_call) و بدون محتوا،
+-- نام یا شناسهٔ کاربر است. هزینه دقیق و با واحد صریح می‌رود؛ تبدیل به ریال صحیح ai.cost در uplink با assistant.cost_to_irr.
+CREATE OR REPLACE FUNCTION assistant.run_metered() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE u record;
+BEGIN
+  SELECT count(c.id) AS llm_calls, coalesce(max(c.round_no), 0) AS rounds,
+         coalesce(sum(c.prompt_tokens), 0)::bigint AS prompt_tokens, coalesce(sum(c.completion_tokens), 0)::bigint AS completion_tokens,
+         coalesce(sum(c.charged_cost), 0)::numeric(28,4) AS cost, min(c.price_unit::text) AS cost_unit,
+         coalesce(bool_or(c.usage_estimated), false) AS usage_estimated,
+         max(c.first_token_ms) FILTER (WHERE c.round_no = 1) AS first_token_ms
+    INTO u
+    FROM assistant.llm_call c WHERE c.tenant_id = NEW.tenant_id AND c.run_id = NEW.id;
+  -- همهٔ دورهای یک اجرا یک واحد قیمت دارند: llm_call_guard واحد هر دور را برابر واحد دورهٔ مصرف اجرا می‌خواهد
+  INSERT INTO core.outbox_event (tenant_id, id, event_type, aggregate_type, aggregate_id, company_id, payload)
+  VALUES (NEW.tenant_id, md5('assistant.run.metered:' || NEW.id::text)::uuid, 'assistant.run.metered', 'assistant.run', NEW.id,
+          NEW.company_id,
+          jsonb_build_object('run_id', NEW.id, 'purpose', NEW.purpose, 'outcome', NEW.status, 'error_code', NEW.error_code,
+                             'provider_source', NEW.provider_source, 'provider_code', NEW.provider_code,
+                             'provider_version', NEW.provider_version, 'model', NEW.model, 'prompt_version', NEW.prompt_version,
+                             'llm_calls', u.llm_calls, 'rounds', u.rounds, 'prompt_tokens', u.prompt_tokens,
+                             'completion_tokens', u.completion_tokens, 'usage_estimated', u.usage_estimated,
+                             'cost', u.cost::text, 'cost_unit', u.cost_unit, 'first_token_ms', u.first_token_ms,
+                             'total_ms', (extract(epoch FROM (NEW.finished_at - NEW.started_at)) * 1000)::bigint,
+                             'started_at', NEW.started_at, 'finished_at', NEW.finished_at))
+  ON CONFLICT DO NOTHING;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS run_metered ON assistant.run;
+CREATE TRIGGER run_metered AFTER UPDATE OF status ON assistant.run FOR EACH ROW
+  WHEN (OLD.status = 'running' AND NEW.status <> 'running') EXECUTE FUNCTION assistant.run_metered();
+
 -- =====================================================================
 -- ۹. فراخوانی مدل (یک دور) — رزرو بودجه هنگام درج، تسویه هنگام پایان
 -- =====================================================================
@@ -829,7 +1089,7 @@ CREATE TABLE IF NOT EXISTS assistant.llm_call (
                                                  + coalesce(completion_tokens, 0)::numeric * output_price_per_mtok) / 1000000, 4) END) STORED,
   finish_reason               text CHECK (finish_reason IN ('stop','tool_calls','length','content_filter','error','cancelled','timeout')),
   http_status                 smallint CHECK (http_status BETWEEN 100 AND 599),
-  error_code                  text CHECK (error_code ~ '^assistant\.[a-z_]+(\.[a-z_]+){1,3}$'),
+  error_code                  text CHECK (error_code ~ '^assistant\.[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,3}$'),   -- http_4xx/http_5xx (RV-AST-03)
   first_token_ms              integer CHECK (first_token_ms >= 0),
   total_ms                    integer CHECK (total_ms >= 0),
   PRIMARY KEY (id),
@@ -850,7 +1110,7 @@ CREATE INDEX IF NOT EXISTS llm_call_tenant_usage_idx ON assistant.llm_call (tena
 CREATE INDEX IF NOT EXISTS llm_call_user_usage_idx ON assistant.llm_call (tenant_id, user_usage_id);
 CREATE INDEX IF NOT EXISTS llm_call_inflight_idx ON assistant.llm_call (tenant_id, lease_expires_at) WHERE status = 'in_flight';
 
--- جمع مصرف یک ردیف دوره (تنها تعریف؛ تریگر بودجه و ویوی v_usage هر دو از آن استفاده می‌کنند)
+-- تعریف مرجع مصرف یک ردیف دوره از جمع llm_call (برای ممیزی و usage_drift؛ مسیر داغ از شمارنده‌های ردیف می‌خواند)
 -- committed = رزرو فراخوانی‌های در جریان + مصرف واقعی فراخوانی‌های پایان‌یافته
 CREATE OR REPLACE FUNCTION assistant.usage_totals(p_tenant uuid, p_usage uuid)
 RETURNS TABLE (tokens_committed bigint, tokens_charged bigint, cost_committed numeric, cost_charged numeric, calls bigint, in_flight bigint)
@@ -869,17 +1129,22 @@ $$;
 CREATE OR REPLACE FUNCTION assistant.llm_call_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-  r assistant.run; p assistant.tenant_policy; c assistant.consent; u assistant.usage_period;
-  v_tokens bigint; v_cost numeric; t record; v_new_cost numeric;
+  r assistant.run; p assistant.tenant_policy; c assistant.consent; u assistant.usage_period; tp assistant.tenant_provider;
+  v_new_cost numeric; v_feature text; v_last record; v_tok_limit bigint; v_cost_limit numeric;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     IF OLD.status = 'in_flight' OR OLD.finished_at >= now() - interval '400 days' THEN
       PERFORM core.raise_hk('HK_AST_RETENTION', 'model calls are metering records kept at least 400 days');
     END IF;
+    IF assistant.held(OLD.tenant_id, (SELECT x.company_id FROM assistant.run x WHERE x.tenant_id = OLD.tenant_id AND x.id = OLD.run_id),
+                      OLD.user_id, 'assistant.run', OLD.run_id) THEN
+      PERFORM core.raise_hk('HK_AST_LEGAL_HOLD', 'a legal hold covers this model call');
+    END IF;
     RETURN OLD;
   END IF;
 
   IF TG_OP = 'INSERT' THEN
+    PERFORM assistant.require_read_committed();
     IF NEW.status <> 'in_flight' OR NEW.finished_at IS NOT NULL OR NEW.prompt_tokens IS NOT NULL OR NEW.completion_tokens IS NOT NULL
        OR NEW.usage_estimated THEN
       PERFORM core.raise_hk('HK_AST_LLM_STATE', 'a model call is created in_flight without usage');
@@ -888,7 +1153,8 @@ BEGIN
     IF NEW.lease_expires_at <= now() THEN
       PERFORM core.raise_hk('HK_AST_LLM_STATE', 'model call lease must be in the future');
     END IF;
-    SELECT * INTO r FROM assistant.run WHERE tenant_id = NEW.tenant_id AND id = NEW.run_id;
+    -- قفل ردیف اجرا: دورهای یک اجرا سریالی‌اند (یکی در جریان، شماره‌های پیاپی)
+    SELECT * INTO r FROM assistant.run WHERE tenant_id = NEW.tenant_id AND id = NEW.run_id FOR UPDATE;
     IF r.status IS DISTINCT FROM 'running' THEN
       PERFORM core.raise_hk('HK_AST_RUN_NOT_RUNNING', 'model calls are only made for a running run');
     END IF;
@@ -899,10 +1165,26 @@ BEGIN
        IS DISTINCT FROM (r.tenant_usage_id, r.user_usage_id, r.provider_fingerprint, r.model) THEN
       PERFORM core.raise_hk('HK_AST_LLM_STATE', 'model call must use the usage rows, provider and model of its run');
     END IF;
-    -- کلید قطع و حق در لحظهٔ هر دور (نه فقط شروع اجرا)
+    -- مهلت مطلق اجرا (RV-AST-21): هیچ دوری از started_at + ۱۵ دقیقهٔ اجرا فراتر نمی‌رود
+    IF NEW.lease_expires_at > r.started_at + interval '15 minutes' THEN
+      PERFORM core.raise_hk('HK_AST_RUN_DEADLINE', 'the round would outlive the 15-minute run deadline; finish the run instead');
+    END IF;
+    -- در لحظهٔ هر دور، نه فقط شروع اجرا (RV-AST-06): کلید قطع، حق، ویژگی هدف، و منبع و مقصد ارائه‌دهنده
     SELECT * INTO p FROM assistant.tenant_policy WHERE tenant_id = NEW.tenant_id;
     IF NOT FOUND OR NOT p.entitled OR NOT p.platform_enabled THEN
       PERFORM core.raise_hk('HK_AST_DISABLED', 'the assistant was disabled for this tenant');
+    END IF;
+    SELECT feature INTO v_feature FROM assistant.purpose WHERE code = r.purpose;
+    IF NOT (v_feature = ANY (p.features)) THEN
+      PERFORM core.raise_hk('HK_AST_DISABLED', format('feature %s was removed from the tenant plan', v_feature));
+    END IF;
+    IF r.provider_source = 'tenant' THEN
+      SELECT * INTO tp FROM assistant.tenant_provider WHERE tenant_id = NEW.tenant_id AND id = r.tenant_provider_id;
+      IF NOT p.allow_tenant_provider OR tp.status IS DISTINCT FROM 'active' OR tp.fingerprint IS DISTINCT FROM r.provider_fingerprint THEN
+        PERFORM core.raise_hk('HK_AST_PROVIDER', 'the tenant provider was disabled, changed or is no longer allowed');
+      END IF;
+    ELSIF NOT (coalesce(r.provider_fingerprint = p.profile_fingerprint, false) OR r.provider_fingerprint = ANY (p.secondary_fingerprints)) THEN
+      PERFORM core.raise_hk('HK_AST_PROVIDER', 'the platform provider of this run is no longer in the tenant policy');
     END IF;
     IF NEW.round_no > p.max_rounds THEN
       PERFORM core.raise_hk('HK_AST_ROUND_CAP', format('round %s exceeds the policy cap %s', NEW.round_no, p.max_rounds));
@@ -912,27 +1194,37 @@ BEGIN
     IF c.status IS DISTINCT FROM 'active' THEN
       PERFORM core.raise_hk('HK_AST_CONSENT', 'data-processing consent was revoked');
     END IF;
+    -- دورها پیاپی‌اند و هم‌زمان نیستند: دور قبلی پایان یافته و این دور دقیقاً بعدی است
+    SELECT max(l.round_no) AS last_round, count(*) FILTER (WHERE l.status = 'in_flight') AS open_calls INTO v_last
+      FROM assistant.llm_call l WHERE l.tenant_id = NEW.tenant_id AND l.run_id = NEW.run_id;
+    IF v_last.open_calls > 0 OR NEW.round_no <> coalesce(v_last.last_round, 0) + 1 THEN
+      PERFORM core.raise_hk('HK_AST_ROUND_ORDER',
+        format('round %s of run %s: rounds are consecutive and one at a time (last %s, in flight %s)',
+               NEW.round_no, NEW.run_id, coalesce(v_last.last_round, 0), v_last.open_calls));
+    END IF;
 
-    -- بودجه: اول ردیف مستأجر، بعد ردیف کاربر (ترتیب ثابت قفل ⇒ بدون بن‌بست)
+    -- بودجه زیر قفل: اول ردیف مستأجر، بعد ردیف کاربر (ترتیب ثابت ⇒ بدون بن‌بست). شمارنده‌های ردیف قفل‌شده همان مقدار
+    -- commit‌شدهٔ آخرند (READ COMMITTED + FOR UPDATE)؛ سقف مؤثر کمینهٔ سقف ردیف و سقف سیاست امضاشدهٔ جاری است.
     v_new_cost := round((NEW.reserved_prompt_tokens::numeric * NEW.input_price_per_mtok
                          + NEW.reserved_completion_tokens::numeric * NEW.output_price_per_mtok) / 1000000, 4);
     FOR u IN SELECT * FROM assistant.usage_period
               WHERE tenant_id = NEW.tenant_id AND id IN (NEW.tenant_usage_id, NEW.user_usage_id)
               ORDER BY (scope = 'user'), id FOR UPDATE
     LOOP
-      SELECT * INTO t FROM assistant.usage_totals(NEW.tenant_id, u.id);
-      IF u.token_limit IS NOT NULL AND t.tokens_committed + NEW.reserved_prompt_tokens + NEW.reserved_completion_tokens > u.token_limit THEN
-        PERFORM core.raise_hk('HK_AST_BUDGET_TOKENS',
-          format('%s token budget exhausted (%s committed of %s)', u.scope, t.tokens_committed, u.token_limit));
+      -- همهٔ مبلغ‌های یک دوره یک واحد دارند (حتی بی‌سقف هزینه)؛ پس جمع هزینه و رویداد سنجش هرگز واحدها را قاطی نمی‌کند
+      IF u.cost_unit <> NEW.price_unit THEN
+        PERFORM core.raise_hk('HK_AST_BUDGET_UNIT', format('price unit %s differs from the usage period unit %s', NEW.price_unit, u.cost_unit));
       END IF;
-      IF u.cost_limit IS NOT NULL THEN
-        IF u.cost_unit <> NEW.price_unit THEN
-          PERFORM core.raise_hk('HK_AST_BUDGET_UNIT', format('price unit %s differs from budget unit %s', NEW.price_unit, u.cost_unit));
-        END IF;
-        IF t.cost_committed + v_new_cost > u.cost_limit THEN
-          PERFORM core.raise_hk('HK_AST_BUDGET_COST',
-            format('%s cost budget exhausted (%s committed of %s)', u.scope, t.cost_committed, u.cost_limit));
-        END IF;
+      v_tok_limit := least(u.token_limit, CASE u.scope WHEN 'tenant' THEN p.tenant_monthly_tokens ELSE p.user_monthly_tokens END);
+      IF v_tok_limit IS NOT NULL
+         AND u.tokens_in_flight + u.tokens_charged + NEW.reserved_prompt_tokens + NEW.reserved_completion_tokens > v_tok_limit THEN
+        PERFORM core.raise_hk('HK_AST_BUDGET_TOKENS',
+          format('%s token budget exhausted (%s committed of %s)', u.scope, u.tokens_in_flight + u.tokens_charged, v_tok_limit));
+      END IF;
+      v_cost_limit := least(u.cost_limit, p.tenant_monthly_cost);
+      IF v_cost_limit IS NOT NULL AND u.cost_in_flight + u.cost_charged + v_new_cost > v_cost_limit THEN
+        PERFORM core.raise_hk('HK_AST_BUDGET_COST',
+          format('%s cost budget exhausted (%s committed of %s)', u.scope, u.cost_in_flight + u.cost_charged, v_cost_limit));
       END IF;
     END LOOP;
     RETURN NEW;
@@ -969,6 +1261,53 @@ BEGIN
   NEW.finished_at := now();
   RETURN NEW;
 END $$;
+
+-- شمارنده‌های دورهٔ مصرف (RV-AST-12): در همان تراکنش و زیر قفل ردیف‌ها (به همان ترتیب ثابت) به‌روز می‌شوند.
+-- درج: رزرو به «در جریان»؛ پایان: رزرو برداشته و مصرف واقعی (یا رزرو کامل در abandoned) به «charged». حذف ۴۰۰روزه
+-- شمارنده را عوض نمی‌کند: شمارندهٔ دوره تاریخچهٔ سنجش است و usage_drift فقط دوره‌های کمتر از ۴۰۰ روز را می‌سنجد.
+CREATE OR REPLACE FUNCTION assistant.llm_call_meter() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM 1 FROM assistant.usage_period
+   WHERE tenant_id = NEW.tenant_id AND id IN (NEW.tenant_usage_id, NEW.user_usage_id)
+   ORDER BY (scope = 'user'), id FOR UPDATE;
+  IF TG_OP = 'INSERT' THEN
+    UPDATE assistant.usage_period
+       SET tokens_in_flight = tokens_in_flight + NEW.reserved_prompt_tokens + NEW.reserved_completion_tokens,
+           cost_in_flight = cost_in_flight + NEW.reserved_cost, calls = calls + 1, calls_in_flight = calls_in_flight + 1
+     WHERE tenant_id = NEW.tenant_id AND id IN (NEW.tenant_usage_id, NEW.user_usage_id);
+  ELSE
+    UPDATE assistant.usage_period
+       SET tokens_in_flight = tokens_in_flight - (NEW.reserved_prompt_tokens + NEW.reserved_completion_tokens),
+           cost_in_flight = cost_in_flight - NEW.reserved_cost, calls_in_flight = calls_in_flight - 1,
+           tokens_charged = tokens_charged + coalesce(NEW.prompt_tokens, 0) + coalesce(NEW.completion_tokens, 0),
+           cost_charged = cost_charged + coalesce(NEW.charged_cost, 0)
+     WHERE tenant_id = NEW.tenant_id AND id IN (NEW.tenant_usage_id, NEW.user_usage_id);
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS llm_call_meter_insert ON assistant.llm_call;
+CREATE TRIGGER llm_call_meter_insert AFTER INSERT ON assistant.llm_call FOR EACH ROW EXECUTE FUNCTION assistant.llm_call_meter();
+DROP TRIGGER IF EXISTS llm_call_meter_settle ON assistant.llm_call;
+CREATE TRIGGER llm_call_meter_settle AFTER UPDATE OF status ON assistant.llm_call FOR EACH ROW
+  WHEN (OLD.status = 'in_flight' AND NEW.status <> 'in_flight') EXECUTE FUNCTION assistant.llm_call_meter();
+
+-- انحراف شمارنده‌ها از تعریف مرجع، برای مستأجر جاری (آزمون، ImportHook و job شبانهٔ assistant.usage_reconcile؛ باید خالی باشد)
+CREATE OR REPLACE FUNCTION assistant.usage_drift()
+RETURNS TABLE (usage_id uuid, field text, stored numeric, derived numeric)
+LANGUAGE sql STABLE AS $$
+  SELECT u.id, x.field, x.stored, x.derived
+    FROM assistant.usage_period u
+    CROSS JOIN LATERAL assistant.usage_totals(u.tenant_id, u.id) t
+    CROSS JOIN LATERAL (VALUES ('tokens_committed', (u.tokens_in_flight + u.tokens_charged)::numeric, t.tokens_committed::numeric),
+                               ('tokens_charged', u.tokens_charged::numeric, t.tokens_charged::numeric),
+                               ('cost_committed', u.cost_in_flight + u.cost_charged, t.cost_committed),
+                               ('cost_charged', u.cost_charged, t.cost_charged),
+                               ('calls', u.calls::numeric, t.calls::numeric),
+                               ('in_flight', u.calls_in_flight::numeric, t.in_flight::numeric)) AS x(field, stored, derived)
+   WHERE u.tenant_id = core.current_tenant_id() AND u.period_start > current_date - 400 AND x.stored IS DISTINCT FROM x.derived
+$$;
+
 DROP TRIGGER IF EXISTS "0_via_assistant" ON assistant.llm_call;
 CREATE TRIGGER "0_via_assistant" BEFORE INSERT OR UPDATE OR DELETE ON assistant.llm_call
   FOR EACH ROW EXECUTE FUNCTION assistant.forbid_via_assistant();
@@ -987,11 +1326,13 @@ CREATE TABLE IF NOT EXISTS assistant.message (
   run_id      uuid NOT NULL,
   seq         integer NOT NULL CHECK (seq >= 1),
   role        text NOT NULL CHECK (role IN ('user','assistant')),
-  content     text NOT NULL CHECK (char_length(content) BETWEEN 1 AND 8000 AND content = core.fa_normalize_text(content)),
+  -- متن پرسش کاربر نرمال fa-norm-v1 است. پاسخ دستیار همان رشتهٔ stream‌شده است و فقط باید «امن» باشد (RV-AST-09):
+  -- نرمال‌سازی کامل فاصله، ارقام عربی و تورفتگی Markdown را عوض می‌کرد و برابری با stream (INV-AI-31) را می‌شکست.
+  content     text NOT NULL CHECK (char_length(content) BETWEEN 1 AND 8000 AND assistant.is_safe_text(content)),
   input_mode  text NOT NULL DEFAULT 'text' CHECK (input_mode IN ('text','suggestion','voice')),
   suggestion_code text CHECK (suggestion_code ~ '^[a-z][a-z0-9_.]{2,102}$'),   -- عمومی یا «<pack>.<code>» صنفی؛ بدون FK (D-AS-25)
   finish      text CHECK (finish IN ('complete','interrupted','refused','error','cancelled','budget')),
-  blocks      jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(blocks) = 'array' AND jsonb_array_length(blocks) <= 16),
+  blocks      jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(blocks) = 'array' AND jsonb_array_length(blocks) <= 32),  -- = سقف max_tool_calls (RV-AST-21)
   grounding   jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(grounding) = 'object'),
   created_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (id),
@@ -1002,7 +1343,7 @@ CREATE TABLE IF NOT EXISTS assistant.message (
   FOREIGN KEY (tenant_id, thread_id, user_id) REFERENCES assistant.thread(tenant_id, id, user_id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, run_id, user_id) REFERENCES assistant.run(tenant_id, id, user_id),
   CHECK ((role = 'assistant') = (finish IS NOT NULL)),
-  CHECK (role = 'assistant' OR char_length(content) <= 2000),
+  CHECK (role = 'assistant' OR (char_length(content) <= 2000 AND content = core.fa_normalize_text(content))),
   CHECK (role = 'user' OR input_mode = 'text'),
   CHECK ((input_mode = 'suggestion') = (suggestion_code IS NOT NULL)),
   CHECK (role = 'assistant' OR (blocks = '[]'::jsonb AND grounding = '{}'::jsonb))
@@ -1038,6 +1379,20 @@ CREATE TRIGGER message_guard BEFORE INSERT ON assistant.message FOR EACH ROW EXE
 DROP TRIGGER IF EXISTS message_immutable ON assistant.message;
 CREATE TRIGGER message_immutable BEFORE UPDATE ON assistant.message FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation();
 
+-- حذف تکی پیام یا فراخوانی ابزار، حتی برای مالک جدول، ممنوع است؛ حذف فقط آبشاری از حذف رشته (اقدام RI = عمق تریگر ≥ ۲)
+-- یا پاک‌سازی نهایی مستأجر (session_replication_role=replica که تریگرها را خاموش می‌کند) انجام می‌شود (RV-AST-24).
+CREATE OR REPLACE FUNCTION assistant.forbid_direct_delete() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF pg_trigger_depth() < 2 THEN
+    PERFORM core.raise_hk('HK_AST_APPEND_ONLY',
+      format('%s.%s rows are deleted only with their thread', TG_TABLE_SCHEMA, TG_TABLE_NAME));
+  END IF;
+  RETURN OLD;
+END $$;
+DROP TRIGGER IF EXISTS message_no_direct_delete ON assistant.message;
+CREATE TRIGGER message_no_direct_delete BEFORE DELETE ON assistant.message FOR EACH ROW EXECUTE FUNCTION assistant.forbid_direct_delete();
+
 -- =====================================================================
 -- ۱۱. فراخوانی ابزار (فقط‌افزودنی؛ رکورد کامل آنچه به مدل رفت)
 -- =====================================================================
@@ -1062,7 +1417,7 @@ CREATE TABLE IF NOT EXISTS assistant.tool_call (
   pseudonymized        integer NOT NULL DEFAULT 0 CHECK (pseudonymized >= 0),
   permissions_checked  text[] NOT NULL DEFAULT '{}',
   denied_permission    text,
-  error_code           text CHECK (error_code ~ '^assistant\.[a-z_]+(\.[a-z_]+){1,3}$'),
+  error_code           text CHECK (error_code ~ '^assistant\.[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,3}$'),
   latency_ms           integer NOT NULL CHECK (latency_ms >= 0),
   created_at           timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (id),
@@ -1079,6 +1434,8 @@ CREATE TABLE IF NOT EXISTS assistant.tool_call (
 );
 SELECT core.enable_tenant_rls('assistant.tool_call');
 SELECT assistant.enable_owner_only('assistant.tool_call');
+CREATE INDEX IF NOT EXISTS tool_call_thread_idx ON assistant.tool_call (tenant_id, thread_id);       -- RV-AST-13
+CREATE INDEX IF NOT EXISTS tool_call_llm_call_idx ON assistant.tool_call (tenant_id, llm_call_id);
 
 CREATE OR REPLACE FUNCTION assistant.tool_call_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -1103,9 +1460,16 @@ BEGIN
   IF NEW.seq > p.max_tool_calls THEN
     PERFORM core.raise_hk('HK_AST_TOOL_CAP', format('tool call %s exceeds the policy cap %s', NEW.seq, p.max_tool_calls));
   END IF;
-  -- فراخوانی آغازشده با مدل فقط مجوزهای خواندنیِ اعلام‌شدهٔ همان ابزار را به کار می‌برد (هرگز materialize)
+  -- دور max_rounds همیشه پاسخ نهایی با tool_choice='none' است (RV-AST-08)؛ هیچ ابزاری به آن پاسخ داده نمی‌شود
+  IF l.round_no >= p.max_rounds THEN
+    PERFORM core.raise_hk('HK_AST_ROUND_CAP', format('round %s is the final round (cap %s): it gets no tool calls', l.round_no, p.max_rounds));
+  END IF;
+  -- فراخوانی آغازشده با مدل فقط مجوزهای خواندنیِ اعلام‌شدهٔ همان ابزار را به کار می‌برد (هرگز materialize)، و فقط
+  -- مجوزهای ثبت‌شده، غیرمنسوخ و غیر critical کاتالوگ هسته (RV-X1-08؛ همان فیلتر v_permission_ceiling)
   SELECT coalesce(array_agg(tp.permission_code), '{}') INTO v_allowed
-    FROM assistant.tool_permission tp WHERE tp.tool_code = NEW.tool_code AND tp.requirement IN ('read','read_optional');
+    FROM assistant.tool_permission tp JOIN core.permission cp ON cp.code = tp.permission_code
+   WHERE tp.tool_code = NEW.tool_code AND tp.requirement IN ('read','read_optional')
+     AND cp.risk <> 'critical' AND cp.deprecated_at IS NULL;
   IF NOT (NEW.permissions_checked <@ v_allowed) OR (NEW.denied_permission IS NOT NULL AND NOT (NEW.denied_permission = ANY (v_allowed))) THEN
     PERFORM core.raise_hk('HK_AST_TOOL_PERMISSION', format('tool %s exercised a permission outside its declared read ceiling', NEW.tool_code));
   END IF;
@@ -1125,6 +1489,8 @@ DROP TRIGGER IF EXISTS tool_call_guard ON assistant.tool_call;
 CREATE TRIGGER tool_call_guard BEFORE INSERT ON assistant.tool_call FOR EACH ROW EXECUTE FUNCTION assistant.tool_call_guard();
 DROP TRIGGER IF EXISTS tool_call_immutable ON assistant.tool_call;
 CREATE TRIGGER tool_call_immutable BEFORE UPDATE ON assistant.tool_call FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation();
+DROP TRIGGER IF EXISTS tool_call_no_direct_delete ON assistant.tool_call;
+CREATE TRIGGER tool_call_no_direct_delete BEFORE DELETE ON assistant.tool_call FOR EACH ROW EXECUTE FUNCTION assistant.forbid_direct_delete();
 
 -- =====================================================================
 -- ۱۲. پیشنهاد (پیش‌نویسِ دستیار؛ تحقق فقط با تأیید انسانی صاحب رشته)
@@ -1159,7 +1525,8 @@ CREATE TABLE IF NOT EXISTS assistant.proposal (
   UNIQUE (tenant_id, tool_call_id),
   FOREIGN KEY (tenant_id, tool_call_id, user_id) REFERENCES assistant.tool_call(tenant_id, id, user_id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, thread_id, user_id) REFERENCES assistant.thread(tenant_id, id, user_id) ON DELETE CASCADE,
-  FOREIGN KEY (tenant_id, run_id, user_id) REFERENCES assistant.run(tenant_id, id, user_id),
+  -- پیشنهاد در شرکت اجرای خودش اعتبارسنجی شده و همان‌جا محقق می‌شود (RV-AST-14)
+  FOREIGN KEY (tenant_id, run_id, user_id, company_id) REFERENCES assistant.run(tenant_id, id, user_id, company_id),
   FOREIGN KEY (tenant_id, decided_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   CHECK ((status = 'proposed') = (decided_at IS NULL)),
@@ -1171,6 +1538,9 @@ CREATE TABLE IF NOT EXISTS assistant.proposal (
 SELECT core.enable_tenant_rls('assistant.proposal');
 SELECT assistant.enable_owner_only('assistant.proposal');
 CREATE INDEX IF NOT EXISTS proposal_open_idx ON assistant.proposal (tenant_id, user_id, expires_at) WHERE status = 'proposed';
+CREATE INDEX IF NOT EXISTS proposal_thread_idx ON assistant.proposal (tenant_id, thread_id);          -- RV-AST-13
+CREATE INDEX IF NOT EXISTS proposal_run_idx ON assistant.proposal (tenant_id, run_id);
+CREATE INDEX IF NOT EXISTS proposal_due_idx ON assistant.proposal (tenant_id, expires_at) WHERE status = 'proposed';
 
 CREATE OR REPLACE FUNCTION assistant.proposal_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -1302,14 +1672,20 @@ CREATE TRIGGER trg_touch BEFORE UPDATE ON assistant.feedback FOR EACH ROW EXECUT
 -- =====================================================================
 -- ۱۴. ویوها (security_invoker)
 -- =====================================================================
+-- از شمارنده‌های ردیف (RV-AST-12)؛ سقف مؤثر = کمینهٔ سقف ردیف و سقف سیاست جاری (همان قاعدهٔ llm_call_guard)
 CREATE OR REPLACE VIEW assistant.v_usage WITH (security_invoker = true) AS
 SELECT u.tenant_id, u.id, u.scope, u.user_id, u.period_start, u.period_end, u.token_limit, u.cost_limit, u.cost_unit, u.limit_source,
-       s.tokens_committed, s.tokens_charged, s.cost_committed::core.amount AS cost_committed, s.cost_charged::core.amount AS cost_charged,
-       s.calls AS llm_calls, s.in_flight,
-       CASE WHEN u.token_limit IS NULL THEN NULL ELSE greatest(u.token_limit - s.tokens_committed, 0) END AS tokens_remaining,
-       CASE WHEN u.cost_limit IS NULL THEN NULL ELSE greatest(u.cost_limit - s.cost_committed, 0)::core.amount END AS cost_remaining
+       (u.tokens_in_flight + u.tokens_charged) AS tokens_committed, u.tokens_charged,
+       (u.cost_in_flight + u.cost_charged)::core.amount AS cost_committed, u.cost_charged::core.amount AS cost_charged,
+       u.calls AS llm_calls, u.calls_in_flight::bigint AS in_flight,
+       e.token_limit AS effective_token_limit, e.cost_limit AS effective_cost_limit,
+       CASE WHEN e.token_limit IS NULL THEN NULL ELSE greatest(e.token_limit - (u.tokens_in_flight + u.tokens_charged), 0) END AS tokens_remaining,
+       CASE WHEN e.cost_limit IS NULL THEN NULL
+            ELSE greatest(e.cost_limit - (u.cost_in_flight + u.cost_charged), 0)::core.amount END AS cost_remaining
   FROM assistant.usage_period u
-  CROSS JOIN LATERAL assistant.usage_totals(u.tenant_id, u.id) s;
+  LEFT JOIN assistant.tenant_policy p ON p.tenant_id = u.tenant_id
+  CROSS JOIN LATERAL (SELECT least(u.token_limit, CASE u.scope WHEN 'tenant' THEN p.tenant_monthly_tokens ELSE p.user_monthly_tokens END) AS token_limit,
+                             least(u.cost_limit, p.tenant_monthly_cost) AS cost_limit) e;
 
 -- خلاصهٔ سنجش هر اجرا (مبنای رویداد assistant.run.metered و داشبورد مصرف مستأجر؛ بدون محتوا)
 CREATE OR REPLACE VIEW assistant.v_run_usage WITH (security_invoker = true) AS
@@ -1327,15 +1703,17 @@ SELECT r.tenant_id, r.id AS run_id, r.user_id, r.company_id, r.purpose, r.status
   LEFT JOIN assistant.llm_call c ON c.tenant_id = r.tenant_id AND c.run_id = r.id
  GROUP BY r.tenant_id, r.id;
 
--- سقف مجوز دستیار (مشتق از رجیستری ابزار؛ هیچ فهرست دستی دیگری نیست)
+-- سقف مجوز دستیار (مشتق از رجیستری ابزار؛ هیچ فهرست دستی دیگری نیست). در زمان خواندن فقط مجوزهای ثبت‌شده، غیرمنسوخ
+-- و غیر critical کاتالوگ هسته (RV-X1-08): مجوزی که بعداً ثبت یا خطرناک‌تر شود، هرگز بی‌صدا در سقف نمی‌ماند (fail-closed).
 CREATE OR REPLACE VIEW assistant.v_permission_ceiling WITH (security_invoker = true) AS
-SELECT tp.permission_code,
+SELECT tp.permission_code, cp.risk,
        bool_or(tp.requirement IN ('read','read_optional')) AS model_initiated,
        bool_or(tp.requirement = 'materialize') AS human_confirmed,
        array_agg(tp.tool_code ORDER BY tp.tool_code) AS tools
   FROM assistant.tool_permission tp
   JOIN assistant.tool t ON t.code = tp.tool_code AND t.deprecated_at IS NULL
- GROUP BY tp.permission_code;
+  JOIN core.permission cp ON cp.code = tp.permission_code AND cp.risk <> 'critical' AND cp.deprecated_at IS NULL
+ GROUP BY tp.permission_code, cp.risk;
 
 -- =====================================================================
 -- ۱۵. توابع نگهداری و lint
@@ -1364,24 +1742,84 @@ BEGIN
   RETURN n1 + n2;
 END $$;
 
--- پاک‌سازی نگهداری: فقط در زمینهٔ سیستمی (بدون app.user_id)، با توقیف قانونی مسدود می‌شود.
+-- پاک‌سازی نگهداری (RetentionHook کلاس assistant_conversation؛ RV-AST-02، RV-AST-22). فقط در زمینهٔ مستأجرِ بدون کاربر؛
+-- هدف سیستمی 'retention' را بند SET خود تابع فقط در طول همین فراخوانی می‌گذارد. cutoff را هستهٔ نگهداری از
+-- core.retention_period (override مستأجر یا پیش‌فرض کلاس) می‌سازد؛ پایگاه داده رد می‌کند اگر cutoff تازه‌تر از دورهٔ
+-- مستأجر یا کمتر از یک روز باشد. سقف نگهداری گفت‌وگو ۳۶۵ روز است: override بلندتر بی‌اثر است (RV-AST-22).
+-- توقیف قانونی: توقیف سطح مستأجر کل پاک‌سازی را رد می‌کند؛ توقیف شرکت، شخص (user) یا خود رشته فقط همان رشته‌ها را نگه می‌دارد.
 CREATE OR REPLACE FUNCTION assistant.purge_threads(p_created_before timestamptz, p_limit integer DEFAULT 500) RETURNS integer
+LANGUAGE plpgsql SET hk.assistant_system = 'retention' AS $$
+DECLARE n integer; v_tenant uuid := core.current_tenant_id(); v_cutoff timestamptz;
+BEGIN
+  IF v_tenant IS NULL OR core.current_user_id() IS NOT NULL OR assistant.impersonating() THEN
+    PERFORM core.raise_hk('HK_AST_SYSTEM_ONLY', 'purge runs only in a system tenant context');
+  END IF;
+  IF p_created_before > now() - greatest(interval '1 day', coalesce(core.retention_period(v_tenant, 'assistant_conversation'), interval '1 day')) THEN
+    PERFORM core.raise_hk('HK_AST_RETENTION', 'cutoff is newer than the tenant conversation retention period (at least one day)');
+  END IF;
+  v_cutoff := greatest(p_created_before, now() - interval '365 days');
+  IF EXISTS (SELECT 1 FROM core.legal_hold h WHERE h.tenant_id = v_tenant AND h.released_at IS NULL AND h.scope = 'tenant') THEN
+    PERFORM core.raise_hk('HK_AST_LEGAL_HOLD', 'a tenant-wide legal hold blocks conversation purge');
+  END IF;
+  DELETE FROM assistant.thread
+   WHERE id IN (SELECT t.id FROM assistant.thread t
+                 WHERE t.tenant_id = v_tenant AND t.created_at < v_cutoff
+                   AND NOT assistant.held(t.tenant_id, t.company_id, t.user_id, 'assistant.thread', t.id)
+                 ORDER BY t.created_at LIMIT p_limit);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
+-- حذف دادهٔ شخصی یک کاربر (ErasureHook.apply): همهٔ رشته‌های او و محتوای آبشاری؛ سنجش بی‌محتوا می‌ماند.
+-- توقیف مستأجر یا خود شخص کل درخواست را رد می‌کند؛ رشتهٔ زیر توقیف شرکت یا منبع می‌ماند و فراخوان آن را «مسدود» گزارش می‌کند.
+CREATE OR REPLACE FUNCTION assistant.erase_user_content(p_user uuid, p_limit integer DEFAULT 500) RETURNS integer
+LANGUAGE plpgsql SET hk.assistant_system = 'erasure' AS $$
+DECLARE n integer; v_tenant uuid := core.current_tenant_id();
+BEGIN
+  IF v_tenant IS NULL OR core.current_user_id() IS NOT NULL OR assistant.impersonating() THEN
+    PERFORM core.raise_hk('HK_AST_SYSTEM_ONLY', 'erasure runs only in a system tenant context');
+  END IF;
+  IF assistant.held(v_tenant, NULL, p_user, NULL, NULL) THEN
+    PERFORM core.raise_hk('HK_AST_LEGAL_HOLD', 'a legal hold on the tenant or on this person blocks erasure');
+  END IF;
+  DELETE FROM assistant.thread
+   WHERE id IN (SELECT t.id FROM assistant.thread t
+                 WHERE t.tenant_id = v_tenant AND t.user_id = p_user
+                   AND NOT assistant.held(t.tenant_id, t.company_id, t.user_id, 'assistant.thread', t.id)
+                 ORDER BY t.created_at LIMIT p_limit);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
+-- انقضای پیشنهادهای سررسیده (job، زمینهٔ مستأجرِ بدون کاربر؛ هدف سیستمی 'proposal_expiry' فقط در همین فراخوانی)
+CREATE OR REPLACE FUNCTION assistant.expire_proposals(p_limit integer DEFAULT 500) RETURNS integer
+LANGUAGE plpgsql SET hk.assistant_system = 'proposal_expiry' AS $$
+DECLARE n integer; v_tenant uuid := core.current_tenant_id();
+BEGIN
+  IF v_tenant IS NULL OR core.current_user_id() IS NOT NULL OR assistant.impersonating() THEN
+    PERFORM core.raise_hk('HK_AST_SYSTEM_ONLY', 'proposal expiry runs only in a system tenant context');
+  END IF;
+  UPDATE assistant.proposal SET status = 'expired'
+   WHERE id IN (SELECT x.id FROM assistant.proposal x
+                 WHERE x.tenant_id = v_tenant AND x.status = 'proposed' AND x.expires_at <= now()
+                 ORDER BY x.expires_at LIMIT p_limit FOR UPDATE SKIP LOCKED);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
+-- درون‌ریزی .hkx (ImportHook دستیار؛ نقش migrator، session_replication_role=replica): گفت‌وگوها فقط در جابه‌جایی جایگاه صادر
+-- می‌شوند؛ در هر صدور دیگر اجرای واردشده به رشته‌ای اشاره دارد که نیامده است. این تابع آن اجراها را جدا می‌کند تا
+-- core.import_verify هیچ FK آویزانی نبیند. بیرون از replica معنا ندارد و رد می‌شود.
+CREATE OR REPLACE FUNCTION assistant.import_detach_orphan_runs() RETURNS integer
 LANGUAGE plpgsql AS $$
 DECLARE n integer;
 BEGIN
-  IF core.current_tenant_id() IS NULL OR core.current_user_id() IS NOT NULL THEN
-    PERFORM core.raise_hk('HK_AST_SYSTEM_ONLY', 'purge runs only in a system tenant context');
+  IF current_setting('session_replication_role') <> 'replica' THEN
+    PERFORM core.raise_hk('HK_AST_SYSTEM_ONLY', 'import_detach_orphan_runs runs only inside the .hkx import (replica)');
   END IF;
-  IF p_created_before > now() - interval '1 day' THEN
-    PERFORM core.raise_hk('HK_AST_RETENTION', 'conversation retention is at least one day');
-  END IF;
-  IF EXISTS (SELECT 1 FROM core.legal_hold h WHERE h.tenant_id = core.current_tenant_id() AND h.released_at IS NULL
-              AND (h.scope = 'tenant' OR (h.scope = 'resource' AND h.resource_type = 'assistant.thread'))) THEN
-    PERFORM core.raise_hk('HK_AST_LEGAL_HOLD', 'a legal hold blocks conversation purge');
-  END IF;
-  DELETE FROM assistant.thread
-   WHERE id IN (SELECT id FROM assistant.thread WHERE tenant_id = core.current_tenant_id() AND created_at < p_created_before
-                 ORDER BY created_at LIMIT p_limit);
+  UPDATE assistant.run r SET thread_id = NULL
+   WHERE r.thread_id IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM assistant.thread t WHERE t.tenant_id = r.tenant_id AND t.id = r.thread_id);
   GET DIAGNOSTICS n = ROW_COUNT;
   RETURN n;
 END $$;
@@ -1552,7 +1990,6 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO core.setting_def (key, module, value_type, enum_values, min_value, max_value, json_schema, allowed_levels, default_value,
                               read_permission, write_permission, description_key, introduced_in) VALUES
-  ('assistant.retention_days',        'assistant', 'int',  NULL, 1, 365, NULL, '{tenant}', '90', NULL, 'assistant.settings.manage', 'setting.assistant.retention_days', '1.0'),
   ('assistant.user_monthly_tokens',   'assistant', 'int',  NULL, 0, 100000000, NULL, '{tenant}', '0', NULL, 'assistant.settings.manage', 'setting.assistant.user_monthly_tokens', '1.0'),
   ('assistant.proposals_enabled',     'assistant', 'bool', NULL, NULL, NULL, NULL, '{tenant,company}', 'true', NULL, 'assistant.settings.manage', 'setting.assistant.proposals_enabled', '1.0'),
   ('assistant.disabled_tools',        'assistant', 'json', NULL, NULL, NULL,
@@ -1581,19 +2018,27 @@ INSERT INTO core.event_subscription (event_type, subscriber) VALUES
   ('assistant.consent.changed', 'uplink')
 ON CONFLICT DO NOTHING;
 
+-- محتوای گفت‌وگو (رشته، پیام، فراخوانی ابزار، پیشنهاد، بازخورد) هرگز «rows» نیست (RV-AST-01): صدور .hkx با app.tenant_id و
+-- بدون کاربر اجرا می‌شود و بسته‌اش را مالک مستأجر دانلود می‌کند. قلاب assistant.conversations محتوا را فقط در صدور
+-- move_placement کارمند پلتفرم (بستهٔ غیرقابل دانلود بین سلول‌ها) می‌نویسد، با hk.assistant_system='placement_move:<export_id>'
+-- که owner_visible آن را با core.tenant_export می‌سنجد؛ در هر صدور دیگر (پشتیبان، خروج، On-prem، آرشیو) گفت‌وگو صادر
+-- نمی‌شود و ImportHook اجراها را از رشتهٔ نیامده جدا می‌کند (assistant.import_detach_orphan_runs).
 INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, export_order, pii_columns, secret_columns, note) VALUES
   ('assistant','tenant_policy',   'assistant', 'skip', 0,    '{}', '{}', 'placement-specific; re-applied from signed desired state or license on the target'),
   ('assistant','tenant_provider', 'assistant', 'hook', 8000, '{}', '{api_key_sealed}', 'assistant.reseal hook re-seals the API key with the target KeyManager'),
   ('assistant','consent',         'assistant', 'rows', 8010, '{signer_full_name}', '{}', NULL),
   ('assistant','usage_period',    'assistant', 'rows', 8020, '{}', '{}', NULL),
-  ('assistant','thread',          'assistant', 'rows', 8030, '{title}', '{}', NULL),
+  ('assistant','thread',          'assistant', 'hook', 8030, '{title}', '{}', 'assistant.conversations: content only for a staff move_placement export; never in a tenant-downloadable package'),
   ('assistant','run',             'assistant', 'rows', 8040, '{}', '{}', NULL),
   ('assistant','llm_call',        'assistant', 'rows', 8050, '{}', '{}', NULL),
-  ('assistant','message',         'assistant', 'rows', 8060, '{content}', '{}', NULL),
-  ('assistant','tool_call',       'assistant', 'rows', 8070, '{args,result}', '{}', NULL),
-  ('assistant','proposal',        'assistant', 'rows', 8080, '{payload,validation}', '{}', NULL),
-  ('assistant','feedback',        'assistant', 'rows', 8090, '{comment}', '{}', NULL)
-ON CONFLICT DO NOTHING;
+  ('assistant','message',         'assistant', 'hook', 8060, '{content}', '{}', 'assistant.conversations (see thread)'),
+  ('assistant','tool_call',       'assistant', 'hook', 8070, '{args,result}', '{}', 'assistant.conversations (see thread)'),
+  ('assistant','proposal',        'assistant', 'hook', 8080, '{payload,validation}', '{}', 'assistant.conversations (see thread)'),
+  ('assistant','feedback',        'assistant', 'hook', 8090, '{comment}', '{}', 'assistant.conversations (see thread)')
+ON CONFLICT (schema_name, table_name) DO UPDATE
+  SET mode = EXCLUDED.mode, export_order = EXCLUDED.export_order, pii_columns = EXCLUDED.pii_columns,
+      secret_columns = EXCLUDED.secret_columns, note = EXCLUDED.note
+  WHERE core.export_table_registry.module = 'assistant';
 
 -- =====================================================================
 -- ۱۷. دسترسی‌ها (کمینه)
@@ -1602,7 +2047,9 @@ GRANT SELECT ON assistant.data_class, assistant.purpose, assistant.proposal_kind
                 assistant.prompt_suggestion TO hk_app, hk_readonly;
 GRANT SELECT, INSERT, UPDATE ON assistant.tenant_policy, assistant.tenant_provider, assistant.consent, assistant.proposal TO hk_app;
 GRANT SELECT, INSERT, DELETE ON assistant.usage_period TO hk_app;
-GRANT UPDATE (token_limit, cost_limit, limit_source) ON assistant.usage_period TO hk_app;
+-- ستون‌های سقف (همگام‌سازی سیاست و تنظیم) و شمارنده‌ها (فقط از تریگر سنجش llm_call با hk_app؛ usage_period_guard بقیه را رد می‌کند)
+GRANT UPDATE (token_limit, cost_limit, limit_source, tokens_in_flight, tokens_charged, cost_in_flight, cost_charged, calls, calls_in_flight)
+  ON assistant.usage_period TO hk_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON assistant.thread, assistant.run, assistant.llm_call, assistant.feedback TO hk_app;
 GRANT SELECT, INSERT ON assistant.message, assistant.tool_call TO hk_app;               -- فقط‌افزودنی؛ حذف فقط آبشاری از رشته
 GRANT SELECT ON assistant.v_usage, assistant.v_run_usage, assistant.v_permission_ceiling TO hk_app, hk_readonly;

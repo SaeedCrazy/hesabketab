@@ -12,7 +12,7 @@
 تصمیم‌های اصلی:
 
 1. **یک سند دریافت/پرداخت چندابزاری.** هر سند `money_document` چند ابزار دارد (نقد، کارتخوان، انتقال، کارت‌به‌کارت، چک، خرج چک، درگاه، تنخواه) و چند سطر طرف حساب. ثبت سند یک `PostingRequest` می‌سازد. در commit، جمع ابزارها، جمع طرف‌ها و مبلغ سند با یک قید deferred برابر سنجیده می‌شود.
-2. **زیردفتر تسویهٔ اشخاص (اقلام باز) مال treasury است.** فاکتور فروش و خرید، برگشتی، رسید و پرداخت هر کدام یک «قلم باز» بدهکار یا بستانکارند. تخصیص (`allocation`) یک قلم بدهکار را با یک قلم بستانکار جفت می‌کند. sales، purchase و payroll در DAG بالای treasury هستند، پس اقلام را در همان تراکنش سند خود از راه `OpenItemService.register` ثبت می‌کنند. مبلغ تخصیص‌یافتهٔ هر قلم با قید deferred برابر جمع تخصیص‌های فعال آن نگه داشته می‌شود.
+2. **زیردفتر تسویهٔ اشخاص (اقلام باز) مال treasury است.** فاکتور فروش و خرید، برگشتی، رسید و پرداخت هر کدام یک «قلم باز» بدهکار یا بستانکارند. تخصیص (`allocation`) یک قلم بدهکار را با یک قلم بستانکار جفت می‌کند. sales، purchase و payroll در DAG بالای treasury هستند، پس اقلام را در همان تراکنش سند خود از راه `OpenItemService.register` ثبت می‌کنند. مبلغ تخصیص‌یافتهٔ هر قلم با قید deferred برابر جمع تخصیص‌های فعال آن نگه داشته می‌شود. treasury زیردفتر `party` را در `ledger.subledger_source` ثبت می‌کند، پس ماندهٔ دریافتنی و پرداختنی هر شخص در هر تاریخ با GL تطبیق می‌شود (INV-TRS-18). تسعیر تحقق‌یافته در تسویهٔ ارزی (INV-TRS-19) و سوخت مطالبات با تأیید (INV-TRS-20) در v1 هستند.
 3. **چک = رکورد + دفتر رویداد فقط‌افزودنی.** وضعیت حسابداری چک فقط با درج رویداد عوض می‌شود. گذارهای مجاز در کاتالوگ `cheque_transition` هستند: ردیف‌های جدول پژوهش ۰۵ عیناً (R1..R14 با R3' و R5'، و P1..P7)، به‌اضافهٔ گذارهای ضمانت، ورود مهاجرت و چند افزودهٔ مستند. قالب سند هر گذار داده است و حساب‌ها از قواعد نگاشت ledger می‌آیند. هر رویداد «محل نگهداری ارزش چک» را نگه می‌دارد، پس زیردفتر چک مستقل از دفتر کل محاسبه و با `ledger.check_control_accounts` تطبیق داده می‌شود.
 4. **بُعد صیاد جداست.** این بُعد فقط رو به جلو حرکت می‌کند. رنگ اعتباری فقط از استعلام ثبت‌شده می‌آید. کاتالوگ رنگ‌ها داده‌محور و بدون آستانه است. حساب‌کتاب چک را در صیاد ثبت یا منتقل نمی‌کند (OTP روی سیم‌کارت شخص لازم است) و فقط رخداد، وضعیت و یادآور نگه می‌دارد. یکتایی شناسهٔ صیاد فقط بین چک‌های «فعال» است.
 5. **صورتحساب بانک و مغایرت‌گیری:**
@@ -38,7 +38,7 @@
 8. **صندوق:**
    - رسید (`pos.ticket`) تغییرناپذیر است و **فقط** از یک فرمان امضاشدهٔ ذخیره‌شده ساخته می‌شود (FK به `device_command`).
    - جمع‌ها، پرداخت‌ها، سقف مرجوعی و سقف تقسیم صورتحساب در commit سنجیده می‌شوند.
-   - صندوق هرگز سند حسابداری نمی‌سازد. pos در DAG به ledger وابسته نیست.
+   - صندوق هرگز سند حسابداری نمی‌سازد. pos در DAG به ledger وابسته نیست (کد `pos` هرگز `ledger` را import نمی‌کند، INV-POS-14). تنها ارجاع پایگاه داده‌ای `pos.cash_movement.posting_key → ledger.posting_key` است که فقط وجود کد را در کاتالوگ سراسری تضمین می‌کند و استثنای برچسب‌دار R-XFK بند ۵ است (`fk_cash_movement__ledger_posting_key`، RV-ARCH-08).
    - فروش از راه سرویس فروش (`sales`) و دریافت از راه سرویس خزانه ثبت می‌شود. کسری و اضافهٔ صندوق را treasury ثبت می‌کند.
 9. **پروتکل آفلاین:**
    - هر فرمان این‌ها را دارد: `cmd_id` (UUIDv7)، `device_seq` پیوسته، `prev_hash`، بدنهٔ کانونی ذخیره‌شده، و امضای ۶۴ بایتی.
@@ -51,9 +51,9 @@
     - مهلت ۷ روزهٔ مؤدیان پارامتر قواعد است. هشدار پیش از روز ششم هم روی دستگاه و هم در سرور (برای دستگاه همگام‌نشده) داده می‌شود.
 
 **اندازه:**
-- **SQL:** ۶۹ جدول (۶۲ مستأجری و ۷ کاتالوگ)، ۲ جدول مرجع `ref`، ۶۹ تابع، ۱۳۹ تریگر و ۵ ویو.
-- **ناوردایی‌ها:** ۹۲ ناوردایی شماره‌دار: ۷۰ با سد پایگاه داده‌ای و آزمون SQL سبز، یکی با `core.security_lint()`، و ۲۱ سرویسی، کلاینتی یا CI.
-- **آزمون پایگاه داده:** ۳۰۴ ادعا در ۲۶ گروه (T00 تا T24). هر کد خطای `HK_*` این فایل (۱۰۸ کد) دست‌کم یک آزمون منفی با الگوی دقیق دارد. آزمون روی PostgreSQL 18.7 سبز است.
+- **SQL:** ۷۱ جدول (۶۴ مستأجری و ۷ کاتالوگ)، ۲ جدول مرجع `ref`، ۸۳ تابع، ۱۷۴ تریگر (با تریگرهای قید deferred) و ۵ ویو.
+- **ناوردایی‌ها:** ۱۰۰ ناوردایی شماره‌دار: ۷۸ با سد پایگاه داده‌ای و آزمون SQL سبز، یکی با `core.security_lint()`، و ۲۱ سرویسی، کلاینتی یا CI.
+- **آزمون پایگاه داده:** ۴۷۵ ادعا در ۳۵ گروه (T00 تا T24 و T30 تا T38، با همروندی واقعی دو نشستی در T34). هر کد خطای `HK_*` این فایل (۱۳۰ کد) دست‌کم یک آزمون منفی با الگوی دقیق دارد. آزمون روی PostgreSQL 18.7 سبز است و جهش‌های هدفمند را می‌کشد (§۹-۱).
 
 ## ۲. دامنه
 
@@ -87,7 +87,7 @@
 | پرداخت اشتراک SaaS و کیف پول پیامک مستأجر | بخش پلتفرم مالک (پایگاه دادهٔ کنترل). از همین رابط `PaymentGateway` استفاده می‌کند |
 | پرداخت حقوق | بخش حقوق. دستور پرداخت از راه `MoneyDocumentService` ساخته می‌شود |
 | نگاشت چک‌ها و مانده‌ها از هلو، سپیدار و حسابفا | بخش مهاجرت. نقطهٔ ورود: `ChequeImportService` (§۵-۳) |
-| KDS، QR و کیوسک، اسنپ‌فود، باشگاه مشتریان | v2؛ اسکیمای این بخش برای آن‌ها جا دارد (§۱۰) |
+| KDS، منوی QR و کیوسک، کانال‌های سفارش بیرونی از نوع اسنپ‌فود، کیف پول مشتری، باشگاه مشتریان و کارت هدیه | v2 (§۱۰، هم‌خوان با ۰۵ §۱۰ و پژوهش V2-05). مالک‌ها در §۱۰ آمده‌اند. «تخفیف عضویت» v1 از قاعدهٔ قیمت گروه مشتری بخش ۰۵ است، نه از این بخش |
 
 ## ۳. تصمیم‌های طراحی
 
@@ -133,13 +133,14 @@
   - **ستون‌های چک:** `treasury.cheque` ستون‌های ثابت (مبلغ، صیاد، سررسید، طرفین) و ستون‌های وضعیت دارد: `state`، `last_event_seq`، `collected_amount`، `deposit_bank_account_id`، `endorsee_party_id` و `is_long_term`.
   - **تغییر وضعیت:** ستون‌های وضعیت فقط با درج `cheque_event` عوض می‌شوند. تریگر `trg_apply` آن‌ها را از مقادیر «پس از» رویداد می‌نویسد. تریگر `cheque_before_write` هر به‌روزرسانی دیگری را رد می‌کند (`HK_CHQ_STATE_VIA_EVENT`).
   - **گذارهای مجاز:** ردیف‌های `treasury.cheque_transition` هستند.
-    - کاتالوگ ۵۱ ردیف دارد.
-    - ردیف‌های برگرفته از پژوهش ۰۵ با `is_research_row = true` (۳۸ ردیف):
+    - کاتالوگ ۵۵ ردیف دارد (۵۱ ردیف نسخهٔ نخست + R2B، R2C، R2D و R7PC در بازبینی؛ RV-X2-02، RV-TP-23).
+    - ردیف‌های برگرفته از پژوهش ۰۵ با `is_research_row = true` (۳۵ ردیف):
       - جدول گذارها (۲۶ ردیف): R1، R2، R3، R3B (=R3')، R4، R5، R5B (=R5')، R6، R7، R8، R9، R10، R11، R12، R13 (به ازای هر وضعیت مبدأ یک ردیف: R13A..F)، R14، و P1، P2، P3، P4، P7. P5 و P6 گذار «برگ دسته‌چک»‌اند (§۵-۵).
-      - چک تضمینی G1..G6 و ورود مهاجرت IMP_* (۱۲ ردیف) از بخش‌های ضمانت و مهاجرت همان پژوهش.
-    - افزوده‌ها با `is_research_row = false` (۱۳ ردیف):
+      - چک تضمینی G1..G3 و ورود مهاجرت IMP_* (۹ ردیف) از بخش‌های ضمانت و مهاجرت همان پژوهش. G4..G6 (ضمانت صادره) انحراف مستند از متن پژوهش‌اند و `is_research_row = false` دارند (RV-TP-25).
+    - افزوده‌ها با `is_research_row = false` (۲۰ ردیف: G4..G6 و ۱۷ ردیف زیر):
       - R6B/C، R7B/C و R8B/C: اعمال R6، R7 و R8 روی «وصول بخشی» و «برگشت از ثالث».
-      - R7P و R7PB: تسویهٔ قسطی چک برگشتی (مبلغ کمتر از مانده؛ چک در همان وضعیت می‌ماند و مانده کم می‌شود).
+      - R7P، R7PB و R7PC: تسویهٔ قسطی چک برگشتی، وصول بخشی و برگشت از ثالث (مبلغ کمتر از مانده؛ چک در همان وضعیت می‌ماند و مانده کم می‌شود؛ RV-TP-23).
+      - R2B، R2C و R2D: ارائهٔ دوبارهٔ چک دریافتی برگشتی، وصول بخشی یا برگشت از ثالث به بانک (RV-X2-02).
       - X2: پاس شدن پس از برگشت (ارائهٔ دوباره).
       - X4: عودت برگ برگشتی پس از تسویهٔ دیگر.
       - XC1: ابطال ثبت چک پرداختی، قرینهٔ R13.
@@ -209,7 +210,8 @@
 ### D-T08 — چک تضمینی فقط در حساب‌های انتظامی
 - **تصمیم:**
   - `purpose='guarantee'` فقط گذارهای G* را می‌پذیرد (`HK_CHQ_TRANSITION_KIND`). قالب‌های این گذارها فقط کلیدهای `treasury.guarantee_*` با نوع مورد انتظار `{memo}` دارند (آزمون T01). D-L16 بخش ۰۳ هم تراز انتظامی را جدا اجبار می‌کند.
-  - به اجرا گذاشتن ضمانت (G3 یا G6) ثبت انتظامی را برمی‌گرداند و یک چک «پرداخت» تازه می‌سازد. این چک با `converted_from_cheque_id` به ضمانت پیوند دارد و با R1 یا P1 روی مبلغ مطالبه ثبت می‌شود.
+  - به اجرا گذاشتن ضمانت (G3 یا G6) ثبت انتظامی را برمی‌گرداند و یک چک «پرداخت» تازه می‌سازد. این چک با `converted_from_cheque_id` به ضمانت پیوند دارد و با R1 یا P1 روی مبلغ مطالبه ثبت می‌شود. ضمانت اجراشده دیگر در یکتایی صیاد شمرده نمی‌شود (`sayad_unique=false`) و در ضمانت صادره، برگ دسته‌چک همان برگ چک تبدیل‌شده می‌ماند؛ پایگاه داده می‌سنجد که مبدأ ضمانتِ enforced با همان جهت، صیاد و برگ باشد (`HK_CHQ_CONVERSION`؛ RV-TP-06). undo اجرای ضمانت فقط پس از ابطال چک تبدیل‌شده ممکن است.
+  - **انحراف مستند از متن پژوهش (RV-TP-25):** پژوهش ۰۵ §۲-۲-۳ برای ضمانت صادره «بدهکار طرف اسناد تضمینی پرداختی / بستانکار اسناد تضمینی پرداختی» می‌گوید. G4، G5 و G6 عمداً برعکس‌اند، چون حساب نگهداری زیردفتر (8102، `guarantee_given`) در قالب ledger مثل 8101 ماهیت بدهکار دارد و `check_control_accounts` ماندهٔ هم‌علامت می‌خواهد. جمع و افشای انتظامی تغییر نمی‌کند. این سه ردیف `is_research_row=false` دارند.
 - **مرجع:** [۰۵ §۲-۲-۲ (چک ضمانت)](../research/05-iran-banking-cheques-payments.md#۲-۲-۲-چک-دریافتی)، [۰۳ D-L16](03-ledger.md#d-l16--حسابهای-انتظامی)
 
 ### D-T09 — زیردفتر چک مستقل از GL و تطبیق‌پذیر
@@ -353,7 +355,8 @@
     - تریگر برابری هر ستون با بدنه.
     - تریگر `device_seq = head+1` و `prev_hash = head.hash`. سر زنجیره در `device_sync_state` است و با `FOR UPDATE` قفل می‌شود.
     - «hash آغاز» = `sha256('hk-pos-genesis:v1:' || device_id)`.
-    - دستگاه فعال باشد، یا فرمان پیش از ابطال آن رخ داده باشد.
+    - دستگاه فعال باشد. برای دستگاه باطل یا گم‌شده (RV-TP-01): `occurred_at` را خود دستگاه امضا می‌کند و سد امنیتی **نیست**. فرمان فقط وقتی پذیرفته می‌شود که `device_seq ≤ device_sync_state.accept_through_seq` باشد (سقفی که مدیر پس از شمارش رسیدهای همگام‌نشدهٔ دستگاه، با دلیل و یک‌بار، اعلام می‌کند؛ `HK_SYNC_ACCEPT_BOUND`) و پیش از `revoked_at` تاریخ خورده باشد. چنین فرمانی پرچم `after_revocation` می‌گیرد و فقط از راه بازبینی حل‌شده اعمال می‌شود (`HK_SYNC_REVIEW_REQUIRED`). بی‌سقف، هیچ فرمانی از دستگاه باطل پذیرفته نمی‌شود.
+    - رسید باید همان payload امضاشده باشد (RV-TP-21): `id` و `occurred_at` رسید = `payload.ticket_id` و `occurred_at` فرمان؛ `subtotal`، `tax_total`، `tip_amount`، `total`، تعداد سطر و پرداخت و جمع پرداخت‌ها = رشته‌های دهدهی payload (`HK_POS_TICKET_PAYLOAD`).
     - الگوریتم امضا با کلید دستگاه یکی باشد.
   - **امضا:** سرویس امضا را با کلید عمومی `core.device` می‌سنجد و بعد درج می‌کند. ابزار ممیزی `pos.verify_device_chain` زنجیره را مستقل می‌سنجد.
   - **نتیجهٔ پردازش:** در `command_outcome` است و تریگر آن را هم‌زمان با فرمان «pending» می‌سازد.
@@ -447,7 +450,7 @@
 ### D-T30 — مؤدیان در صندوق آفلاین: حافظه یا بازهٔ رزرو برای هر دستگاه، هشدار پیش از روز ششم
 - **تصمیم:**
   - **ساخت taxid:** taxid آفلاین روی دستگاه ساخته می‌شود. یا با حافظهٔ جدای دستگاه (`device_memory`)، یا با سریال از بازهٔ رزروشدهٔ `core.number_reservation` روی سری مالیاتی (`reserved_range`). سریال سوخته با `tax.serial_voided` اعلام می‌شود.
-  - **مهلت:** «مهلت ارسال» پارامتر قواعد است (`tax.moadian.offline_submit_deadline_days`؛ مالک: بخش مالیات). هرگز ثابت کد نیست.
+  - **مهلت:** «مهلت ارسال» پارامتر قواعد است (`tax.moadian.send_deadline_days`؛ مالک: بخش مالیات، همان پارامتر سرور و صندوق؛ CR-CMP-05). هرگز ثابت کد نیست.
   - **هشدار روی دستگاه:** وقتی قدیمی‌ترین صورتحساب ارسال‌نشده به «مهلت − `pos.tax.warn_before_deadline_h`» برسد (پیش‌فرض ۲۴ ساعت، یعنی روز ششم)، دستگاه هشدار مسدودکننده می‌دهد: «اتصال برقرار کنید».
   - **هشدار سرور:** job `pos.tax.deadline_watch` برای دستگاهی که `last_cmd_received_at` آن از همان آستانه گذشته، اعلان اجباری `pos.tax_deadline` می‌فرستد، چون سرور فروش همگام‌نشده را نمی‌بیند.
 - **مرجع:** [۰۳ §۳-۱ بند ۴](../research/03-iran-tax-and-legal.md#۳-۱-معماری-ماژول-مالیات-tax--compliance)، [README بند ۶](../research/README.md#الف-پلتفرم-و-زیرساخت)
@@ -548,7 +551,7 @@ erDiagram
 | `ref.sayad_credit_status` | برچسب رنگ‌های صیاد: سفید، زرد، نارنجی، قهوه‌ای، قرمز و «نمایش داده نشد». ستون‌ها: `severity` (فقط ترتیب)، منبع، اطمینان (`low`) و نسخهٔ داده. **هیچ آستانهٔ تعداد یا مبلغی ندارد.** به‌روزرسانی فقط با migration یا بستهٔ امضاشده (C-05 بخش ۰۱) |
 | `ref.psp` | شرکت‌های PSP و خدمات آن‌ها (`card_pos`، `ipg`). کد همان نام درایور در integrations است |
 | `treasury.cheque_state` | وضعیت‌ها به ازای (جهت، کاربرد)، با `is_holding`، `is_terminal` و `sayad_unique`. CHECK: وضعیت «نزد ما» نهایی نیست |
-| `treasury.cheque_transition` | ۵۱ گذار (۳۸ ردیف برگرفته از پژوهش و ۱۳ افزودهٔ مستند) با ستون‌های `code`، جهت، کاربرد، `from_state` (NULL = ایجاد)، `to_state`، `op`، `requires_journal`، `amount_rule`، `requires_fund`، `requires_counterparty`، `journal_template`، مرجع پژوهش و `is_research_row`. FK وضعیت‌ها به `cheque_state`. ایندکس یکتای شکل `(direction, purpose, from, to, op)`. CHECK: «سنددار ⇔ قالب ≥ ۲ سطر» |
+| `treasury.cheque_transition` | ۵۵ گذار (۳۵ ردیف برگرفته از پژوهش و ۲۰ افزوده یا انحراف مستند) با ستون‌های `code`، جهت، کاربرد، `from_state` (NULL = ایجاد)، `to_state`، `op`، `requires_journal`، `amount_rule`، `requires_fund`، `requires_counterparty`، `journal_template`، مرجع پژوهش و `is_research_row`. FK وضعیت‌ها به `cheque_state`. ایندکس یکتای شکل `(direction, purpose, from, to, op)`. CHECK: «سنددار ⇔ قالب ≥ ۲ سطر» |
 | `treasury.gateway_provider` | رجیستری آداپترهای درگاه. ستون‌ها: نوع (PSP بانکی یا پرداخت‌یار)، `psp_code`، **واحد مبلغ API** (`IRR` یا `IRT`)، مهلت verify، نیاز به settle (ملت)، پشتیبانی استعلام و بازپرداخت، وضعیت (`active`/`deprecated`/`blocked` با یادداشت اجباری)، منبع و اطمینان. آیدی‌پی `blocked` است |
 | `treasury.statement_header_synonym` | فرهنگ مترادف سرستون: (فیلد استاندارد، مترادف نرمال‌شده با `core.fa_search_key`، وزن). بذر از پژوهش ۰۵ §۲-۳-۲ |
 | `treasury.statement_keyword` | الگوهای شرح برای طبقه‌بندی تراکنش (پایا، ساتنا، پل، کارت‌به‌کارت، شاپرک، چک، کارمزد، سود، ...) با کلید نگاشت پیشنهادی. بذر در بستهٔ دادهٔ پنل مالک |
@@ -570,13 +573,14 @@ erDiagram
 | جدول | توضیح |
 |---|---|
 | `treasury.money_document` | سند دریافت یا پرداخت. ستون‌ها:<br>• **هویت:** جهت، تاریخ، شخص اصلی (اختیاری)، ارز، `total_amount > 0`، شعبه.<br>• **وضعیت:** draft/posted/cancelled.<br>• **شماره:** `number_issued_id` (یکتا) و `doc_no`.<br>• **اسناد حسابداری:** `journal_id` و `cancel_journal_id` (FK سه‌ستونی به `ledger.journal`).<br>• **مبدأ:** `origin` (manual، pos، gateway، statement، migration، payroll، api، petty_cash، assistant)، `origin_ref` و `input_amount_unit` (برای api و migration اجباری).<br>• `approval_request_id`.<br><br>CHECKها: ستون‌های ثبت و لغو با وضعیت؛ برای مبدأ خودکار `origin_ref` اجباری. ایندکس یکتای `(origin, origin_ref)` روی اسناد زنده. تریگر `money_document_guard`: پیش‌نویس آزاد است (لغو ممنوع، حذف مجاز). ثبت‌شده فقط ← لغو و بقیهٔ ستون‌ها ثابت. لغوشده نهایی. قید deferred `money_document_check`: سند ثبت‌شده ≥۱ ابزار و ≥۱ طرف دارد، جمع هر دو = مبلغ، و ابزار چک به رکورد چک اشاره دارد |
-| `treasury.money_instrument` | ابزار. ستون‌ها:<br>• `kind`.<br>• **یکی از** `cash_box_id`، `bank_account_id`، `card_terminal_id`، `gateway_payment_id`، `cheque_id`/`cheque_draft` یا `petty_cash_fund_id` (CHECK `instrument_shape`).<br>• `transfer_method`: پایا، ساتنا، پل، داخلی یا کارت‌به‌کارت.<br>• کد رهگیری، RRN و STAN (رشته)، کارت ماسک.<br>• شبا و کارت ماسک طرف.<br>• `card_txn_id`، کارمزد انتقال.<br><br>تریگر `money_line_guard`: فقط در پیش‌نویس. نوع ابزار با جهت سند بخواند: دریافت بدون تنخواه و خرج چک؛ پرداخت بدون کارتخوان و درگاه. درگاه فقط با پرداخت verify‌شدهٔ هم‌مبلغ و هم‌شرکت. چک با مبلغ، شرکت و جهت درست. هر پرداخت درگاه یک ابزار |
-| `treasury.money_counter_line` | طرف دیگر سند. ستون‌ها:<br>• `kind`: `party` (حساب طبق نقش: customer → `sales.receivable`، supplier → `purchase.payable`، employee → `payroll.salary_payable`، other → `treasury.other_*` طبق قاعده)، `party_advance` (پیش‌دریافت یا پیش‌پرداخت)، `account` (کلید یا حساب صریح) یا `bounced_cheque` (تسویهٔ چک برگشتی؛ چک باید برگشتی باشد).<br>• مرکز هزینه و پروژه.<br><br>CHECK شکل |
-| `treasury.open_item` | قلم باز. ستون‌ها:<br>• شرکت، شعبه، شخص، نقش، `account_class`، `direction`.<br>• **مبدأ:** ماژول، نوع و شناسهٔ سند، شماره، `source_line_key` (برای قسط).<br>• تاریخ سند و سررسید (≥ تاریخ سند).<br>• ارز، مبلغ، مبلغ پایه، `allocated_amount`، وضعیت، `journal_id`.<br><br>یکتا: یک قلم زنده به ازای هر سطر مبدأ. تریگر `open_item_guard`: هویت و مبلغ ثابت؛ وضعیت open/closed از تخصیص مشتق؛ لغو فقط بدون تخصیص؛ لغو نهایی. قید deferred `open_item_check`: `allocated_amount` = جمع تخصیص‌های فعال |
-| `treasury.allocation` | تخصیص. ستون‌ها: قلم بدهکار و بستانکار، مبلغ، ارز، تاریخ، `kind ∈ normal, offset` (تهاتر سند می‌خواهد)، `journal_id`، منبع، وضعیت (active ← reversed با دلیل).<br><br>تریگر `allocation_guard` (قفل دو قلم به ترتیب شناسه): جهت‌ها درست، هر دو باز، هم‌شرکت، هم‌ارز، شخص مؤثر یکسان (پس از ادغام)، هم‌کلاس (یا تهاتر بین دو کلاس)، و تجاوز نکردن از ماندهٔ هیچ‌کدام. تریگر `allocation_apply` مبلغ تخصیص‌یافتهٔ دو قلم را به‌روز می‌کند. حذف ممنوع |
+| `treasury.money_instrument` | ابزار. ستون‌ها:<br>• `company_id` (از سند؛ تریگر) و همهٔ FKهای منبع وجه سه‌ستونی «همان شرکت» (RV-TP-07).<br>• `kind`.<br>• **یکی از** `cash_box_id`، `bank_account_id`، `card_terminal_id`، `gateway_payment_id`، `cheque_id`/`cheque_draft` یا `petty_cash_fund_id` (CHECK `instrument_shape`).<br>• `transfer_method`: پایا، ساتنا، پل، داخلی یا کارت‌به‌کارت.<br>• کد رهگیری، RRN و STAN (رشته)، کارت ماسک.<br>• شبا و کارت ماسک طرف.<br>• `card_txn_id`، کارمزد انتقال.<br><br>تریگر `money_line_guard`: فقط در پیش‌نویس. نوع ابزار با جهت سند بخواند: دریافت بدون تنخواه و خرج چک؛ پرداخت بدون کارتخوان و درگاه. درگاه فقط با پرداخت verify‌شدهٔ هم‌مبلغ و هم‌شرکت. چک با مبلغ، شرکت و جهت درست. ارز منبع وجه = ارز سند (`HK_TRS_CURRENCY_MISMATCH`). هر پرداخت درگاه حداکثر یک ابزار در سند **زنده** (سند لغوشده جای رسید اصلاحی را نمی‌گیرد؛ RV-TP-17). متن آزاد (مرجع، شرح، کد رهگیری) شمارهٔ کارت کامل نمی‌پذیرد (`treasury.contains_pan`؛ INV-TRS-02) |
+| `treasury.money_counter_line` | طرف دیگر سند. ستون‌ها:<br>• `kind`: `party` (حساب طبق نقش: customer → `sales.receivable`، supplier → `purchase.payable`، employee → `payroll.salary_payable`، other → `treasury.other_*` طبق قاعده)، `party_advance` (پیش‌دریافت یا پیش‌پرداخت)، `account` (کلید یا حساب صریح) ، `bounced_cheque` (تسویهٔ چک برگشتی یا برگشت‌خورده از دست سوم؛ RV-TP-23) . همهٔ سطرها مثبت‌اند؛ اضافهٔ گرد کردن نقدی صندوق سطر `account` با `treasury.cash_over_short` است (۰۵ D-C30؛ RV-X2-14).<br>• `company_id` از سند؛ حساب و چک «همان شرکت».<br>• مرکز هزینه و پروژه.<br><br>CHECK شکل |
+| `treasury.open_item` | قلم باز. ستون‌ها:<br>• شرکت، شعبه، شخص، نقش، `account_class`، `direction`.<br>• **مبدأ:** ماژول، نوع و شناسهٔ سند، شماره، `source_line_key` (برای قسط).<br>• تاریخ سند و سررسید (≥ تاریخ سند).<br>• ارز، مبلغ، مبلغ پایه، `allocated_amount`، وضعیت (open، closed، cancelled)، `journal_id`.<br>• `account_id`: حساب کنترل (همان شرکت) که سند مبدأ برای این شخص ثبت کرده؛ اگر ندهند تریگر از سند حل می‌کند (RV-IT2-04).<br>• `cancel_date`: تاریخ دفتری ابطال برای زیردفتر در تاریخ.<br><br>یکتا: یک قلم زنده به ازای هر سطر مبدأ. تریگر `open_item_guard`: هویت و مبلغ ثابت؛ وضعیت open/closed از تخصیص مشتق؛ لغو فقط بدون تخصیص؛ لغو نهایی. قید deferred `open_item_check`: `allocated_amount` = جمع تخصیص‌های فعال؛ و سند مبدأ حساب قلم را برای همان شخص و سمت ثبت کرده است (`HK_TRS_OPEN_ITEM_ACCOUNT`) |
+| `treasury.allocation` | تخصیص. ستون‌ها: قلم بدهکار و بستانکار، مبلغ، ارز، تاریخ، `kind ∈ normal, offset` (تهاتر سند می‌خواهد)، `journal_id`، منبع (`manual`، `auto`، `payment`، `gateway`، `pos`، `write_off`، ...)، وضعیت (active ← reversed با دلیل، `reverse_date` و `reverse_journal_id`).<br>• **پایه (RV-X3-01):** `debit_base` و `credit_base` (پایهٔ مصرف‌شدهٔ هر قلم؛ تریگر) و `fx_diff_base` (تولیدی = بستانکار − بدهکار). تفاوت ≠ ۰ یا دو حساب کنترل متفاوت سند می‌خواهد (`HK_TRS_ALLOC_FX_JOURNAL`، `HK_TRS_ALLOC_ACCOUNT`).<br><br>تریگر `allocation_guard` (قفل دو قلم به ترتیب شناسه): جهت‌ها درست، هر دو باز، هم‌شرکت، هم‌ارز، شخص مؤثر یکسان (پس از ادغام)، هم‌کلاس (یا تهاتر بین دو کلاس)، و تجاوز نکردن از ماندهٔ هیچ‌کدام. تریگر `allocation_apply` مبلغ تخصیص‌یافتهٔ دو قلم را به‌روز می‌کند. حذف ممنوع |
 | `treasury.fund_transfer` | انتقال وجه. ستون‌ها:<br>• یک مبدأ و یک مقصد از سه نوع (CHECK)، نه خودش (CHECK)، ارز یکسان (تریگر).<br>• `purpose`: transfer، deposit_cash، withdraw_cash، petty_replenish (مقصد تنخواه)، pos_drop، pos_float.<br>• `transfer_method`، کد رهگیری، کارمزد.<br>• `via_in_transit`، تاریخ دریافت.<br>• وضعیت draft/sent/posted/cancelled.<br>• سه سند (ارسال، دریافت، لغو) و شماره.<br><br>تریگر: پس از draft فقط تکمیل یا لغو. یکتایی مبدأ خودکار |
 | `treasury.cash_count` | شمارش نقد. ستون‌ها: صندوق، زمان، تاریخ کاری، مورد انتظار، شمارش‌شده، `difference` (تولیدی)، اسکناس‌ها `[{value: رشتهٔ اعشاری, qty}]` (جمع = شمارش‌شده)، منبع (`pos_shift` با `source_ref` = شیفت؛ یکتا)، وضعیت.<br><br>CHECK: ثبت‌شده با اختلاف ≠ ۰ سند دارد. ثبت‌شده تغییرناپذیر |
-| `treasury.petty_cash_claim` و `petty_cash_claim_line` | صورت‌خرج تنخواه و سطرها. سطر: تاریخ هزینه، شرح، مبلغ، ارزش افزوده، **یکی از** کلید یا حساب، مرکز هزینه، پروژه، فروشنده، پیوست رسید.<br><br>CHECKها: ستون‌های ارسال، تأیید، ثبت و رد با وضعیت؛ `approved_by ≠ submitted_by`. تریگر: گذارها، و تغییرناپذیری پس از بسته شدن (جز پیوند جایگزینی، یک‌بار). سطرها فقط در پیش‌نویس. قید deferred: جمع سطرها = مبلغ از submitted به بعد |
+| `treasury.petty_cash_claim` و `petty_cash_claim_line` | صورت‌خرج تنخواه و سطرها. سطر: تاریخ هزینه، شرح، مبلغ، ارزش افزوده، **یکی از** کلید یا حساب، مرکز هزینه، پروژه، فروشنده، پیوست رسید؛ `vat_treatment` (`expense` یا `input_credit`)، `seller_taxid`، `tax_invoice_taxid` و `tax_purchase_entry_id` (RV-TP-10).<br><br>CHECKها: ستون‌های ارسال، تأیید، ثبت و رد با وضعیت؛ `approved_by ≠ submitted_by`؛ اعتبار ارزش افزوده فقط با شناسهٔ مالیاتی فروشنده و صورتحساب. تریگر: گذارها، و تغییرناپذیری پس از بسته شدن (جز پیوند جایگزینی، یک‌بار). سطرها فقط در پیش‌نویس. قید deferred: جمع سطرها = مبلغ از submitted به بعد؛ سطر `input_credit` در صورت‌خرج ثبت‌شده به دفتر خرید مالیاتی پیوند دارد (`HK_TRS_PETTY_VAT_REGISTER`) |
+| `treasury.receivable_write_off` | سوخت مطالبه (RV-X2-06). ستون‌ها: شخص، قلم بدهکار (هدف) و قلم بستانکار (اثر سوخت)، مبلغ، ارز، تاریخ، دلیل (≥ ۱۰ نویسه)، `approval_request_id` با FK چهارستونی به درخواست تأیید `treasury.write_off`، `journal_id`، وضعیت (posted ← reversed با `reverse_journal_id` و دلیل).<br><br>تریگر `write_off_guard`: درخواست تأیید approved، هویت ثابت، برگشت نهایی. قید deferred `write_off_check`: سند منبع `treasury.write_off/<id>`، قلم بستانکار از همان منبع با حساب و شخص قلم هدف، و تخصیص `write_off` فعال تا وقتی سوخت فعال است (`HK_TRS_WRITE_OFF_*`) |
 
 ### ۴-۵. چک
 
@@ -645,9 +649,10 @@ erDiagram
 | جدول | توضیح |
 |---|---|
 | `pos.open_order` | سفارش باز. ستون‌ها: نوع (سالن با میز، بیرون‌بر، پیک با اطلاعات، نگه‌داشته)، وضعیت (open، paid، voided با دلیل)، مهمان، مشتری، گارسون، `version` (هر تغییر +۱؛ تریگر)، آخرین فرمان |
-| `pos.open_order_line` | سطر سفارش. ستون‌ها: SKU و واحد (FK «همان کالا»)، مقدار، قیمت، والد (modifier)، کورس، صندلی، ایستگاه، یادداشت، وضعیت، زمان ارسال، `voided_after_send` (مشتق)، دلیل باطل |
-| `pos.ticket` | رسید. ستون‌ها:<br>• پایانه، شیفت، روز، دستگاه، `cmd_id` (FK به فرمان؛ یکتا)، `created_xact`.<br>• نوع (sale، return، exchange)، نوع سفارش، سفارش و میز.<br>• شماره و `number_issued_id` (یکتا)، رسید اصلی (برای تعویض اجباری، برای فروش ممنوع).<br>• مشتری، فهرست قیمت و نسخهٔ snapshot، قیمت با مالیات.<br>• ارز، روش گرد کردن.<br>• **جمع‌ها (علامت‌دار):** جمع خالص، تخفیف، حق سرویس و نرخ، مالیات، گرد کردن، انعام، کل.<br>• **مالیات:** نسخهٔ قاعدهٔ مالیات، `taxid` (یکتا) و `tax_indatim_ms` (با هم)، حافظه و سند مالیاتی (§۱۲).<br>• زمان‌ها، آفلاین (با نشست)، صندوقدار.<br>• **ثبت:** وضعیت ثبت، سند فروش (§۱۲)، سند دریافت، زمان ثبت.<br><br>CHECK علامت (فروش ≥ ۰، مرجوعی ≤ ۰). ایندکس‌ها برای صف ثبت |
-| `pos.ticket_line` | سطر رسید. ستون‌ها:<br>• جهت (فروش یا برگشت)، SKU و واحد، مقدار > ۰، قیمت.<br>• منبع قیمت (فهرست، دستی، قیمت باز، modifier، صفر)، قیمت فهرست دستگاه و سرور (برای اختلاف قیمت).<br>• ناخالص، تخفیف، خالص (= ناخالص − تخفیف)، مالیات، دستهٔ مالیاتی.<br>• والد، کورس، صندلی، ایستگاه، سطر سفارش، سطر اصلی (فقط برگشت) |
+| `pos.open_order_line` | سطر سفارش. ستون‌ها: SKU و واحد (FK «همان کالا»)، مقدار، قیمت، والد (modifier)، کورس، صندلی، ایستگاه، یادداشت، وضعیت، زمان ارسال، `voided_after_send` (مشتق)، دلیل باطل، `billed_qty` (شمارندهٔ صورتحساب تقسیمی زیر قفل ردیف؛ ≤ مقدار؛ RV-TP-02) |
+| `pos.ticket` | رسید. ستون‌ها:<br>• پایانه، شیفت، روز، دستگاه، `cmd_id` (FK به فرمان؛ یکتا)، `created_xact`.<br>• نوع (sale، return، exchange)، نوع سفارش، سفارش و میز.<br>• شماره و `number_issued_id` (یکتا)، رسید اصلی (برای تعویض اجباری، برای فروش ممنوع).<br>• مشتری، فهرست قیمت و نسخهٔ snapshot، قیمت با مالیات.<br>• ارز، روش گرد کردن.<br>• **جمع‌ها (علامت‌دار):** جمع خالص، تخفیف، حق سرویس و نرخ، مالیات، گرد کردن، انعام، کل.<br>• **مالیات:** نسخهٔ قاعدهٔ مالیات، `taxid` (یکتا)، `tax_indatim_ms`، `tax_inty` (نوع ۱/۲/۳) و `tax_inp` (الگو) — همه با هم (RV-X2-16)، حافظه و سند مالیاتی (§۱۲).<br>• زمان‌ها، آفلاین (با نشست)، صندوقدار.<br>• **ثبت:** وضعیت ثبت، سند فروش (§۱۲)، سند دریافت، زمان ثبت.<br><br>CHECK علامت (فروش ≥ ۰، مرجوعی ≤ ۰). ایندکس‌ها برای صف ثبت |
+| `pos.ticket_line` | سطر رسید. ستون‌ها:<br>• جهت (فروش یا برگشت)، SKU و واحد، مقدار > ۰، قیمت.<br>• منبع قیمت (فهرست، دستی، قیمت باز، modifier، صفر)، قیمت فهرست دستگاه و سرور (برای اختلاف قیمت).<br>• ناخالص، تخفیف، خالص (= ناخالص − تخفیف)، مالیات، دستهٔ مالیاتی.<br>• والد، کورس، صندلی، ایستگاه، سطر سفارش، سطر اصلی (فقط برگشت).<br>• شمارنده‌های مرجوعی سطر فروش: `returned_qty`، `returned_net`، `returned_tax` (فقط تریگر، فقط افزایش؛ ≤ فروش؛ RV-TP-02، RV-TP-15) |
+| `pos.ticket_line_tracking` | سریال و دستهٔ سطر رسید (RV-TP-09): سطر، ترتیب، `serial_no` یا `batch_no`، تاریخ انقضا، مقدار (سریال = ۱). فقط با رسید نوشته می‌شود؛ `post_from_pos` از آن `inventory.tracking_bundle` می‌سازد |
 | `pos.ticket_payment` | پرداخت. ستون‌ها:<br>• روش: نقد، کارتخوان، کارت‌به‌کارت، انتقال، نسیه.<br>• مبلغ علامت‌دار، دریافتی و باقی (نقد: مبلغ = دریافتی − باقی).<br>• پایانه و نتیجهٔ کارت (کارتی ⇔ هر دو)، RRN، STAN و ماسک (فقط کارتی و کارت‌به‌کارت).<br>• حساب بانک (کارت‌به‌کارت و انتقال ⇔)، کد رهگیری، شخص (نسیه ⇔)، تراکنش کارتی (یک‌بار).<br><br>CHECK: پرداخت کارتی همیشه مثبت (بازپرداخت کارتی در صندوق ممنوع) |
 
 ### ۴-۱۱. ویوها و توابع منتشرشده
@@ -659,7 +664,12 @@ erDiagram
 | `treasury.v_party_cheque_exposure` | به ازای شخص مؤثر: جمع چک‌های وصول‌نشده و برگشتی. ورودی کنترل اعتبار sales (`credit_includes_uncleared_cheques` بخش ۰۴) |
 | `treasury.v_card_clearing_aging` | تراکنش‌های تسویه‌نشده به تفکیک پایانه و روز |
 | `pos.v_device_sync_health` | سر زنجیره، آخرین دریافت، اختلاف ساعت و شمار pending، review و deferred هر دستگاه |
-| `treasury.cheque_holdings(kind, company, as_of)` و چهار تابع `subledger_*` | زیردفتر چک برای `ledger.check_control_accounts` |
+| `treasury.cheque_holdings(kind, company, as_of)` و چهار تابع `subledger_*` چک | زیردفتر چک برای `ledger.check_control_accounts` |
+| `treasury.subledger_party(company, as_of)` | زیردفتر اشخاص (حساب کنترل، بُعد شخص مؤثر، ارز، ماندهٔ ارزی و پایه در تاریخ) برای `ledger.check_control_accounts` (INV-TRS-18) |
+| `treasury.party_dim(tenant, party)`، `open_item_resolve` | بُعد `party` شخص مؤثر؛ حل حساب کنترل قلم باز از سند مبدأ |
+| `treasury.luhn_ok`، `pan_candidates`، `contains_pan`، `mask_pans` | تشخیص و ماسک شمارهٔ کارت در متن آزاد (INV-TRS-02) |
+| `treasury.minor_unit_guard()` | تریگر واحد خرد ارز برای همهٔ مبالغ (INV-TRS-17) |
+| `pos.close_blockers(company, from, to)` | موانع بستن دوره و سال برای قلاب بستن (§۵-۲۲) |
 | `treasury.statement_continuity_breaks(import)` | شکست‌های پیوستگی مانده (سطر، مورد انتظار، واقعی) |
 | `treasury.is_masked_pan`، `all_masked_pans`، `canonical_party`، `assert_fund_dimension`، `fund_currency`، `denominations_total`، `sayad_rank` | کمکی |
 | `pos.genesis_hash(device)` | hash آغاز زنجیره |
@@ -668,15 +678,15 @@ erDiagram
 
 ### ۴-۱۲. ثبت در کاتالوگ‌های ماژول‌های دیگر (در همین فایل، idempotent)
 
-- **`ledger.posting_key`:** `treasury.cheque_bounced`، `cheque_receivable_lt`، `cheque_payable_lt`، `cheque_protest_cost`، `gateway_clearing`، `cash_in_transit`، `cash_over_short`، `bank_interest_income`، `unidentified_receipt` و `pos.tips_payable`.
+- **`ledger.posting_key`:** `treasury.cheque_bounced`، `cheque_receivable_lt`، `cheque_payable_lt`، `cheque_protest_cost`، `gateway_clearing`، `cash_in_transit`، `cash_over_short`، `bank_interest_income`، `unidentified_receipt` و `pos.tips_payable` (همراه کلیدهای پایهٔ ۰۳، جمعاً ۲۲ کلید با مالک treasury/pos). کلید سوخت مطالبات را ۰۳ با نگاشت قالب ثبت می‌کند (CR-T17)؛ تسعیر تحقق‌یافته از کلیدهای خود ۰۳ (`ledger.fx.realized_*`).
 - **`ledger.dimension_type_catalog`:** `payment_gateway` در جایگاه ۱.
-- **`ledger.subledger_source`:** چهار نوع زیردفتر چک.
-- **`core.permission`:** ۴۸ مجوز `treasury.*` و `pos.*`. شامل `pos.session.open` که بخش ۰۲ برای ورود PIN ارجاع داده است.
+- **`ledger.subledger_source`:** چهار نوع زیردفتر چک و زیردفتر `party` (`treasury.subledger_party`؛ RV-IT2-04).
+- **`core.permission`:** ۵۱ مجوز (۳۱ `treasury.*` و ۲۰ `pos.*`). شامل `pos.session.open` که بخش ۰۲ برای ورود PIN ارجاع داده است، `treasury.write_off.post` (critical) و `treasury.reminder.send` (C-AS-09).
 - **`core.role_template_permission`:** برای accountant، cashier، sales_clerk و auditor.
-- **`core.setting_def`:** ۲۲ تنظیم (§۵-۲۸).
+- **`core.setting_def`:** ۲۱ تنظیم (§۵-۲۸). تنظیم قدیمی `pos.cash_rounding_increment` حذف شد؛ گام گرد کردن `sales.cash_rounding.increment` بخش ۰۵ است (CR-C19).
 - **`core.notification_category`:** ۵ دسته.
 - **`core.event_subscriber` و `core.event_subscription`:** §۵-۲۵.
-- **`core.export_table_registry`:** همهٔ ۶۲ جدول مستأجری.
+- **`core.export_table_registry`:** همهٔ ۶۴ جدول مستأجری (با `receivable_write_off` و `ticket_line_tracking`). ستون‌های راز در `secret_columns` (R-GRANT؛ RV-IT2-11).
   - `gateway_account` با `hook`، برای مهروموم دوباره با KEK مقصد.
   - سه جدول جریان با `skip` (مشتق؛ دستگاه‌ها پس از جابه‌جایی مستأجر از نو bootstrap می‌کنند).
 
@@ -869,14 +879,32 @@ class ReceiptService:                                 # نمای ساده برا
 
 class OpenItemService:                               # صدازننده: sales, purchase, payroll, treasury
     async def register(self, uow, reg: OpenItemRegistration) -> UUID: ...                       # idempotent با کلید مبدأ
-    async def cancel_by_source(self, uow, *, source_module: str, source_doc_type: str, source_doc_id: UUID, reason: str) -> int: ...
+    async def cancel_by_source(self, uow, *, source_module: str, source_doc_type: str, source_doc_id: UUID, reason: str,
+                               cancel_date: date) -> int: ...                                # cancel_date = تاریخ سند برگشت (زیردفتر در تاریخ)
 
 class AllocationService:
     async def allocate(self, uow, debit_item_id: UUID, credit_item_id: UUID, amount: Amount, *, on: date,
                        source: str = "manual") -> UUID: ...
     async def auto_allocate(self, uow, company_id: UUID, party_id: UUID, *, strategy: Literal["fifo_due", "exact_amount"] = "fifo_due") -> list[UUID]: ...
     async def offset(self, uow, receivable_item_id: UUID, payable_item_id: UUID, amount: Amount, *, on: date) -> UUID: ...  # سند تهاتر
-    async def reverse(self, uow, allocation_id: UUID, reason: str) -> None: ...
+    async def reclass(self, uow, advance_item_id: UUID, invoice_item_id: UUID, amount: Amount, *, on: date) -> UUID: ...  # دو حساب کنترل → سند
+    async def reverse(self, uow, allocation_id: UUID, reason: str, *, on: date) -> None: ...   # سنددار → سند برگشت؛ reverse_date = on
+    # allocate/offset/reclass: debit_base/credit_base را تریگر حساب می‌کند؛ fx_diff_base ≠ 0 → سند treasury.allocation/<id>
+    # (ledger.fx.realized_gain|loss در برابر حساب کنترل [شخص]) پیش از commit (RV-X3-01)
+
+class WriteOffService:                                # سوخت مطالبات (RV-X2-06)؛ مجوز treasury.write_off.post (critical)
+    async def request(self, uow, cmd: WriteOffCreate) -> ApprovalRequestOut: ...   # subject_type='treasury.write_off'
+    async def post(self, uow, write_off_id: UUID) -> WriteOffOut: ...                # پس از approved: سند + قلم بستانکار + تخصیص write_off
+    async def reverse(self, uow, write_off_id: UUID, reason: str, *, on: date) -> WriteOffOut: ...  # وصول بعدی: برگشت سند، تخصیص و قلم
+
+class PartyReminderService:                           # C-AS-09؛ مجوز treasury.reminder.send (sensitive)
+    async def preview(self, uow, party_id: UUID, template: str, vars: Mapping[str, str]) -> ReminderPreview: ...  # فقط خواندن
+    async def send(self, uow, party_id: UUID, template: str, vars: Mapping[str, str]) -> UUID: ...  # فقط با رضایت ثبت‌شدهٔ شخص؛ الگوی تأییدشده
+
+class TreasuryImportService:                          # صدازننده: migration (CR-MG02)
+    async def unreconciled_items(self, uow, cmd: OpenItemImportCmd) -> list[UUID]: ...    # source_module='migration'، بی‌سند (journal_id NULL)
+    async def money_document_history(self, uow, cmd: MoneyDocumentImportCmd) -> UUID: ... # origin='migration'، input_amount_unit اجباری
+    async def cancel_history(self, uow, import_job_id: UUID) -> int: ...                   # بازگشت کل یک کار مهاجرت
 
 class TransferService:
     async def create(self, uow, cmd: TransferCreate) -> TransferOut: ...
@@ -893,7 +921,8 @@ class PettyCashService:
     async def create_claim(self, uow, cmd: PettyClaimCreate) -> PettyClaimOut: ...
     async def submit(self, uow, claim_id: UUID) -> None: ...
     async def approve(self, uow, claim_id: UUID) -> None: ...         # SoD: approver ≠ submitter (CHECK + core.sod_rule)
-    async def post(self, uow, claim_id: UUID) -> None: ...            # بدهکار هزینه‌ها و مالیات / بستانکار تنخواه
+    async def post(self, uow, claim_id: UUID) -> None: ...            # بدهکار هزینه‌ها (و فقط برای input_credit: tax.vat_receivable) / بستانکار تنخواه
+    # input_credit: پیش از post، TaxRegisterService.record_purchase(...) و پر کردن tax_purchase_entry_id (RV-TP-10)
     async def replenish(self, uow, fund_id: UUID, claim_ids: list[UUID], source: FundRef) -> TransferOut: ...
 
 class ChequeService:
@@ -910,6 +939,7 @@ class ChequeService:
 
 class ChequeImportService:                            # صدازننده: migration
     async def import_open_cheque(self, uow, cmd: ChequeImportCmd, *, amount_unit: AmountUnit) -> UUID: ...  # IMP_*؛ بدون سند
+    # import_cheque_history(cheque, events) برای CHEQUE→regenerate در v2 (CR-MG02)
 
 class ChequeBookService:
     async def register_book(self, uow, cmd: ChequeBookCreate) -> ChequeBookOut: ...   # برگ‌ها با sayad_id اختیاری
@@ -955,7 +985,14 @@ class ReconciliationService:
 class ChequeQuery:
     async def due(self, uow, company_id: UUID, *, start: date, end: date, direction: str | None) -> list[ChequeDueRow]: ...
     async def cash_forecast(self, uow, company_id: UUID, *, start: date, days: int, bucket: Literal["day","week"]) -> list[ForecastRow]: ...
-    async def party_exposure(self, uow, company_id: UUID, party_id: UUID) -> ChequeExposure: ...   # برای sales.credit_control
+    async def party_exposure(self, uow, company_id: UUID, party_id: UUID) -> ChequeExposure: ...   # برای sales.credit_control (RV-TP-22)
+
+class ChequeExposure(BaseModel, frozen=True):          # از treasury.v_party_cheque_exposure، به شخص مؤثر و ارز
+    uncleared: Amount            # in_hand + deposited؛ فقط وقتی sales.credit_includes_uncleared_cheques روشن است جزء exposure
+    bounced_outside_ar: Amount   # ماندهٔ برگشتی که بیرون از AR نشسته (چک برگشتی، برگشت از ثالث)؛ همیشه جزء exposure
+    endorsed_contingent: Amount  # چک خرج‌شده که ممکن است با R10 برگردد؛ فقط هشدار، جزء exposure نیست
+    bounced_count: int
+    # برگشتیِ داخل AR (bounce_target=party_receivable) این‌جا نیست، چون در ماندهٔ AR شخص هست (دوبار شمرده نشود)
     async def party_risk(self, uow, party_id: UUID) -> PartyChequeRisk: ...          # سابقهٔ برگشتی داخلی (نه رنگ صیاد)
 ```
 
@@ -1015,19 +1052,20 @@ post(doc):                                                            # یک ت�
 |---|---|---|---|---|
 | R1 | ∅ ← in_hand | دریافت | @holding[شخص] / @counter[شخص] | معمولاً در سند دریافت؛ بلندمدت اگر سررسید > آستانه |
 | R2 | in_hand ← deposited | واگذاری | چک در جریان وصول[بانک] / @holding[شخص] | بانک اجباری؛ دروازهٔ صیاد (`sayad_accept_required`) |
-| R3 | deposited ← collected | وصول | @fund[بانک] / در جریان وصول[بانک واگذاری] | ترجیحاً از سطر صورتحساب؛ کارمزد سند جدا |
+| R3 | deposited ← collected | وصول | @fund[بانک] / در جریان وصول[بانک واگذاری] (مانده) | ترجیحاً از سطر صورتحساب؛ کارمزد سند جدا |
 | R3B (R3') | in_hand ← collected | وصول مستقیم | @fund / @holding | بانک یا صندوق |
-| R4 | deposited ← partially_collected | وصول بخشی | @fund (partial) + @bounce_target (remainder) / در جریان وصول (partial + remainder) | 0 < مبلغ < اسمی؛ collected = مبلغ |
-| R5 | deposited ← bounced | برگشت از بانک | @bounce_target / در جریان وصول | اعلان `treasury.cheque.bounced`؛ ریسک داخلی شخص |
+| R4 | deposited ← partially_collected | وصول بخشی | @fund (partial) + @bounce_target (remainder) / در جریان وصول (partial + remainder) | 0 < مبلغ < مانده؛ remainder = مانده − مبلغ؛ collected += مبلغ |
+| R5 | deposited ← bounced | برگشت از بانک | @bounce_target / در جریان وصول (مانده) | اعلان `treasury.cheque.bounced`؛ ریسک داخلی شخص |
+| R2B، R2C، R2D | bounced، partial یا rtp ← deposited | ارائهٔ دوباره (RV-X2-02) | در جریان وصول[بانک] / @bounce_target (rtp: چک برگشتی) (مانده) | بانک اجباری؛ سپس R3، R4 یا R5 دوباره |
 | R5B (R5') | in_hand ← bounced | برگشت در شعبه | @bounce_target / @holding | |
 | R6، R6B، R6C | bounced، partial یا rtp ← همان | هزینهٔ گواهی | @cost_target / @fund | مبلغ صریح |
 | R7، R7B، R7C | bounced، partial یا rtp ← settled | تسویه | @fund / @bounce_target (rtp: چک برگشتی) | مبلغ = مانده؛ معمولاً در سند دریافت با سطر `bounced_cheque` |
-| R7P، R7PB | bounced یا partial ← همان | تسویهٔ قسطی | @fund / @bounce_target (explicit) | 0 < مبلغ < مانده؛ `collected_amount` به‌اندازهٔ قسط بالا و محل نگهداری پایین می‌رود |
+| R7P، R7PB، R7PC | bounced، partial یا rtp ← همان | تسویهٔ قسطی | @fund / @bounce_target (rtp: چک برگشتی) (explicit) | 0 < مبلغ < مانده؛ `collected_amount` به‌اندازهٔ قسط بالا و محل نگهداری پایین می‌رود. R7PC برای برگشت از ثالث (RV-TP-23) |
 | R8، R8B، R8C | bounced، partial یا rtp ← replaced | تعویض | @holding (چک تازه) / @bounce_target | چک تازه با `replaces_cheque_id`؛ R1 آن در همان سند |
 | R9 | in_hand ← endorsed | خرج (انتقال به غیر) | @counter[گیرنده] / @holding[شخص] | گیرنده اجباری؛ دروازهٔ صیاد؛ یادآور «انتقال در صیاد» |
 | R10 | endorsed ← returned_by_third_party | برگشت از ثالث | چک برگشتی[شخص اصلی] / @counter[گیرنده] | بدهی ما به گیرنده زنده می‌شود |
 | R11 | in_hand ← returned_to_drawer | عودت | @counter / @holding | |
-| R12 | deposited ← in_hand | برگشت از بانک بدون ارائه | @holding / در جریان وصول | |
+| R12 | deposited ← in_hand | برگشت از بانک بدون ارائه | @holding / در جریان وصول (مانده) | |
 | R13A..F | in_hand، deposited، partial، bounced، rtp یا endorsed ← cancelled | ابطال ثبت | برگشت همهٔ اسناد گذارهای مؤثر (هر کدام `reverse` با `source_event='cancel:<seq>'`) | فقط وقتی هیچ تطبیق بانکی یا تسویهٔ قطعی به آن‌ها وابسته نباشد |
 | R14 | in_hand ← in_hand | طبقه‌بندی جاری | اسناد دریافتنی / اسناد دریافتنی بلندمدت | فقط اگر `is_long_term`. job پایان دوره |
 
@@ -1051,7 +1089,7 @@ post(doc):                                                            # یک ت�
 
 **ورود مهاجرت:** IMP_RP_IN_HAND، IMP_RP_DEPOSITED، IMP_RP_BOUNCED، IMP_RG_HELD، IMP_IP_ISSUED و IMP_IG_ISSUED. ∅ ← وضعیت جاری، بدون سند.
 
-**undo:** از وضعیت جاری به وضعیت پس از آخرین گذار مؤثرِ پیش از گذار undo‌شده می‌رود. سند آن برگشت سند گذار undo‌شده است.
+**undo:** از وضعیت جاری به وضعیت پس از آخرین گذار مؤثرِ پیش از گذار undo‌شده می‌رود. سند آن برگشت سند گذار undo‌شده است (از treasury برای همین چک). ابطال ثبت (R13*، XC1، GXR، GXI) **نهایی است** و undo نمی‌شود، چون سندهای برگشت ابطال جایی ثبت نشده‌اند و بازگرداندن آن چک را بی‌سند به وضعیت نگهداری می‌برد (RV-TP-05). undo تعویض (R8*) یا اجرای ضمانت (G3، G6) فقط پس از ابطال چک جانشین یا تبدیل‌شده در همان تراکنش (`HK_CHQ_UNDO_DEPENDENT`).
 
 **بُعد صیاد:**
 - **دریافتی:** `not_inquired → inquired → accepted → transferred`، و `rejected` از not_inquired یا inquired.
@@ -1094,16 +1132,22 @@ transition(cmd):
                                                 #      bounce_target = setting (bounced_account → treasury.cheque_bounced ؛ party_receivable → sales.receivable)
                                                 #      cost_target = setting (expense → treasury.cheque_protest_cost ؛ party_receivable → sales.receivable)
                                                 #      fund = treasury.bank[cmd.bank] یا treasury.cash[cmd.cash_box]
-                                                #      amounts: face=c.amount, partial=cmd.amount, remainder=c.amount−cmd.amount,
+                                                #      amounts: face=c.amount, partial=cmd.amount, remainder=(c.amount−c.collected_amount)−cmd.amount,
                                                 #               outstanding=c.amount−c.collected_amount, explicit=cmd.amount
                                                 #      dims: party:from=c.received_from_party_id, party:payee, party:endorsee, deposit_bank, own_bank, fund
        result ← LedgerPostingService.post(PostingRequest(source_module='treasury', source_doc_type='treasury.cheque',
-                                                          source_doc_id=c.id, source_event=f'{t.code}:{seq}', journal_date=cmd.event_date,
+                                                          source_doc_id=c.id, source_event=f'{t.code.lower()}:{seq}', journal_date=cmd.event_date,
                                                           attributes={'attr:cheque_purpose': c.purpose, 'attr:bank_code': ...}))
-  4  holding ← سطر بدهکار نگهدارنده در وضعیت مقصد (اگر is_holding): account_id و dim1 از result.lines (source_line_ref='hold')
+  4  holding ← سطر بدهکار نگهدارنده در وضعیت مقصد (اگر is_holding): account_id و dim1 از result.lines (source_line_ref='chq:<cheque_id>'؛ همان قرارداد §۵-۴)
   5  INSERT cheque_event (seq=c.last+1, after-values, holding_*, journal_id=result.journal_id)   ← تریگرها چک را به‌روز می‌کنند
-  6  پیامدها: R5/R5B با bounce_target=party_receivable → OpenItemService.register(debit, source=treasury.cheque bounce)
-            R8 → چک تازه (R1) ؛ G3/G6 → چک پرداخت تازه + R1/P1 ؛ R9 → sayad_state هدف «transferred» پس از تأیید کاربر
+  6  اقلام باز (RV-TP-11، RV-X2-01): برای **هر سطر** result.lines که روی حساب subledger_kind='party' نشسته (دریافتنی یا پرداختنی
+     تجاری) OpenItemService.register(direction = سمت سطر، party = بُعد سطر، account_id = حساب سطر، amount = مبلغ سطر،
+     source = treasury.cheque/<c.id>، source_line_key = '<lower(code)>:<seq>[:n]'). نمونه‌ها: R5، R5B و باقی‌ماندهٔ R4 با
+     bounce_target=party_receivable (بدهکار مشتری)؛ R6* با cost_target=party_receivable (پیش‌فرض)؛ R7*/R8* بستانکار مشتری و
+     auto_allocate به قلم برگشت؛ R10 بستانکار گیرندهٔ انتقال (بدهی ما زنده می‌شود)؛ R11 و P3/P4 (@counter) بدهی را زنده می‌کنند؛
+     R9 مستقل بدهی گیرنده را کم می‌کند. قید deferred `trg_open_items` برابری «سطرهای party = اقلام» را برای هر گذار، ابطال اقلام را
+     برای undo و ابطال ثبت می‌سنجد (`HK_CHQ_OPEN_ITEM`). R1/P1 درون سند دریافت/پرداخت اقلامشان را از خود سند دارند.
+     R8 → چک تازه (R1) ؛ G3/G6 → چک پرداخت تازه + R1/P1 ؛ R9 → sayad_state هدف «transferred» پس از تأیید کاربر
             اعلان: bounced (اجباری برای حسابدار)، endorsed (یادآور انتقال در صیاد)
   7  Outbox: treasury.cheque.<op> (§۵-۲۵) ؛ Audit
 ```
@@ -1125,14 +1169,32 @@ transition(cmd):
 
 ```
 register(reg): INSERT open_item ON CONFLICT (کلید مبدأ زنده) → اگر موجود و برابر: برگرداندن id (idempotent)؛ اگر نابرابر: 409 treasury.open_item.source_conflict
+     reg.account_id = حساب کنترل سطر شخص در PostingResult مبدأ (اگر ندهد، تریگر از سند مبدأ حل می‌کند؛ RV-IT2-04)
+cancel_by_source(src, cancel_date): قلم‌های بی‌تخصیص مبدأ → cancelled با cancel_date = تاریخ سند برگشت
 auto_allocate(company, party, 'fifo_due'):
   credits ← اقلام credit باز شخص مؤثر (به ترتیب doc_date, id) ؛ debits ← اقلام debit باز (به ترتیب due_date, doc_date, id)
   هم‌کلاس، هم‌ارز ؛ دو اشاره‌گر: amt = min(credit.outstanding, debit.outstanding) → allocate(...) تا تمام شدن یکی
   خروجی: فهرست تخصیص‌ها (پیش‌نمایش در UI؛ اعمال با تأیید یا خودکار برای origin=pos/gateway)
 offset(receivable_item, payable_item, amount): سند تهاتر (بدهکار purchase.payable / بستانکار sales.receivable [شخص]) + allocation(kind=offset)
+reclass(advance_item, invoice_item, amount): دو حساب کنترل (پیش‌دریافت 3301 و دریافتنی 1201): سند طبقه‌بندی + allocation(normal, journal_id)
+     (بی‌سند ممنوع: HK_TRS_ALLOC_ACCOUNT)
 ```
 
-**تفاوت ارز:** تخصیص v1 فقط هم‌ارز است. تفاوت تسعیر تحقق‌یافته در تسویهٔ ارزی (v2) با `allocation.journal_id` و کلیدهای `ledger.fx.realized_*` ثبت می‌شود. اسکیمای آن آماده است.
+**زیردفتر اشخاص (RV-IT2-04، RV-X3-02).** treasury مالک زیردفتر `party` است (CR-C06) و `treasury.subledger_party(company, as_of)` را در `ledger.subledger_source` ثبت می‌کند. پس `ledger.check_control_accounts` دریافتنی و پرداختنی تجاری (1201، 3101) را با اقلام باز به تفکیک حساب، بُعد شخص مؤثر و ارز تطبیق می‌دهد:
+- ماندهٔ هر قلم در تاریخ = مبلغ − تخصیص‌های تا آن تاریخ (پایه: `amount_base` − پایهٔ مصرف‌شده)، بدهکار مثبت و بستانکار منفی؛ قلم باطل‌شده تا `cancel_date` و تخصیص برگشت‌خورده تا `reverse_date` شمرده می‌شوند.
+- هر قلم `account_id` دارد و قید deferred می‌سنجد که سند مبدأ همان حساب را برای همان شخص و سمت ثبت کرده است (`HK_TRS_OPEN_ITEM_ACCOUNT`).
+- تخصیص عادی دو قلم یک حساب اثر خالص ندارد؛ تهاتر، طبقه‌بندی و تفاوت تسعیر سند خودشان را دارند. پس سند دستی روی دریافتنی بی‌قلم باز، یا قلم بی‌سند، کشف می‌شود (آزمون T37).
+- درخواست به ۰۳: `allowed_source_modules` حساب‌های 1201 و 3101 در بسته‌های v1 به ماژول‌های صاحب قلم باز محدود شود (§۱۳).
+
+**تسعیر تحقق‌یافته در تسویه (RV-X3-01؛ v1).** ۰۳ سود و زیان تحقق‌یافته را v1 و کار زیردفتر می‌داند (03 §۵ و §۱۰). هر تخصیص پایهٔ مصرف‌شدهٔ هر قلم را ثبت می‌کند: ارز پایه = همان مبلغ؛ ارز دیگر = به نسبت مبلغ (گرد به واحد خرد ارز پایه)، و تخصیصی که قلم را می‌بندد باقی‌ماندهٔ پایه را می‌گیرد. `fx_diff_base = credit_base − debit_base`. اگر ≠ ۰، تخصیص بدون سند `treasury.allocation/<id>` ثبت نمی‌شود (`HK_TRS_ALLOC_FX_JOURNAL`): مثبت → بدهکار حساب کنترل [شخص] / بستانکار `ledger.fx.realized_gain`؛ منفی → بدهکار `ledger.fx.realized_loss` / بستانکار حساب کنترل. برگشت تخصیص سنددار سند برگشت می‌خواهد (`allocation_reverse_journal`). تسعیر پایان دوره (unrealized) همچنان پرسش باز صاحب محصول دربارهٔ ۰۳ است (C-L15) و به این بخش مربوط نیست.
+
+**سوخت مطالبات (RV-X2-06؛ v1).** `WriteOffService.post(party, receivable_item, amount, reason)`:
+1. مجوز `treasury.write_off.post` (critical) و درخواست تأیید با `subject_type='treasury.write_off'` که پیش از ثبت approved باشد (`core.approval_assert_approved`؛ FK چهارستونی RV-CORE-26).
+2. سند `treasury.write_off/<id>`: بدهکار `treasury.bad_debt_expense` / بستانکار حساب کنترل [شخص] (کلید را ۰۳ ثبت و نگاشت می‌کند؛ §۱۳).
+3. قلم باز بستانکار با منبع `treasury.write_off/<id>` روی همان حساب، و تخصیص `source='write_off'` به قلم بدهکار؛ مبلغ ≤ ماندهٔ قلم.
+4. **وصول بعدی:** برگشت سوخت = سند برگشت، برگشت تخصیص، ابطال قلم بستانکار (همه با همان تاریخ)، سپس دریافت عادی.
+5. ارزش افزودهٔ صورتحسابی که در مؤدیان ثبت شده برگشت نمی‌خورد (یادداشت برای حسابدار؛ اصلاح مالیاتی فقط از مسیر صورتحساب برگشت از فروش).
+پایگاه داده (`receivable_write_off` و قید deferred) هم‌خوانی سند، قلم و تخصیص را در ثبت و برگشت اجبار می‌کند (`HK_TRS_WRITE_OFF_*`). ذخیرهٔ مطالبات مشکوک‌الوصول (روش ذخیره) v2 است.
 
 ### ۵-۸. ورود صورتحساب بانک (pipeline)
 
@@ -1304,7 +1366,11 @@ class InquiryProvider(Protocol):                     # finnotech, jibit
 
 ### ۵-۱۳. تنخواه، انتقال، شمارش نقد
 
-- **ثبت صورت‌خرج:** بدهکار حساب یا کلید هر سطر (و `tax.vat_receivable` برای ارزش افزوده) با مرکز هزینه / بستانکار `treasury.petty_cash[تنخواه]`.
+- **ثبت صورت‌خرج:** بدهکار حساب یا کلید هر سطر با مرکز هزینه / بستانکار `treasury.petty_cash[تنخواه]`.
+- **ارزش افزودهٔ تنخواه (RV-TP-10):** هر سطر `vat_treatment` دارد:
+  - `expense` (پیش‌فرض؛ رسید عادی بی‌شناسهٔ مالیاتی فروشنده): مالیات جزء هزینهٔ سطر است و جدا ثبت نمی‌شود.
+  - `input_credit`: فقط با `vat_amount > 0`، شناسهٔ مالیاتی فروشنده و شمارهٔ صورتحساب مالیاتی (CHECK). پیش از `posted` باید در دفتر خرید مالیاتی (`tax.purchase_entry`) ثبت و `tax_purchase_entry_id` پر شده باشد (`HK_TRS_PETTY_VAT_REGISTER`). فقط همین بخش بدهکار `tax.vat_receivable` می‌شود.
+  - ثبت ارزش افزودهٔ اعتباری بدون دفتر خرید مالیاتی ممنوع است تا گزارش فصلی ارزش افزوده و دفتر کل از هم جدا نشوند.
 - **جایگزینی:** `TransferService` از بانک یا صندوق به تنخواه، به مبلغ جمع صورت‌خرج‌های ثبت‌شدهٔ جایگزین‌نشده (پیشنهاد = سقف − مانده). پیوند `replenished_by_transfer_id` یک‌بار نوشته می‌شود.
 - **انتقال:**
   - بی‌واسطه: بدهکار مقصد / بستانکار مبدأ، به‌اضافهٔ کارمزد.
@@ -1401,6 +1467,13 @@ loop:
 - outcome pending با seq کمتر جلوی پردازش بقیه را می‌گیرد (تریگر).
 - deferred و review نمی‌گیرند. فرمان‌های وابسته به یک فرمان review‌شده خودشان deferred می‌شوند: مرجوعیِ رسیدی که review است، بستن شیفتِ دارای فروش review.
 
+**بازیابی فروش دستگاه باطل یا گم‌شده (RV-X4-04):**
+- توکن دستگاه باطل دیگر حل نمی‌شود (`core.auth_resolve_token`)، پس `/pos/sync/push` برای آن بسته است. فروش‌های واقعی پیش از ابطال که روی دستگاه مانده‌اند فقط از مسیر بازیابی می‌آیند:
+  1. مدیر با نشست کاربر و مجوز `pos.sync.recover` (critical، با تأیید دونفره) و `Idempotency-Key`، رسیدهای چاپی و شمارش کشو را با دستگاه مقایسه و `accept_through_seq` را با دلیل ثبت می‌کند (`POST /api/v1/pos/devices/{id}/accept-bound`).
+  2. خروجی امضاشدهٔ صف فرمان دستگاه (همان بدنه‌ها و امضاها) با `POST /api/v1/pos/devices/{id}/recovery-upload` بارگذاری می‌شود. امضا با کلید عمومی ثبت‌شدهٔ دستگاه سنجیده می‌شود.
+  3. فرمان‌های تا سقف ذخیره و همه `review` می‌شوند (`pos.sync.device_revoked`). هیچ‌کدام خودکار اعمال نمی‌شود.
+- فرمان بالاتر از سقف، یا با `occurred_at ≥ revoked_at`، رد پایگاه داده‌ای است، حتی اگر امضای معتبر داشته باشد (کلید دزدیده‌شده).
+
 **کسری غیرقابل‌جبران:**
 - اگر IndexedDB پاک شده باشد، کلید دستگاه هم از بین رفته است. دستگاه باید از نو ثبت شود (`core.device` تازه).
 - مدیر بازهٔ از دست رفتهٔ دستگاه قدیم را در `device_seq_gap` اعلام می‌کند. شمارهٔ رسیدهای همان بازه با `core.number_void` ابطال می‌شوند و سریال‌های مالیاتی با `tax.serial_voided`.
@@ -1414,7 +1487,7 @@ loop:
 | `shift.opened` | shift_id، terminal_id، business_date، opening_float، counts[]، opened_by | `ShiftService.open` |
 | `shift.closed` | shift_id، counts[]، counted_cash، card_totals[{card_terminal_id, total, count}]، closed_by | `ShiftService.close`. سرور expected را محاسبه می‌کند. `CashCountService.post_shift_close` و `CardService.close_day` |
 | `cash.moved` | movement_id، kind، amount، reason، posting_key یا target_cash_box_id | `ShiftService.cash_move` + سند پرداخت متفرقه یا `fund_transfer(pos_drop)` |
-| `sale.completed`، `return.completed`، `exchange.completed` | ticket (§۴-۱۰)، lines[]، payments[]، open_order_ref، customer (id یا client_id)، prices_snapshot_version، tax {taxid, indatim_ms, memory_ref, serial}، offline_session_id، amount_unit='IRR' | `TicketService.ingest` (§۵-۲۰) |
+| `sale.completed`، `return.completed`، `exchange.completed` | `ticket_id`، `subtotal`، `tax_total`، `tip_amount`، `total` (رشتهٔ دهدهی؛ پایگاه داده با رسید می‌سنجد)، ticket (بقیهٔ §۴-۱۰)، `lines[]` (با `tracking[]` سریال و دسته)، `payments[]` (هر کدام `amount` رشتهٔ دهدهی)، open_order_ref، customer (id یا client_id)، prices_snapshot_version، tax {taxid, indatim_ms, memory_ref, serial, inty, inp}، offline_session_id، amount_unit='IRR' | `TicketService.ingest` (§۵-۲۰) |
 | `order.upserted` | order (کامل با lines)، base_version | `OrderService.upsert`. نسخهٔ پایه ≠ نسخهٔ سرور → ادغام سطرمحور، و اگر ناسازگار باشد review (`pos.order.conflict`) |
 | `order.voided` | order_id، reason، voided_lines[] | ضایعات برای سطرهای ارسال‌شده (رویداد برای inventory) |
 | `kitchen.sent` | order_id، line_ids[]، course_no، station_id | سطرها sent می‌شوند. چاپ محلی است و فرمان فقط ثبت است |
@@ -1431,7 +1504,7 @@ loop:
 | وضعیت هنگام دریافت | تصمیم | خروجی |
 |---|---|---|
 | امضای نامعتبر، بدنهٔ نابرابر، fork دنباله | رد دسته؛ quarantine دستگاه | `pos.sync.bad_signature` / `pos.sync.fork` (۴۲۲/۴۰۹)؛ اعلان امنیتی |
-| فرمان پس از ابطال یا مفقودی دستگاه (`occurred_at ≥ revoked_at`) | رد | `rejected: pos.sync.device_revoked` |
+| فرمان دستگاه باطل یا گم‌شده | بالاتر از `accept_through_seq` یا با `occurred_at ≥ revoked_at`: رد پایگاه داده‌ای. تا سقف اعلام‌شدهٔ مدیر: ذخیره و **همیشه بررسی** | `rejected: pos.sync.device_revoked` / `review: pos.sync.device_revoked` (RV-TP-01) |
 | SKU غیرفعال یا حذف‌شده | پذیرش (فروش رخ داده) | applied. گزارش «فروش کالای غیرفعال» |
 | SKU ناشناخته (هرگز در کاتالوگ نبوده) | بررسی | `review: pos.sale.unknown_sku` |
 | قیمت دستگاه ≠ قیمت فهرست امروز سرور | پذیرش. `server_list_price` ثبت. اگر اختلاف بیش از `price_variance_pct` باشد: هشدار | applied + گزارش «اختلاف قیمت آفلاین» |
@@ -1440,9 +1513,12 @@ loop:
 | مشتری آفلاین با کد ملی موجود | پیوند به شخص موجود | `client_id_alias` |
 | مشتری ادغام‌شده | جانشین | `client_id_alias(merged_party)` |
 | فروش نسیه بیش از سقف اعتبار یا با توقیف | پذیرش (کالا رفته)، توقیف تجاری پیشنهادی و اعلان | applied + `parties.hold` (سرویس sales) |
-| تاریخ کاری در دورهٔ بسته یا قفل | بررسی | `review: ledger.period_closed`. حسابدار انتخاب می‌کند: بازگشایی، یا ثبت در دورهٔ باز با یادداشت |
+| تاریخ کاری در دورهٔ بسته یا قفل | بررسی | `review` با کد ledger (`ledger.period.closed`، `.soft_closed`، `.module_locked` یا `.finalized`). قاعدهٔ رسید دیررس (RV-X2-13): سند فروش و سند مؤدیان **تاریخ دستگاه** را نگه می‌دارند، چون taxid روز صدور را دارد (`issue_taxid_day`). دورهٔ بسته یا بستهٔ نرم: حسابدار با مجوز بازگشایی دوره را باز و رسید را با همان تاریخ ثبت می‌کند. سال قفل یا قطعی: فروش و دریافت با سند `prior_period_adjustment` در سال جاری ثبت می‌شوند و سند مؤدیان دست نمی‌خورد؛ ردیف تطبیق GL و اظهارنامهٔ ارزش افزوده با دستهٔ توضیح `pos_late_ticket` (درخواست به بخش مالیات) توضیح داده می‌شود. برای پیشگیری، قلاب بستن pos بستن دوره و سال را تا رسیدن فرمان‌ها سد می‌کند (§۵-۲۲) |
 | مرجوعیِ رسیدی که هنوز نرسیده (دستگاه دیگر) | تعویق ≤ ۲۴ ساعت، سپس بررسی | `deferred: pos.return.original_missing` |
-| مرجوعی بیش از مقدار فروش | بررسی | `review: pos.return.exceeds` (سد DB `HK_POS_RETURN_EXCEEDS` مانع ذخیره است) |
+| مرجوعی بیش از مقدار، خالص یا مالیات فروش (یا بیش از سهم نسبی سطر) | بررسی | `review: pos.return.exceeds` (سد DB `HK_POS_RETURN_EXCEEDS` مانع ذخیره است؛ دو صندوق هم‌زمان هم سد می‌شوند) |
+| نسیه به مشتری عمومی یا شخص دیگر | بررسی | `review: pos.sale.on_account_party` (سد DB `HK_POS_ON_ACCOUNT_PARTY`) |
+| نسیهٔ آفلاین برای مشتری بدون هویت کامل نوع ۱ مؤدیان | دستگاه اجازه نمی‌دهد (snapshot جریان `parties` پرچم «هویت نوع ۱ کامل» دارد). اگر برسد: بررسی | `review: pos.tax.type1_identity` (سد DB `HK_POS_TYPE2_CASH_ONLY` و `HK_POS_TYPE1_BUYER`) |
+| کالای سریالی بی‌سریال یا سریال تکراری | بررسی | `review: pos.sale.serial_conflict` (سریال در `ticket_line_tracking`؛ تکرار را inventory در `post_from_pos` می‌گیرد) |
 | بازپرداخت کارتی (نباید آفلاین ساخته شود) | رد | `rejected: pos.refund.card_offline` (CHECK هم مانع است) |
 | اختلاف ساعت بیش از حد، یا taxid با `indatim` آینده | بررسی برای بخش مالیاتی؛ فروش ذخیره | `review: pos.sync.clock_skew` |
 | سقف آفلاین (ساعت، مبلغ یا نسیه) شکسته | پذیرش با پرچم نشست | applied + `limit_exceeded` + اعلان مدیر |
@@ -1500,10 +1576,11 @@ class PosTicketIn(BaseModel, frozen=True):            # در hesabketab.contract
     kind: Literal["sale", "return", "exchange"]; business_date: date; occurred_at: datetime
     customer_party_id: UUID; original_sales_doc_id: UUID | None
     lines: tuple[PosTicketLineIn, ...]                 # variant, uom, qty, unit_price, line_gross=trunc(qty×price), discount, line_net, tax_amount,
-                                                       # tax_category, parent_line_no (modifier), direction, original_line_ref
+                                                       # tax_category, parent_line_no (modifier), direction, original_line_ref,
+                                                       # tracking: tuple[{serial_no | batch_no, expiry_date, qty}] (RV-TP-09)
     order_discount: Amount; service_charge: Amount; tip_amount: Amount; rounding_adjustment: Amount; total: Amount
     prices_include_tax: bool; tax_rule_version: str
-    tax: PosTaxData | None                             # taxid, indatim_ms, memory_ref, serial (اگر آفلاین ساخته شده)
+    tax: PosTaxData | None                             # taxid, indatim_ms, memory_ref, serial, inty, inp (اگر آفلاین ساخته شده؛ RV-X2-16)
     gl_mode: Literal["per_document", "batched"]        # همان مقدارهای sales.invoice.gl_mode؛ batched فقط با per_shift
     allow_negative_stock: bool                          # مبدأ آفلاین
     source_ref: str                                     # 'pos:<cmd_id>'
@@ -1517,7 +1594,7 @@ class SalesInvoiceService(Protocol):                   # بخش ۰۵ (§۵-۳ آ
 
 **`TicketService.ingest(cmd)`** — یک تراکنش، داخل پردازش فرمان:
 
-1. مشتری حل می‌شود: alias، ادغام، یا مشتری عمومی پایانه.
+1. مشتری حل می‌شود: alias، ادغام، یا مشتری عمومی پایانه. پرداخت نسیه فقط به نام همین مشتری نام‌دار است (INV-POS-16). نوع صورتحساب مؤدیان دستگاه (`inty`) با تسویه و هویت خریدار می‌خواند (INV-POS-17).
 2. شمارهٔ رسید: `core.number_record_external(series_dev, period, value, formatted, 'pos.ticket', ticket_id, device)`.
 3. درج `pos.ticket` همراه با سطرها و پرداخت‌ها. قید deferred جمع‌ها و پرداخت‌ها را در commit می‌سنجد.
 4. `SalesInvoiceService.post_from_pos` اجرا می‌شود: سند فروش، کسر موجودی و دستور پخت (inventory)، و سند مالیاتی (tax). سند GL فروش و بهای تمام‌شده را خود sales ثبت می‌کند.
@@ -1526,6 +1603,7 @@ class SalesInvoiceService(Protocol):                   # بخش ۰۵ (§۵-۳ آ
    - ابزارها: نقد → کشوی پایانه؛ کارتخوان → پایانهٔ کارتخوان، با `CardService.record_txn(source='pos', rrn, stan)`؛ کارت‌به‌کارت یا انتقال → بانک.
    - طرف: مشتری `customer` با `allocate_to` قلم باز سند فروش.
    - انعام سطر طرف جدا با کلید `pos.tips_payable` دارد و جزء مبلغ رسید است.
+   - گرد کردن نقدی (`rounding_adjustment`؛ RV-X2-14) طبق قرارداد یکتای ۰۵ D-C30 (CR-C19): اگر مشتری **کمتر** پرداخته، همان مبلغ تخفیف فاکتوری `rounding` در سند فروش است و جمع فاکتور = جمع رسید صندوق؛ اگر **بیشتر** پرداخته، رسید خزانه سطر طرف `kind='account'` با کلید `treasury.cash_over_short` به همان مبلغ دارد. پس: ابزارها = پرداخت‌ها = قلم فاکتور (`allocate_to`) + انعام + اضافهٔ گرد کردن. هیچ سطر طرف منفی نیست (CHECK `amount > 0`) و حساب «گرد کردن» جدایی وجود ندارد. گام گرد کردن تنظیم واحد ۰۵ است (`sales.cash_rounding.increment`) و از جریان تنظیمات به دستگاه می‌رسد.
    - باقی پول نقد در خود ابزار خالص شده است (مبلغ = دریافتی − باقی).
 6. پرداخت نسیه سند خزانه ندارد. قلم باز فروش باز می‌ماند و بعداً تسویه می‌شود.
 7. مرجوعی و تعویض:
@@ -1574,18 +1652,25 @@ ShiftService.close(cmd):  (از فرمان shift.closed)
   6  اختیاری: drop به گاوصندوق (fund_transfer pos_drop)
 force_close (مدیر، مجوز pos.shift.force_close): وقتی دستگاه از دست رفته؛ counted = شمارش دستی مدیر
   7  per_shift: SalesInvoiceService.post_shift_batch(shift) + رسید تجمیعی treasury (origin='pos', origin_ref=shift)
-BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گزارش Z روز
+BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر؛ باز کردن هم‌زمان شیفت با FOR SHARE روز سد می‌شود، RV-TP-03) ؛ گزارش Z روز
 ```
+
+**قلاب بستن دوره و سال (RV-X2-13).** pos یک `YearEndHook` (03 §۵-۷) و همان را به‌عنوان `PeriodCloseHook` (درخواست به بخش ۰۳) ثبت می‌کند. `blockers(company, from, to)` همان `pos.close_blockers(company_id, from, to)` است و این موارد را مانع می‌داند:
+- فرمان حل‌نشده (`pending`، `deferred`، `review`) دستگاه‌های شرکت با `occurred_at` تا یک روز پس از پایان بازه؛
+- رسید ثبت‌نشده (`pending`، `review`) با روز کاری درون بازه؛
+- روز کاری یا شیفت باز درون بازه؛
+- نشست آفلاین بازی که پیش از پایان بازه شروع شده است (دستگاهی که فروشش هنوز نرسیده).
+عبور از مانع فقط با مجوز `ledger.period.close` به‌اضافهٔ دلیل ثبت‌شده ممکن است. فروشی که بعداً برسد طبق ردیف «تاریخ کاری در دورهٔ بسته یا قفل» §۵-۱۷ رفتار می‌شود.
 
 ### ۵-۲۳. سرور لبه (v2؛ اسکیمای v1)
 
 - **جفت شدن:** `POST /api/v1/edge/nodes` (بخش ۰۱) ردیف `pos.edge_node(pending)` با hash کد جفت‌شدن می‌سازد. لبه کلید Ed25519 خودش را می‌سازد و فعال می‌شود.
 - **پایین‌دست:** لبه همهٔ جریان‌های شعبه را pull می‌کند و به پایانه‌های LAN می‌دهد.
 - **بالادست:**
-  - پایانه فرمان را به لبه می‌فرستد. لبه آن را در Postgres محلی ذخیره و ack محلی می‌دهد، ولی پایانه فقط پس از `acked_by_cloud` پاک می‌کند (INV-EDGE-03).
-  - لبه پاکت دسته را با کلید خودش امضا می‌کند (`edge_sig`). ابر هر دو امضا را می‌سنجد (INV-EDGE-02).
+  - پایانه فرمان را به لبه می‌فرستد. لبه آن را در Postgres محلی ذخیره و ack محلی می‌دهد، ولی پایانه فقط پس از `acked_by_cloud` پاک می‌کند (INV-POSEDGE-03).
+  - لبه پاکت دسته را با کلید خودش امضا می‌کند (`edge_sig`). ابر هر دو امضا را می‌سنجد (INV-POSEDGE-02).
 - **فرمان‌های خود لبه:** `order.upserted`، `kitchen.sent` و `table.transferred` با دستگاه لبه (`core.device`؛ CR-T03) و زنجیرهٔ جدا هستند.
-- **محدودیت:** لبه سند ثبت نمی‌کند (INV-EDGE-01).
+- **محدودیت:** لبه سند ثبت نمی‌کند (INV-POSEDGE-01).
 
 ### ۵-۲۴. سخت‌افزار (قرارداد استفاده از `DeviceHub`)
 
@@ -1660,6 +1745,20 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | `device_command_tenant_id_cmd_id_key` | «duplicate» در پاسخ push (پس از سنجش hash) | 202 |
 | `HK_SYNC_DEVICE_REVOKED` / `HK_SYNC_QUARANTINED` | `pos.sync.device_not_allowed` | 403 |
 | `HK_SYNC_OUT_OF_ORDER` / `HK_SYNC_OUTCOME` | `core.internal.invariant` | 500 |
+| `HK_SYNC_ACCEPT_BOUND` | `pos.sync.accept_bound_invalid` | 409 |
+| `HK_SYNC_REVIEW_REQUIRED` | `pos.sync.review_required` | 409 |
+| `HK_POS_TICKET_PAYLOAD` / `HK_POS_ON_ACCOUNT_PARTY` / `HK_POS_TYPE2_CASH_ONLY` / `HK_POS_TYPE1_BUYER` / `HK_POS_TRACKING_QTY` | (پردازش فرمان) outcome `review` با همین کد پایین‌حرف | — |
+| `HK_TRS_MINOR_UNIT` | `treasury.amount.minor_unit` | 422 |
+| `HK_TRS_INSTRUMENT_CURRENCY` | `treasury.instrument.currency_mismatch` | 422 |
+| `HK_TRS_OPEN_ITEM_ACCOUNT` / `HK_CHQ_OPEN_ITEM` / `HK_CHQ_JOURNAL_SOURCE` | `core.internal.invariant` (باگ سرویس) | 500 |
+| `HK_TRS_ALLOC_ACCOUNT` | `treasury.allocation.account_mismatch` | 422 |
+| `HK_TRS_ALLOC_FX_JOURNAL` | `treasury.allocation.fx_journal_required` | 422 |
+| `HK_TRS_WRITE_OFF_ITEM` / `HK_TRS_WRITE_OFF_JOURNAL` / `HK_TRS_WRITE_OFF_IMMUTABLE` | `treasury.write_off.invalid` | 422 |
+| `HK_APPROVAL_REQUIRED` (از core) | `core.approval.required` | 409 |
+| `HK_TRS_PETTY_VAT_REGISTER` | `treasury.petty_cash.vat_not_registered` | 422 |
+| `HK_GW_DUPLICATE_RECEIPT` | `treasury.gateway.receipt_exists` | 409 |
+| `HK_CRD_SETTLEMENT_STATE` | `treasury.card.settlement_closed` | 409 |
+| `HK_CHQ_UNDO_DEPENDENT` / `HK_CHQ_CONVERSION` | `treasury.cheque.undo_not_allowed` / `treasury.cheque.conversion_invalid` | 409 / 422 |
 
 ### ۵-۲۷. سطح دستیار هوشمند (Q-F)
 
@@ -1696,7 +1795,7 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | `pos.offline.price_variance_pct` | decimal "0" (هر اختلاف گزارش) | tenant، company |
 | `pos.sync.clock_skew_max_s` | int ۱۲۰ | tenant |
 | `pos.gl_posting_mode` | enum `per_ticket`، `per_shift` | tenant، company، branch |
-| `pos.service_charge.percent`، `pos.tips.enabled`، `pos.cash_rounding_increment` | | tenant، company، branch |
+| `pos.service_charge.percent`، `pos.tips.enabled` (گام گرد کردن نقدی: `sales.cash_rounding.increment` بخش ۰۵) | | tenant، company، branch |
 | `pos.tax.warn_before_deadline_h` | int ۲۴ | tenant |
 
 **عدد قانونی در این تنظیم‌ها نیست.** مهلت ارسال مؤدیان، نرخ‌ها، سقف ماده ۱۴ مکرر و «رسید کارتخوان = صورتحساب نوع ۳ تا پایان ۱۴۰۵» همه پارامترهای تاریخ‌دار `rules` هستند. مالک آن‌ها بخش مالیات و موتور قواعد است.
@@ -1746,6 +1845,10 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | POST | `/treasury/allocations:auto` | `auto_allocate`. پیش‌فرض `apply=false` و فقط پیش‌نمایش | `treasury.allocation.manage` | اجباری اگر `apply=true` |
 | POST | `/treasury/allocations/{id}/reverse` | برگشت تخصیص (`reason`) | `treasury.allocation.manage` | اجباری |
 | POST | `/treasury/offsets` | تهاتر دریافتنی و پرداختنی یک شخص (سند + تخصیص) | `treasury.allocation.offset` | اجباری |
+| POST | `/treasury/reclassifications` | تخصیص پیش‌دریافت یا پیش‌پرداخت به فاکتور (سند طبقه‌بندی + تخصیص؛ INV-TRS-18) | `treasury.allocation.manage` | اجباری |
+| POST | `/treasury/write-offs` | درخواست سوخت مطالبه (`WriteOffCreate`: قلم، مبلغ، دلیل) → درخواست تأیید | `treasury.write_off.post` | اجباری |
+| POST | `/treasury/write-offs/{id}/post` و `/{id}/reverse` | ثبت پس از تأیید؛ برگشت در وصول بعدی (`reason`، `on`) (INV-TRS-20) | `treasury.write_off.post` | اجباری |
+| POST | `/treasury/parties/{id}/reminders:preview` و `/reminders` | پیش‌نمایش و ارسال پیامک یادآوری بدهی (فقط با رضایت ثبت‌شده؛ C-AS-09) | `treasury.document.read` / `treasury.reminder.send` | اجباری (ارسال) |
 | POST | `/treasury/transfers` و `/{id}/post`، `/{id}/receive`، `/{id}/cancel` | انتقال داخلی، مستقیم یا با وجوه در راه | `treasury.transfer.create` | اجباری (به‌جز ساخت) |
 | POST | `/treasury/cash-counts` و `/{id}/post` | شمارش با اسکناس و سکه، و ثبت اختلاف (بیش از آستانه: تأیید) | `treasury.cash_count.post` | اجباری |
 | POST | `/treasury/petty-cash-claims` و `/{id}/submit` | صورت‌خرج تنخواه | `treasury.petty_cash.claim` | توصیه‌شده |
@@ -1837,6 +1940,8 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | POST | `/pos/review-queue/{outcome_id}/resolve` | حل: `retry`، `post_in_open_period`، `accept_with_note`، `link_party`، `void_with_note`. حل با یادداشت و کنشگر (INV-SYNC-05) | `pos.sync.review` | اجباری |
 | POST | `/pos/devices/{device_id}/seq-gaps` | اعلام کسری دنبالهٔ غیرقابل‌جبران (§۵-۱۵) | `pos.sync.review` + MFA تازه | اجباری |
 | POST | `/pos/devices/{device_id}/quarantine-release` | رفع قرنطینه پس از بررسی | `pos.terminal.manage` | اجباری |
+| POST | `/pos/devices/{device_id}/accept-bound` | سقف پذیرش دنبالهٔ دستگاه باطل یا گم‌شده (`accept_through_seq` + دلیل؛ یک‌بار؛ §۵-۱۵، RV-TP-01) | `pos.sync.recover` (critical، تأیید دونفره) | اجباری |
+| POST | `/pos/devices/{device_id}/recovery-upload` | بارگذاری خروجی امضاشدهٔ صف فرمان دستگاه باطل با نشست مدیر؛ فرمان‌ها تا سقف ذخیره و همه `review` می‌شوند (RV-X4-04) | `pos.sync.recover` | اجباری |
 | GET | `/pos/sync/health` | `v_device_sync_health`: سر زنجیره، اختلاف ساعت، صف‌ها، سن آخرین دریافت | `pos.terminal.read` | — |
 | GET | `/pos/reports/x`، `/z`، `/daily`، `/offline-variance`، `/waste` | گزارش‌های X، Z، روزانه، اختلاف قیمت آفلاین و ضایعات | `pos.report.read` | — |
 | GET، POST | `/pos/edge-nodes` | فهرست و جفت کردن لبه (v2؛ مسیر جفت شدن در بخش ۰۱) | `pos.edge.read` / `pos.edge.manage` | اجباری |
@@ -1864,20 +1969,24 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | شناسه | گزاره | اجرا | آزمون |
 |---|---|---|---|
 | **INV-TRS-01** | شبای هر حساب بانکی شرکت mod-97 معتبر است و کد بانک آن با بانک حساب می‌خواند. شبای بانک ادغام‌شده روی بانک جانشین پذیرفته می‌شود | CHECK `ref.is_valid_sheba`؛ تریگر `bank_account_guard` (`HK_TRS_SHEBA_BANK_MISMATCH`) با `ref.bank.merged_into` | `T02 INV-TRS-01 invalid mod-97 SHEBA`، `SHEBA of Parsian on a Mellat account`، `old Ghavamin SHEBA accepted on its merge successor (Sepah)` |
-| **INV-TRS-02** | هیچ شمارهٔ کارت کامل (PAN) در هیچ جدولی ذخیره نمی‌شود. فقط قالب ماسک ۶+۶ ستاره+۴ | CHECK `treasury.is_masked_pan` / `all_masked_pans` روی حساب بانکی، ابزار، تراکنش کارتی، پرداخت درگاه و پرداخت رسید | `T02 INV-TRS-02 full card number rejected`، `T12 INV-TRS-02 no full PAN on card transactions` |
+| **INV-TRS-02** | هیچ شمارهٔ کارت کامل (PAN) در هیچ جدولی ذخیره نمی‌شود، نه در ستون کارت و نه در متن آزاد (شرح و طرف صورتحساب، مرجع و یادداشت ابزار، یادداشت‌ها و دلیل‌ها). فقط قالب ماسک ۶+۶ ستاره+۴. «کارت» = هر رشتهٔ ۱۶ رقمی جدا (ارقام فارسی هم، با جداکنندهٔ اختیاری) که از Luhn بگذرد؛ نرمال‌ساز و سرویس‌ها با `treasury.mask_pans` پیش از ذخیره ماسک می‌کنند. ستون «شمارهٔ کارت مبدأ» صورتحساب به `counterparty_card_masked` می‌رود. `deposit_id` کلید تطبیق است و ماسک نمی‌شود | CHECK `treasury.is_masked_pan` / `all_masked_pans` روی ستون‌های کارت؛ CHECK `NOT treasury.contains_pan(col)` (`*_no_pan`) روی ۳۱ ستون متن آزاد treasury و pos (RV-TP-08) | `T02 INV-TRS-02 full card number rejected`، `T12 INV-TRS-02 no full PAN on card transactions`، `T31 RV-TP-08 statement description with a full PAN rejected` (و counterparty، مرجع و یادداشت ابزار، یادداشت رسید)، `T31 mask_pans masks to the masked-PAN shape` |
 | **INV-TRS-03** | هر منبع وجه یک مقدار بُعد اختصاصی از نوع درست دارد (`bank_account`، `cash_box`، `petty_cash`، `pos_terminal`، `payment_gateway`) و آن مقدار به منبع دیگری داده نمی‌شود | تریگر `assert_fund_dimension` (`HK_TRS_FUND_DIMENSION`)؛ UNIQUE روی ستون بُعد | `T02 INV-TRS-03 bank account with a cash-box dimension`، `cash box with another cash box dimension` |
 | **INV-TRS-04** | سند ثبت‌شده تراز است: Σ ابزارها = Σ سطرهای طرف = مبلغ سند. پس از ثبت، سند و سطرهایش تغییرناپذیرند | قید deferred `money_document_check` (`HK_TRS_DOC_UNBALANCED`)؛ تریگرهای guard (`HK_TRS_DOC_IMMUTABLE`) | `T03 INV-TRS-04 posted document must balance`، `posted document immutable`، `no lines after posting` |
-| **INV-TRS-05** | شکل هر ابزار با نوع و جهتش می‌خواند: نقد ↔ صندوق، کارتخوان ↔ پایانه و RRN، تنخواه فقط در پرداخت، روش انتقال فقط برای انتقال، سطر «چک برگشتی» فقط با چک برگشتی | CHECKهای `money_instrument`؛ تریگر (`HK_TRS_INSTRUMENT_DIRECTION`، `HK_TRS_COUNTER_CHEQUE`) | `T03 INV-TRS-05 cash needs a cash box`، `rrn only on card instruments`، `petty cash is not a receipt instrument`، `T03 card_to_card method`، `T24 bounced-cheque settlement needs a bounced cheque` |
-| **INV-TRS-06** | برای هر قلم باز: `allocated_amount` = Σ تخصیص‌های فعال، و 0 ≤ تخصیص‌یافته ≤ مبلغ. وضعیت (`open`، `partial`، `closed`) از همین مشتق است | تریگر allocation به‌روزرسانی هر دو قلم؛ قید deferred (`HK_TRS_ALLOC_DRIFT`) | `T04 INV-TRS-06 allocation updates both items`، `allocated_amount equals active allocations`، `T04 reversal restores both items` |
-| **INV-TRS-07** | مبلغ قلم باز تغییرناپذیر است. هر سطر مبدأ حداکثر یک قلم زنده دارد. قلمی که تخصیص فعال دارد لغو نمی‌شود | تریگر guard (`HK_TRS_IMMUTABLE_FIELD`، `HK_TRS_OPEN_ITEM_ALLOCATED`)؛ ایندکس یکتای جزئی `open_item_source_uq` | `T04 INV-TRS-07 amount immutable`، `one live open item per source line`، `allocated item cannot be cancelled` |
+| **INV-TRS-05** | شکل هر ابزار با نوع و جهتش می‌خواند: نقد ↔ صندوق، کارتخوان ↔ پایانه و RRN، تنخواه فقط در پرداخت، روش انتقال فقط برای انتقال، سطر «چک برگشتی» فقط با چک برگشتی. منبع وجه، چک، تراکنش کارت، پرداخت درگاه و حساب سطر طرف از **همان شرکتِ** سند و با **همان ارز** سندند؛ همین برای رویداد چک، جابه‌جایی نقد و پرداخت رسید صندوق (RV-TP-07) | CHECKهای `money_instrument`؛ ستون `company_id` (از والد با تریگر) و FK سه‌ستونی `(tenant_id, company_id, x)`؛ تریگر (`HK_TRS_INSTRUMENT_DIRECTION`، `HK_TRS_COUNTER_CHEQUE`، `HK_TRS_INSTRUMENT_CURRENCY`) | `T03 INV-TRS-05 cash needs a cash box`، `rrn only on card instruments`، `petty cash is not a receipt instrument`، `T03 card_to_card method`، `T24 bounced-cheque settlement needs a bounced cheque`، `T35 RV-TP-07 a cash box of another company never funds a document`، `… a USD bank account never funds an IRR document`، `… company of a line is the company of its document` |
+| **INV-TRS-17** | هر مبلغ پولی treasury و pos (قلم باز، تخصیص، سند و سطرها، چک و رویداد، تراکنش کارت، تسویه، شمارش نقد، انتقال، تنخواه، رسید صندوق و سطر و پرداخت، شیفت، جابه‌جایی نقد) با `minor_unit` ارز خودش گرد است؛ مبلغ پایه با ارز پایهٔ شرکت. همان قاعدهٔ سطر سند ledger (RV-TP-20) | تریگر `treasury.minor_unit_guard` (`HK_TRS_MINOR_UNIT`) | `T35 RV-TP-20 fractional rial on a document` (و قلم باز، تراکنش کارت، شمارش نقد، رسید صندوق) |
+| **INV-TRS-06** | برای هر قلم باز: `allocated_amount` = Σ تخصیص‌های فعال، و 0 ≤ تخصیص‌یافته ≤ مبلغ. وضعیت (`open` یا `closed`) از همین مشتق است؛ `cancelled` فقط با تخصیص صفر و با `cancel_date` (تاریخ دفتری ابطال، برای زیردفتر در تاریخ). «بخشی تسویه‌شده» وضعیت نیست و از `0 < allocated_amount < amount` خوانده می‌شود | تریگر allocation به‌روزرسانی هر دو قلم؛ قید deferred (`HK_TRS_ALLOC_DRIFT`) | `T04 INV-TRS-06 allocation updates both items`، `allocated_amount equals active allocations`، `T04 reversal restores both items` |
+| **INV-TRS-07** | مبلغ، حساب کنترل و هویت قلم باز تغییرناپذیرند. هر سطر مبدأ حداکثر یک قلم زنده دارد. قلمی که تخصیص فعال دارد لغو نمی‌شود | تریگر guard (`HK_TRS_IMMUTABLE_FIELD`، `HK_TRS_OPEN_ITEM_ALLOCATED`)؛ ایندکس یکتای جزئی `open_item_source_uq` | `T04 INV-TRS-07 amount immutable`، `one live open item per source line`، `allocated item cannot be cancelled` |
 | **INV-TRS-08** | روی شخص ادغام‌شده قلم تازه ساخته نمی‌شود. قلم‌های قدیمی او با اقلام جانشین تسویه می‌شوند | تریگر با `parties.canonical_party` / `treasury.canonical_party` | `T04b INV-TRS-08 no new open item on a merged party`، `loser item settled by winner receipt` |
 | **INV-TRS-09** | انتقال دقیقاً یک مبدأ و یک مقصد دارد، به خودش نیست و هر دو منبع هم‌ارزند. حالت «در راه» فقط با مرحلهٔ دریافت کامل می‌شود | CHECK `fund_transfer_*`؛ تریگر (`HK_TRS_TRANSFER_CURRENCY`) | `T05 INV-TRS-09 exactly one source fund`، `no self transfer`، `fund currency`، `T05 in-transit transfer completes only with its receive leg` |
 | **INV-TRS-10** | لغو سند ثبت‌شده فقط با سند برگشت است. بازگشت به پیش‌نویس و حذف سند ثبت‌شده ممکن نیست | تریگر guard (`HK_TRS_DOC_TRANSITION`)؛ GRANT بدون DELETE روی ردیف ثبت‌شده | `T03 cancel needs a reversal journal`، `no way back to draft`، `posted document not deletable` |
 | **INV-TRS-11** | هر مبدأ خودکار (`pos`، `gateway`، `statement`، `payroll`، `petty_cash`) برای هر `origin_ref` حداکثر یک سند زنده دارد. پس پردازش دوباره سند دوم نمی‌سازد | ایندکس یکتای جزئی `money_document_origin_uq`؛ CHECK `money_doc_origin_ref` | `T03 INV-TRS-11 one live document per automatic origin`، `automatic origin needs its source reference` |
 | **INV-TRS-12** | در شمارش نقد، Σ (اسکناس و سکه × تعداد) = مبلغ شمارش‌شده. اختلاف ناصفر فقط با سند ثبت می‌شود | تریگر (`HK_TRS_CASH_COUNT_DENOMINATION`، `HK_TRS_CASH_COUNT_TOTAL`)؛ CHECK | `T06 INV-TRS-12 denominations add up to the count`، `shortage needs a journal` |
-| **INV-TRS-13** | جمع سطرهای صورت‌خرج = مبلغ آن. تأییدکننده ≠ ارسال‌کننده | قید deferred؛ CHECK | `T07 INV-TRS-13 lines add up to the claim`، `approver differs from submitter` |
+| **INV-TRS-13** | جمع سطرهای صورت‌خرج = مبلغ آن. تأییدکننده ≠ ارسال‌کننده. ارزش افزودهٔ تنخواه فقط با `input_credit`، شناسهٔ مالیاتی فروشنده و صورتحساب مؤدیان اعتبار می‌شود و صورت‌خرج ثبت‌شده آن را در دفتر خرید مالیاتی دارد؛ بقیه هزینه است (RV-TP-10) | قید deferred (`HK_TRS_DOC_UNBALANCED`، `HK_TRS_PETTY_VAT_REGISTER`)؛ CHECK `petty_line_vat_credit` | `T07 INV-TRS-13 lines add up to the claim`، `approver differs from submitter`، `T37 RV-TP-10 input VAT credit needs the seller tax id and the Moadian invoice taxid`، `T37 RV-TP-10 input VAT of a posted petty cash claim is recorded in the tax purchase register first` |
 | **INV-TRS-14** | تخصیص فقط بین یک قلم بدهکار و یک قلم بستانکار است، با همان شرکت، شخص مؤثر، ارز و کلاس. دریافتنی با پرداختنی فقط از راه تهاتر سنددار جفت می‌شود. مبلغ ≤ ماندهٔ هر دو است. تخصیص تغییرناپذیر است و فقط با دلیل برگشت می‌خورد | تریگر `allocation_guard` (`HK_TRS_ALLOC_DIRECTION`، `_PARTY`، `_CURRENCY`، `_CLASS`، `_COMPANY`، `_EXCEEDS`، `_ITEM_STATE`، `_IMMUTABLE`) | `T04 debit/credit roles`، `different parties`، `currency must match`، `receivable vs payable needs an offset`، `exceeds`، `allocation immutable`، `T24 allocation stays inside one company` |
 | **INV-TRS-15** | ابزار چک در سند ثبت‌شده به رکورد چک اشاره می‌کند و مبلغش برابر مبلغ چک است | تریگر و قید deferred (`HK_TRS_INSTRUMENT_CHEQUE`، `HK_TRS_DOC_CHEQUE_MISSING`) | `T24 cheque instrument amount equals the cheque`، `posted cheque instruments reference their cheque record` |
+| **INV-TRS-18** | زیردفتر اشخاص = دفتر کل (INV-LED-34): برای هر حساب کنترل `party` (1201، 3101)، شخص مؤثر و ارز، در هر تاریخ، Σ ماندهٔ اقلام باز (قلم باطل تا `cancel_date` و تخصیص برگشتی تا `reverse_date`) = ماندهٔ GL. هر قلم حساب کنترلی را دارد که سند مبدأ برای همان شخص و سمت ثبت کرده؛ سند بی‌قلم روی حساب کنترل کشف می‌شود. تخصیص بین دو حساب کنترل (پیش‌دریافت ↔ دریافتنی) فقط با سند طبقه‌بندی (RV-IT2-04، RV-X3-02) | `treasury.subledger_party` در `ledger.subledger_source` + `ledger.check_control_accounts`؛ قید deferred `open_item_check` (`HK_TRS_OPEN_ITEM_ACCOUNT`)؛ `allocation_guard` (`HK_TRS_ALLOC_ACCOUNT`) | `T37 RV-IT2-04 treasury registers the party subledger`، `open item account must be the account its journal posted`، `receivables subledger (open items) = GL by party`، `party subledger as of a date`، `RV-X3-02 a receivable posting without an open item is detected by check_control_accounts`، `allocating an advance to an invoice needs a reclassification journal`، `party subledger = GL after a dated cancellation` |
+| **INV-TRS-19** | هر تخصیص پایهٔ مصرف‌شدهٔ هر دو قلم را ثبت می‌کند (به نسبت مبلغ؛ تخصیص بستن‌کننده باقی‌مانده را می‌گیرد) و `fx_diff_base` ≠ ۰ بدون سند تسعیر تحقق‌یافتهٔ `treasury.allocation/<id>` ثبت نمی‌شود. برگشت تخصیص سنددار سند برگشت می‌خواهد. پس ماندهٔ پایهٔ ارزی زیردفتر = GL (RV-X3-01) | تریگر `allocation_guard` (`HK_TRS_ALLOC_FX_JOURNAL`)؛ ستون تولیدی `fx_diff_base` | `T37 RV-X3-01 settling foreign-currency items at another rate needs the realized FX journal`، `partial settlement consumes base pro rata and books the realized difference`، `reversing an allocation with a journal needs its reversal journal`، `foreign-currency outstanding base is net of the base consumed by allocations` |
+| **INV-TRS-20** | سوخت مطالبه فقط با درخواست تأیید approved همان سوخت، حداکثر به ماندهٔ دریافتنیِ همان شخص و ارز، با سند `treasury.write_off/<id>`، قلم بستانکار و تخصیص `write_off` ثبت می‌شود. ثبت‌شده تغییرناپذیر است و فقط یک‌بار برگشت می‌خورد؛ برگشت تخصیص را برمی‌گرداند و قلم بستانکار را باطل می‌کند (RV-X2-06) | تریگر `write_off_guard` و قید deferred `write_off_check` (`HK_TRS_WRITE_OFF_ITEM`، `_JOURNAL`، `_IMMUTABLE`)؛ FK چهارستونی تأیید و `core.approval_assert_approved` | `T37 RV-X2-06 a write-off needs an approved request for this very write-off`، `never exceeds the outstanding receivable`، `owns its credit item and write_off allocation`، `after a write-off aging (open items) = GL by party`، `a reversed write-off reopens the receivable` |
 | **INV-TRS-16** | سند GL هر سند خزانه برای هر ابزار سطری با همان مبلغ، همان حساب کلید ابزار و همان بُعد منبع وجه دارد (`source_line_ref = inst:<n>`). پس ماندهٔ هر منبع از GL = جمع اسناد آن | سرویس (`domain/posting.py`) + `ledger.check_control_accounts` | `tests/integration/treasury/test_money_document_posting.py::test_gl_lines_match_instruments`، `::test_fund_balance_equals_documents` |
 
 ### ۷-۲. چک (CHQ)
@@ -1887,11 +1996,11 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | **INV-CHQ-01** | شناسهٔ صیاد ۱۶ رقم است و جز برای چک قدیمی (`is_legacy`) یا ورود مهاجرت اجباری است | CHECK | `T09 INV-CHQ-01 sayad id is 16 digits`، `sayad id required unless legacy` |
 | **INV-CHQ-02** | شناسهٔ صیاد فقط بین چک‌های «فعال» یکتاست. چک خرج‌شده یا عودت‌شده می‌تواند با رکورد تازه برگردد | ستون `sayad_unique` (از وضعیت)؛ ایندکس یکتای جزئی `cheque_sayad_active_uq` | `T09 INV-CHQ-02 duplicate active sayad id`، `spent cheque may come back as a new record`، `reactivation conflicts with the active record` |
 | **INV-CHQ-03** | وضعیت چک فقط با رویداد عوض می‌شود. هر چک رویداد ایجاد دارد. `seq` پیوسته است. هر گذار در کاتالوگ است و از وضعیت جاری شروع می‌شود. وضعیت پایانی خروجی ندارد | تریگرهای `cheque_guard` (`HK_CHQ_STATE_VIA_EVENT`) و `cheque_event_guard` (`HK_CHQ_TRANSITION`، `_EVENT_SEQ`، `_EVENT_DATE`)؛ قید deferred (`HK_CHQ_NO_CREATION_EVENT`) | `T09 INV-CHQ-03 state changes only via events`، `cheque needs its creation event`، `contiguous event seq`، `R3 needs deposited state`، `T09 terminal state has no exits`، `event dates never go backwards` |
-| **INV-CHQ-04** | گذار سنددار سند دارد و گذار بی‌سند ندارد. منبع وجه و طرف تازهٔ لازم داده شده‌اند | `cheque_event_guard` (`HK_CHQ_JOURNAL_REQUIRED`، `_JOURNAL_UNEXPECTED`، `_FUND_REQUIRED`، `_COUNTERPARTY_REQUIRED`) | `T09 INV-CHQ-04 deposit needs its journal`، `T09 deposit needs a bank account`، `T24 endorsement names the endorsee` |
-| **INV-CHQ-05** | مبلغ هر گذار طبق قاعدهٔ کاتالوگ است: وصول بخشی 0 < x < اسمی، تسویه = مانده. `collected_amount` فقط از رویداد تغییر می‌کند | `cheque_event_guard` (`HK_CHQ_AMOUNT`)؛ مقادیر «پس از» | `T09 INV-CHQ-05 partial amount below face`، `T10 INV-CHQ-05 partial collection recorded`، `T09 settlement equals the outstanding amount`، `T10 collected amount only via events` |
+| **INV-CHQ-04** | گذار سنددار سند دارد و گذار بی‌سند ندارد. سند از treasury و برای همین چک است (`source_doc_type='treasury.cheque'`، `source_doc_id` = چک، `source_event = lower(code):seq`)، یا سند دریافت/پرداخت همان رویداد، یا واگذاری گروهی؛ و اگر ارزش چک به حساب یا بُعد نگهداری تازه برود، سند سطر بدهکار همان حساب و بُعد و مبلغ را دارد. سند undo برگشتِ treasury همین چک است (RV-IT2-10). منبع وجه و طرف تازهٔ لازم داده شده‌اند | `cheque_event_guard` (`HK_CHQ_JOURNAL_REQUIRED`، `_JOURNAL_UNEXPECTED`، `_JOURNAL_SOURCE`، `_FUND_REQUIRED`، `_COUNTERPARTY_REQUIRED`) | `T09 INV-CHQ-04 deposit needs its journal`، `T09 deposit needs a bank account`، `T24 endorsement names the endorsee`، `T36 RV-IT2-10 a journal of another module is not a cheque transition journal`، `… the transition journal debits the new holding account`، `… an undo journal is the treasury reversal of this cheque` |
+| **INV-CHQ-05** | مبلغ هر گذار طبق قاعدهٔ کاتالوگ است: وصول (R3)، برگشت (R5) و برگشت از بانک (R12) = مانده؛ وصول بخشی 0 < x < مانده و `collected_amount` به‌اندازهٔ x بالا می‌رود؛ تسویه = مانده؛ قسط 0 < x < مانده. پس چک برگشتی دوباره ارائه می‌شود (R2B، R2C، R2D) و دوباره وصول یا برگشت می‌شود (RV-X2-02). `collected_amount` فقط از رویداد تغییر می‌کند | `cheque_event_guard` (`HK_CHQ_AMOUNT`)؛ مقادیر «پس از» | `T09 INV-CHQ-05 partial amount below face`، `T10 INV-CHQ-05 partial collection recorded`، `T09 settlement equals the outstanding amount`، `T10 collected amount only via events`، `T36 RV-X2-02 a bounced cheque is re-presented, bounces again, is re-presented and collected`، `T36 RV-X2-02 partial collections accumulate across re-presentations`، `T36 RV-TP-23 a cheque returned by a third party is settled in instalments` |
 | **INV-CHQ-06** | چک تضمینی فقط حساب‌های انتظامی را لمس می‌کند و گذارهای پرداخت ندارد. قالب چک عادی هرگز کلید انتظامی ندارد | داده‌های کاتالوگ + `HK_CHQ_TRANSITION_KIND` | `T01 INV-CHQ-06 guarantee templates use memo keys only`، `T01 payment templates never touch memo keys`، `T11 INV-CHQ-06 guarantee cheque cannot use payment transitions` |
-| **INV-CHQ-07** | بازهٔ سریال دسته‌چک‌های یک حساب هم‌پوشانی ندارد. چک صادره به یک برگ unused با همان medium اشاره می‌کند. هر برگ حداکثر یک چک فعال دارد. ابطال ثبت برگ را آزاد می‌کند | EXCLUDE (gist) روی بازه؛ تریگر (`HK_CHQ_LEAF_MISMATCH`، `_LEAF_TRANSITION`، `_LEAF_RANGE`)؛ `cheque_leaf_active_uq` | `T08 INV-CHQ-07 overlapping cheque books`، `T11 INV-CHQ-07 issued cheque uses a chequebook leaf`، `leaf medium must match`، `leaf issued with the cheque`، `one active cheque per leaf`، `T11 cancelled registration frees the leaf` |
-| **INV-CHQ-08** | رویدادها فقط‌افزودنی‌اند. undo فقط برای آخرین گذار مؤثر، هر رویداد یک‌بار، با سند برگشت، و دقیقاً مقادیر قبلی را بازمی‌گرداند. رویداد ایجاد undo نمی‌شود | `core.forbid_mutation`؛ `cheque_event_guard` (`HK_CHQ_UNDO_TARGET`، `_UNDO_NOT_LAST`، `_UNDO_VALUES`)؛ `cheque_event_undo_once_uq` | `T09 INV-CHQ-08 events append-only`، `undo restores the previous after-values exactly (holding)`، `an event is undone at most once`، `creation cannot be undone (use cancel)`، `T24 only the latest effective transition can be undone` |
+| **INV-CHQ-07** | بازهٔ سریال دسته‌چک‌های یک حساب هم‌پوشانی ندارد. چک صادره به یک برگ unused با همان medium اشاره می‌کند. هر برگ حداکثر یک چک فعال دارد؛ برگ چک فعال نه unused می‌شود نه باطل. ضمانت صادرهٔ اجراشده (G6) برگ و صیادش را به چک پرداخت تبدیل‌شده (`converted_from_cheque_id`) می‌دهد (RV-TP-06، D-T08). ابطال ثبت برگ را آزاد می‌کند | EXCLUDE (gist) روی بازه؛ تریگر (`HK_CHQ_LEAF_MISMATCH`، `_LEAF_TRANSITION`، `_LEAF_RANGE`، `_CONVERSION`)؛ `cheque_leaf_active_uq` (بدون ضمانت enforced)؛ `sayad_unique=false` برای ضمانت اجراشده | `T08 INV-CHQ-07 overlapping cheque books`، `T11 INV-CHQ-07 issued cheque uses a chequebook leaf`، `leaf medium must match`، `leaf issued with the cheque`، `one active cheque per leaf`، `T11 cancelled registration frees the leaf`، `T36 INV-CHQ-07 a leaf of an active cheque never returns to unused`، `T36 a leaf of an active cheque is not voided`، `T36 RV-TP-06 enforced issued guarantee becomes a payment cheque on the same leaf and sayad id (G6 then P1)`، `… (G3 then R1)`، `T36 RV-TP-06 only an enforced guarantee converts to a payment cheque` |
+| **INV-CHQ-08** | رویدادها فقط‌افزودنی‌اند. undo فقط برای آخرین گذار مؤثر، هر رویداد یک‌بار، با سند برگشت، و دقیقاً مقادیر قبلی را بازمی‌گرداند. رویداد ایجاد و ابطال ثبت (R13*، XC1، GXR، GXI) undo نمی‌شوند: ابطال نهایی است (RV-TP-05). undo تعویض (R8*) یا اجرای ضمانت (G3، G6) فقط پس از ابطال چک جانشین یا تبدیل‌شده | `core.forbid_mutation`؛ `cheque_event_guard` (`HK_CHQ_UNDO_TARGET`، `_UNDO_NOT_LAST`، `_UNDO_VALUES`، `_UNDO_DEPENDENT`)؛ `cheque_event_undo_once_uq` | `T09 INV-CHQ-08 events append-only`، `undo restores the previous after-values exactly (holding)`، `an event is undone at most once`، `creation cannot be undone (use cancel)`، `T24 only the latest effective transition can be undone`، `T36 RV-TP-05 a cancelled received cheque cannot be revived by undo`، `… a cancelled issued cheque cannot be revived by undo`، `T36 RV-TP-05 undo of a replacement needs the replacement cheque cancelled first` |
 | **INV-CHQ-09** | چک صادره در وجه حامل نیست: ذی‌نفع اجباری است | CHECK `cheque_no_bearer` | `T11 INV-CHQ-09 bearer cheque forbidden` |
 | **INV-CHQ-10** | رنگ اعتباری فقط از استعلام ثبت‌شده و از کاتالوگ داده‌ای می‌آید. استعلام قدیمی‌تر رنگ تازه‌تر را بازنویسی نمی‌کند. استعلام فقط برای چک دریافتی است | FK به `ref.sayad_credit_status`؛ تریگر (`HK_CHQ_SAYAD_COLOR`، `HK_CHQ_SAYAD_INQUIRY`) | `T11 INV-CHQ-10 colour only from a recorded inquiry`، `colour from the data-driven catalog`، `T11 older inquiry does not override`، `inquiry only for received cheques` |
 | **INV-CHQ-11** | وضعیت صیاد هر جهت فقط رو به جلو و در مجموعهٔ همان جهت است. وضعیت حقوقی هم فقط رو به جلو است | تریگر (`HK_CHQ_SAYAD_TRANSITION`، `HK_CHQ_LEGAL_TRANSITION`) | `T11 INV-CHQ-11 sayad state forward only`، `sayad states per direction`، `T11 legal status forward only` |
@@ -1900,6 +2009,7 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | **INV-CHQ-14** | در هر وضعیت «نزد ما»، رویداد آخر حساب و بُعد محل نگهداری را با مبلغ = مانده ثبت می‌کند. زیردفتر چک (`cheque_holdings`) در هر تاریخ با GL حساب‌های کنترل برابر است. سند GL بدون رویداد چک کشف می‌شود | `cheque_event_guard` (`HK_CHQ_HOLDING`، `HK_CHQ_AFTER_VALUES`)؛ `ledger.subledger_source` + `ledger.check_control_accounts` | `T09 INV-CHQ-14 holding state records its holding account`، `T10 INV-CHQ-14 holding amount = outstanding after partial collection`، `T22 INV-CHQ-14 cheque subledger = GL as of 2026-04-15 (in hand)`، `... 2026-04-30 (deposited)`، `GL posting without a cheque event is detected` |
 | **INV-CHQ-15** | چک واردشده از مهاجرت فقط با گذار `IMP_*` و بدون سند ثبت می‌شود (مانده از سند افتتاحیه است). گذار import برای چک غیرمهاجرتی ممنوع است | `cheque_event_guard` (`HK_CHQ_IMPORT_ORIGIN`) | `T11 INV-CHQ-15 imported cheque has no new journal (balance comes from opening)`، `T11 import transitions only for migrated cheques`، `import event describes the registered cheque` |
 | **INV-CHQ-16** | با `sayad_accept_required = block`، واگذاری و خرج چک دریافتیِ غیر `accepted` فقط با مجوز `treasury.cheque.override_sayad` و ممیزی ممکن است. با `warn` هشدار در پاسخ می‌آید | سرویس `ChequeService.transition` | `tests/unit/treasury/test_cheque_service.py::test_sayad_gate_off_warn_block`، `::test_sayad_override_audited` |
+| **INV-CHQ-18** | هر گذار چک که ارزش را به حساب کنترل اشخاص می‌برد (برگشت به دریافتنی، باقی‌ماندهٔ وصول بخشی، هزینهٔ واخواست، تسویه و تعویض برگشتی، برگشت از ثالث، عودت، برگشت چک ما، خرج) برای هر سطر آن حساب قلم بازِ همان حساب، شخص، سمت و مبلغ پایه دارد (منبع `treasury.cheque`، کلید `lower(code):seq[:n]`). undo اقلام همان گذار را باطل می‌کند و ابطال ثبت چک همهٔ اقلامش را (RV-TP-11، RV-X2-01) | قید deferred `cheque_event_open_items_check` (`HK_CHQ_OPEN_ITEM`) | `T37 RV-TP-11 a cheque bounce to the party receivable registers its open item`، `undo of a transition cancels the open items it registered`، `cancelling a cheque registration cancels its open items` |
 | **INV-CHQ-17** | ابطال ثبت چک (R13، XC1، GXR، GXI) همهٔ اسناد گذارهای مؤثر را برمی‌گرداند و اگر یکی از آن‌ها در صورت مغایرت قطعی باشد رد می‌شود. لغو سند دریافت یا پرداخت وقتی چکش گذار بعدی خورده رد می‌شود | سرویس + `HK_BNK_RECON_FINALIZED` در برگشت تطبیق | `tests/integration/treasury/test_cheque_cancel.py::test_cancel_reverses_all_effective_journals`، `::test_cancel_blocked_by_finalized_recon`، `::test_document_cancel_blocked_when_cheque_moved` |
 
 ### ۷-۳. کارتخوان و درگاه (CRD، GW)
@@ -1907,11 +2017,11 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | شناسه | گزاره | اجرا | آزمون |
 |---|---|---|---|
 | **INV-CRD-01** | RRN و STAN متن‌اند (صفرهای پیشرو حفظ می‌شود). STAN ≤ ۶ رقم است. RRN در هر پایانه یکتاست | نوع `text` + CHECK؛ `card_txn_rrn_uq` | `T03 INV-CRD-01 RRN keeps leading zeros (text)`، `T12 INV-CRD-01 RRN text with leading zeros`، `RRN unique per terminal`، `T12 STAN is at most 6 digits` |
-| **INV-CRD-02** | هر تراکنش کارتی حداکثر یک‌بار تسویه می‌شود. ناخالص تسویه = Σ تراکنش‌های آن و خالص = ناخالص − کارمزد. تراکنش تسویه‌شده باطل نمی‌شود. تسویهٔ ثبت‌شده تغییرناپذیر است و لغوش تراکنش‌ها را آزاد می‌کند | تریگر و قید deferred (`HK_CRD_SETTLED_ONCE`، `HK_CRD_SETTLEMENT_TOTAL`، `HK_CRD_TRANSITION`) | `T12 INV-CRD-02 settled once`، `settlement equals its transactions`، `T12 settled transaction cannot be voided`، `posted settlement immutable`، `cancelled settlement releases its transactions`، `T24 reversed card transaction is final` |
+| **INV-CRD-02** | هر تراکنش کارتی حداکثر یک‌بار تسویه می‌شود و فقط به تسویهٔ **پیش‌نویس** همان پایانه و شرکت می‌پیوندد (با قفل ردیف تسویه)؛ تسویهٔ ثبت‌شده یا ابطال‌شده تراکنش تازه نمی‌گیرد (RV-TP-04). ناخالص تسویه = Σ تراکنش‌های آن و خالص = ناخالص − کارمزد. تراکنش تسویه‌شده باطل نمی‌شود. تسویهٔ ثبت‌شده تغییرناپذیر است و لغوش تراکنش‌ها را آزاد می‌کند | تریگر و قید deferred (`HK_CRD_SETTLED_ONCE`، `HK_CRD_SETTLEMENT_STATE`، `HK_CRD_SETTLEMENT_TOTAL`، `HK_CRD_TRANSITION`) | `T12 INV-CRD-02 settled once`، `settlement equals its transactions`، `T12 settled transaction cannot be voided`، `posted settlement immutable`، `cancelled settlement releases its transactions`، `T24 reversed card transaction is final`، `T35 RV-TP-04 a posted settlement never takes a new transaction`، `… a transaction of another terminal never joins the settlement`، `… a new transaction cannot be inserted into a posted settlement`، `… a void transaction never joins a settlement` |
 | **INV-CRD-03** | شمارهٔ پایانه در هر PSP یکتاست. بستن روزِ دارای اختلاف نمی‌تواند `ok` باشد | UNIQUE؛ CHECK | `T02 INV-CRD-03 terminal unique per PSP`، `T12 a mismatching day close cannot be ok` |
 | **INV-GW-01** | پرداخت درگاه فقط گذارهای مجاز را طی می‌کند (`created → redirected → callback_received → verified/failed/reversed/expired`). `reversed` و `failed` پایانی‌اند. مبلغ verify‌شده = مبلغ درخواستی | تریگر `gateway_payment_guard` (`HK_GW_TRANSITION`) | `T13 INV-GW-01 created -> verified not allowed`، `reversed is final`، `verified amount equals the requested amount` |
 | **INV-GW-02** | `(provider_code, provider_ref)` در مستأجر یکتاست و `provider_ref` فقط یک‌بار نوشته می‌شود | `gateway_payment_provider_ref_uq`؛ freeze | `T13 INV-GW-02 unique (provider, provider_ref)`، `T13 provider ref set once` |
-| **INV-GW-03** | ابزار `gateway` رسید فقط به پرداخت verify‌شده اشاره می‌کند و هر پرداخت حداکثر یک رسید دارد | تریگر (`HK_GW_NOT_VERIFIED`)؛ `money_instrument_gateway_uq` | `T13 INV-GW-03 receipt only for a verified payment` |
+| **INV-GW-03** | ابزار `gateway` رسید فقط به پرداخت verify‌شدهٔ همان شرکت و مبلغ اشاره می‌کند و هر پرداخت حداکثر یک رسید **زنده** (پیش‌نویس یا ثبت‌شده) دارد. رسید ابطال‌شده جا را برای رسید اصلاحی آزاد می‌کند و پیوند `gateway_payment.money_document_id` (و `pos.ticket.money_document_id`) فقط پس از ابطال رسید قبلی جابه‌جا می‌شود (RV-TP-17) | تریگر با قفل ردیف پرداخت (`HK_GW_NOT_VERIFIED`، `HK_GW_DUPLICATE_RECEIPT`)؛ `gateway_payment_guard` و `ticket_guard` | `T13 INV-GW-03 receipt only for a verified payment`، `T35 RV-TP-17 a gateway payment has one live receipt`، `… the receipt link of a live receipt is fixed`، `… a corrected receipt reuses the gateway payment after the first receipt is cancelled`، `… the receipt link moves to the corrected receipt` |
 | **INV-GW-04** | ارائه‌دهندهٔ `blocked` (آیدی‌پی) فعال یا پیکربندی نمی‌شود | تریگر (`HK_GW_PROVIDER_BLOCKED`) | `T13 INV-GW-04 blocked provider cannot be configured` |
 | **INV-GW-05** | پرداخت دارای رسید زنده به `reversed` نمی‌رود مگر رسید پیش‌تر لغو شده باشد | تریگر (`HK_GW_REVERSE_WITH_RECEIPT`) | `T13 INV-GW-05 reversing a credited payment needs the receipt cancelled first` |
 | **INV-GW-06** | مبلغ ریال صحیح است. `api_amount` برای ارائه‌دهندهٔ تومانی = مبلغ/۱۰ و برای ریالی = مبلغ | تریگر (`HK_GW_AMOUNT_UNIT`)؛ CHECK | `T13 INV-GW-06 toman provider gets amount/10`، `T13 whole rials only` |
@@ -1924,11 +2034,11 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 |---|---|---|---|
 | **INV-BNK-01** | هر سطر صورتحساب دقیقاً یکی از برداشت یا واریز را دارد. `signed_amount` مولد است | CHECK؛ `GENERATED` | `T14 INV-BNK-01 exactly one of debit/credit` |
 | **INV-BNK-02** | یک فایل دوبار وارد نمی‌شود (sha256 فایل در حساب). سطر تکراری در یک حساب دوبار نمی‌نشیند (`dedupe_hash`) | `statement_import_file_uq`؛ `statement_line_dedupe_uq` | `T14 INV-BNK-02 same file imported twice`، `duplicate line in the same account` |
-| **INV-BNK-03** | ورود فقط وقتی قطعی می‌شود که پیوستگی مانده (مانده‌ی قبلی ± مبلغ = ماندهٔ سطر) بی‌شکست باشد، یا عبور با دلیل ثبت شده باشد | تریگر `statement_import_guard` با `statement_continuity_breaks` (`HK_BNK_CONTINUITY`) | `T14 INV-BNK-03 continuity computed on commit`، `one balance break detected`، `broken running balance blocks commit`، `override with reason` |
+| **INV-BNK-03** | ورود فقط وقتی قطعی می‌شود که پیوستگی مانده بی‌شکست باشد، یا عبور با دلیل ثبت شده باشد. ماندهٔ مورد انتظار هر سطر = آخرین ماندهٔ ناتهیِ پیشین (یا ماندهٔ اول دوره) + جمع علامت‌دار سطرهای میانی؛ سلول خالی شکست بعدی را پنهان نمی‌کند و خودش «no_balance» است، پس فایل بی‌ستون مانده بدون override قطعی نمی‌شود (RV-TP-18) | تریگر `statement_import_guard` با `statement_continuity_breaks` (`HK_BNK_CONTINUITY`؛ نوع شکست: balance، opening، closing، no_balance) | `T14 INV-BNK-03 continuity computed on commit`، `one balance break detected`، `broken running balance blocks commit`، `override with reason`، `T35 RV-TP-18 a blank balance cell does not hide the next break (expected 160)`، `… break after a blank balance blocks commit`، `… a file without balances needs an override reason` |
 | **INV-BNK-04** | سطرهای ورود قطعی تغییرناپذیر و حذف‌نشدنی‌اند (فقط وضعیت تطبیق تغییر می‌کند) | تریگر guard (`HK_BNK_LINE_STATE`)؛ GRANT | `T14 INV-BNK-04 committed line immutable`، `committed line not deletable` |
 | **INV-BNK-05** | هر گروه تطبیق تراز است (Σ اقلام صورتحساب = Σ اقلام دفتر). سطر صورتحساب کامل در گروه می‌آید. هر سطر صورتحساب و هر سطر GL حداکثر در یک گروه فعال است. قلم دفتر روی حساب GL همان بانک با بُعد آن است. وضعیت سطر از گروه مشتق است | قید deferred (`HK_BNK_MATCH_UNBALANCED`)؛ تریگرها (`HK_BNK_MATCH_LINE`، `_BOOK`، `_STATE`، `_STATUS`)؛ `recon_item_*_active_uq` | `T14 INV-BNK-05 match sides balance`، `whole statement line amount`، `a line is in at most one active match`، `book item must be on the bank GL account`، `line marked matched`، `T24 items are added active to an active match` |
 | **INV-BNK-06** | واحد مبلغ اعلام‌شدهٔ هر ورود (`IRR`، `IRT`، `IRR_NEW`) صریح و پس از ساخت تغییرناپذیر است | NOT NULL + freeze | `T14 INV-BNK-06 declared amount unit immutable` |
-| **INV-BNK-07** | شرح نرمال fa-norm-v1 است. صورت مغایرت قطعی اتحاد «ماندهٔ بانک − تطبیق‌نشدهٔ بانک = ماندهٔ دفتر − تطبیق‌نشدهٔ دفتر» را دارد و تطبیق‌های تا تاریخ خود را قفل می‌کند | `GENERATED`؛ CHECK؛ تریگر (`HK_BNK_RECON_FINALIZED`، `HK_BNK_MATCH_IMMUTABLE`) | `T14 INV-BNK-07 description normalized (Arabic ya/kaf)`، `finalized reconciliation identity`، `finalized reconciliation locks its matches` |
+| **INV-BNK-07** | شرح نرمال fa-norm-v1 است. صورت مغایرت قطعی اتحاد «ماندهٔ بانک − تطبیق‌نشدهٔ بانک = ماندهٔ دفتر − تطبیق‌نشدهٔ دفتر» را دارد و تطبیق‌های تا تاریخ خود را قفل می‌کند: نه undo و نه تطبیق تازه برای سطر صورتحساب یا سطر دفتری با تاریخ ≤ as_of (RV-TP-13) | `GENERATED`؛ CHECK؛ تریگر (`HK_BNK_RECON_FINALIZED`، `HK_BNK_MATCH_IMMUTABLE`) | `T14 INV-BNK-07 description normalized (Arabic ya/kaf)`، `finalized reconciliation identity`، `finalized reconciliation locks its matches`، `T35 RV-TP-13 no new match for a statement line inside the finalized period`، `… for a GL line inside the finalized period`، `matching after the finalized date is allowed` |
 | **INV-BNK-08** | نرمال‌ساز مبلغ و تاریخ: ارقام فارسی و عربی و جداکننده‌ها حذف، علامت از پرانتز یا منها، ضریب IRT × ۱۰ و IRR_NEW از پارامتر تاریخ‌دار. تاریخ جلالی در همهٔ قالب‌ها به همان روز میلادی می‌رسد | سرویس `statement/normalize.py` | `tests/property/treasury/test_statement_normalize.py::test_amount_roundtrip`، `::test_jalali_formats_same_day`، `::test_unit_factor` |
 | **INV-BNK-09** | ورود دوباره یا هم‌پوشان یک صورتحساب سطر تازه نمی‌سازد و `dedupe_hash` برای یک ورودی همیشه یکسان است (`occurrence` برای سطرهای کاملاً یکسان) | سرویس `statement/dedupe.py` + `statement_line_dedupe_uq` | `tests/property/treasury/test_statement_dedupe.py::test_reimport_idempotent`، `::test_overlap_import` |
 | **INV-BNK-10** | تطبیق خودکار فقط وقتی انجام می‌شود که امتیاز ≥ آستانه و بهترین کاندید یکتا باشد. وگرنه پیشنهاد است. هیچ سطری با مبلغ نابرابر گروه نمی‌شود | سرویس `recon/engine.py` + INV-BNK-05 | `tests/unit/treasury/test_recon_engine.py::test_ambiguous_candidates_not_auto_matched`، `::test_threshold`، `tests/property/treasury/test_recon_engine.py::test_matches_always_balanced` |
@@ -1940,17 +2050,20 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | **INV-POS-01** | پایانه روی دستگاهی از همان شعبه است. هر دستگاه و هر کشو حداکثر یک پایانهٔ فعال دارد. کشو از نوع `pos_drawer` است. مشتری عمومی بی‌نام است. حالت مالیاتی آفلاین حافظه دارد. شعبه ثابت است | تریگر `terminal_guard` (`HK_POS_TERMINAL_DEVICE`، `_CASH_BOX`، `_WALK_IN`)؛ `terminal_*_active_uq`؛ CHECK | `T15 INV-POS-01 device of another branch`، `one active terminal per device and per drawer`، `T15 terminal uses a pos_drawer cash box`، `walk-in customer is anonymous`، `offline tax mode names its memory`، `branch fixed` |
 | **INV-POS-02** | سری رسید پایانه سری `pos.ticket` با `allocation=device` همان دستگاه است | تریگر (`HK_POS_TERMINAL_SERIES`) | `T15 INV-POS-02 receipt series must be the device pos.ticket series` |
 | **INV-POS-03** | هر پایانه حداکثر یک شیفت باز دارد. شیفت از کشوی پایانهٔ خودش استفاده می‌کند. دادهٔ باز کردن ثابت و شیفت بسته تغییرناپذیر است | `shift_one_open_uq`؛ تریگر `shift_guard` (`HK_POS_SHIFT_CLOSED`) | `T16 INV-POS-03 one open shift per terminal`، `T16 shift uses its terminal cash box`، `opening data fixed`، `T19 closed shift immutable` |
-| **INV-POS-04** | هر شعبه حداکثر یک روز کاری باز دارد. روز فقط پس از بستن همهٔ شیفت‌ها بسته می‌شود و روز بسته نهایی است | `business_day_one_open_uq`؛ تریگر (`HK_POS_DAY_OPEN_SHIFTS`، `HK_POS_DAY_CLOSED`) | `T16 INV-POS-04 one open business day per branch`، `close shifts before the business day`، `T19 closed business day final` |
+| **INV-POS-04** | هر شعبه حداکثر یک روز کاری باز دارد. روز فقط پس از بستن همهٔ شیفت‌ها بسته می‌شود و روز بسته نهایی است، حتی با باز و بسته شدن هم‌زمان: باز کردن شیفت روز را `FOR SHARE` قفل می‌کند و تریگر BEFORE بستن روز پس از قفل ردیف اجرا می‌شود (RV-TP-03) | `business_day_one_open_uq`؛ تریگر (`HK_POS_DAY_OPEN_SHIFTS`، `HK_POS_DAY_CLOSED`، `HK_POS_SHIFT_CONTEXT`) | `T16 INV-POS-04 one open business day per branch`، `close shifts before the business day`، `T19 closed business day final`، `T34 RV-TP-03 closing the day waits for a shift being opened in it`، `T34 RV-TP-03 the day close sees the committed shift`، `T34 RV-TP-03 the shift sees the closed day`، `T34 RV-TP-03 no closed business day has an open shift` |
 | **INV-POS-05** | جمع‌های رسید: ناخالص سطر = trunc(مقدار × فی) (RC_IITP، همان `sales.invoice_line_gross`). جمع = سطرها − تخفیف + حق سرویس + مالیات + گرد کردن. Σ پرداخت‌ها = جمع + انعام | قید deferred `ticket_check` (`HK_POS_TICKET_TOTALS`، `_PAYMENTS`، `_LINES`)؛ CHECK `line_rounding = 'truncate'` | `T18 INV-POS-05 line gross = trunc(qty x price)`، `ticket total = lines - discount + service + tax + rounding`، `payments = total + tip` |
-| **INV-POS-06** | رسید فقط از یک فرمان `*.completed` ذخیره‌شدهٔ همان دستگاه با نوع منطبق ساخته می‌شود. شمارهٔ رسید دستگاه یک‌بار مصرف می‌شود. شیفت و روز رسید با هم می‌خوانند | FK به `device_command`؛ تریگر (`HK_POS_TICKET_SOURCE`، `HK_POS_TICKET_CONTEXT`)؛ UNIQUE `number_issued_id` | `T18 INV-POS-06 ticket comes from a matching sale command`، `device receipt number used once`، `T24 ticket shift and business day agree` |
+| **INV-POS-06** | رسید فقط از یک فرمان `*.completed` ذخیره‌شدهٔ همان دستگاه با نوع منطبق ساخته می‌شود و با payload امضاشدهٔ آن یکی است: شناسه، `occurred_at`، جمع‌ها، تعداد سطر و پرداخت و جمع پرداخت‌ها. شمارهٔ رسید دستگاه یک‌بار مصرف می‌شود. شیفت و روز رسید با هم می‌خوانند | FK به `device_command`؛ تریگر و قید deferred (`HK_POS_TICKET_SOURCE`، `HK_POS_TICKET_CONTEXT`، `HK_POS_TICKET_PAYLOAD`)؛ UNIQUE `number_issued_id` | `T18 INV-POS-06 ticket comes from a matching sale command`، `device receipt number used once`، `T24 ticket shift and business day agree`، `T32 RV-TP-21 ticket totals differ from the signed payload`، `T32 RV-TP-21 ticket id differs from the signed payload`، `T32 ticket occurred_at equals the signed command` |
 | **INV-POS-07** | بازپرداخت کارتی در صندوق ساخته نمی‌شود | CHECK پرداخت رسید | `T18 INV-POS-07 no card refunds at the POS` |
 | **INV-POS-08** | رسید، سطرها و پرداخت‌ها تغییرناپذیر و حذف‌نشدنی‌اند. سطرها فقط در تراکنش ساخت رسید نوشته می‌شوند (`created_xact`). فقط پیوندهای ثبت، یک‌بار، پر می‌شوند و وضعیت ثبت فقط رو به جلو است | تریگرهای `ticket_guard` و `ticket_child_guard` (`HK_POS_TICKET_IMMUTABLE`، `_POSTING`)؛ GRANT | `T18 INV-POS-08 ticket immutable`، `lines are written only with their ticket`، `T18 posting status forward only`، `posting links set once`، `ticket not deletable`، `payments immutable` |
-| **INV-POS-09** | مقدار مرجوعی هر سطر فروش، روی همهٔ مرجوعی‌ها، از مقدار فروخته بیشتر نمی‌شود. رسید مرجوعی جمع غیرمثبت دارد | قید deferred (`HK_POS_RETURN_EXCEEDS`)؛ CHECK | `T18 INV-POS-09 returned quantity never exceeds the sale`، `T18 return ticket carries return lines with non-positive totals` |
+| **INV-POS-09** | مقدار، خالص و مالیات مرجوعی هر سطر فروش، روی همهٔ مرجوعی‌ها و حتی از دو صندوق هم‌زمان، از فروش آن بیشتر نمی‌شود؛ خالص و مالیات هر سطر برگشتی ≤ سهم نسبی (به نسبت مقدار، گرد به بالا در واحد خرد) سطر فروش است؛ همان SKU و واحد و رسید اصلی. رسید مرجوعی جمع غیرمثبت دارد | شمارنده‌های `returned_qty`، `returned_net` و `returned_tax` روی سطر فروش با UPDATE شرطی زیر قفل ردیف (`ticket_line_apply`)؛ CHECK `ticket_line_returned`؛ قید deferred برابری شمارنده با سطرهای برگشتی و سهم نسبی (`HK_POS_RETURN_EXCEEDS`؛ RV-TP-02، RV-TP-15) | `T18 INV-POS-09 returned quantity never exceeds the sale`، `T18 return ticket carries return lines with non-positive totals`، `T33 RV-TP-15 a return never refunds more than the original line earned`، `… never claims back more output VAT than the sale`، `… a partial return refunds at most its pro-rata share of the line net`، `T33 returned counters never go down`، `T34 RV-TP-02 a concurrent return of the same sale line waits for the first`، `T34 RV-TP-02 the second return sees the first and is capped` |
 | **INV-POS-10** | هر تغییر سفارش باز نسخه را +۱ می‌کند. سطر ارسال‌شده به آشپزخانه حذف یا ویرایش مقدار نمی‌شود و فقط با دلیل باطل می‌شود (پرچم ضایعات مشتق). سفارش بسته تغییرناپذیر است | تریگرهای `open_order_guard` و `open_order_line_guard` (`HK_POS_ORDER_VERSION`، `_LINE_SENT`، `_LINE_STATE`، `_CLOSED`) | `T19 INV-POS-10 every change advances the version`، `sent line is voided, never deleted`، `waste flag derived for voided-after-send`، `T19 sent line quantity fixed`، `void needs a reason`، `closed order immutable`، `T24 new order lines are pending` |
-| **INV-POS-11** | جمع مقدار فروخته از یک سطر سفارش در همهٔ رسیدهای تقسیم ≤ مقدار آن سطر است. سطر باطل فروخته نمی‌شود | قید deferred (`HK_POS_SPLIT_EXCEEDS`) | `T19 INV-POS-11 split bills never exceed the order line`، `voided order line cannot be billed` |
-| **INV-POS-12** | کسری یا اضافهٔ شیفت = شمارش‌شده − مورد انتظار | CHECK روی `pos.shift` | `T19 INV-POS-12 over/short = counted - expected` |
+| **INV-POS-11** | جمع مقدار فروخته از یک سطر سفارش در همهٔ رسیدهای تقسیم، حتی از دو صندوق هم‌زمان، ≤ مقدار آن سطر است. سطر باطل فروخته نمی‌شود و سطر صورتحساب‌شده باطل نمی‌شود | شمارندهٔ `open_order_line.billed_qty` با UPDATE شرطی زیر قفل ردیف؛ CHECK `open_line_billed`؛ قید deferred برابری با رسیدها (`HK_POS_SPLIT_EXCEEDS`؛ RV-TP-02) | `T19 INV-POS-11 split bills never exceed the order line`، `voided order line cannot be billed`، `T34 RV-TP-02 a concurrent split bill of the same order line waits for the first`، `T34 RV-TP-02 the second split bill sees the first and is capped` |
+| **INV-POS-12** | شیفت بسته کسری یا اضافه دارد و آن = شمارش‌شده − مورد انتظار | CHECK `shift_closed` و `shift_over_short` روی `pos.shift` (RV-TP-26) | `T19 INV-POS-12 over/short = counted - expected`، `T33 RV-TP-26 a closed shift records its over/short (INV-POS-12)` |
 | **INV-POS-13** | محاسبهٔ جمع رسید در TypeScript (صندوق)، پایتون (سرور) و SQL (`ticket_check`) روی بردارهای طلایی یکسان است | بردار مشترک `pos_totals_vectors_v1.json` | `packages/pos-core/test/totals.vectors.test.ts`، `tests/unit/pos/test_totals.py::test_vectors`، `tests/db/test_pos_totals_vectors.py` |
 | **INV-POS-14** | `hesabketab.pos` هیچ import از `hesabketab.ledger` ندارد. `treasury` از `sales`، `purchase`، `payroll` و `pos` import نمی‌کند | قرارداد import-linter (بخش ۰۱) | `ci: lint-imports` (`contracts: pos-no-ledger, treasury-below-commerce`) |
+| **INV-POS-16** | پرداخت نسیهٔ رسید فقط به نام مشتری همان رسید است و هرگز مشتری عمومی بی‌نام (RV-TP-16) | قید deferred (`HK_POS_ON_ACCOUNT_PARTY`) | `T33 RV-TP-16 on-account to the anonymous walk-in party rejected`، `… to a third party rejected`، `on-account to the named ticket customer accepted` |
+| **INV-POS-17** | taxid صادرشدهٔ دستگاه نوع (`tax_inty`) و الگوی (`tax_inp`) صورتحساب را دارد. نوع ۲ هرگز نسیه نیست (INV-SAL-15). نوع ۱ خریدار شناخته‌شده دارد (RV-X2-16) | CHECK `ticket_tax_pair`؛ قید deferred (`HK_POS_TYPE2_CASH_ONLY`، `HK_POS_TYPE1_BUYER`) | `T33 RV-X2-16 a type-2 Moadian invoice is never on account`، `… a type-1 Moadian invoice needs an identified buyer`، `… a device taxid records its invoice type and pattern` |
+| **INV-POS-18** | سطر کالای سریالی یا دسته‌ای سریال و دسته‌اش را در `ticket_line_tracking` دارد: یک سریال = یک واحد، جمع مقدار ردیابی = مقدار سطر، و فقط با رسید نوشته می‌شود (RV-TP-09) | CHECK `tracking_serial_unit`؛ قید deferred (`HK_POS_TRACKING_QTY`)؛ `ticket_child_guard` | `T33 RV-TP-09 serial/batch quantities add up to the line quantity`، `T33 one serial number is one unit`، `T33 RV-TP-09 a serialized sale stores its serial numbers`، `T33 tracking rows are written only with their ticket` |
 | **INV-POS-15** | پایانه‌ای با صورتحساب مالیاتی ارسال‌نشده، پیش از گذشتن `مهلت − warn_before_deadline_h`، روی دستگاه بنر مسدودکننده و در سرور اعلان اجباری مدیر دارد. مهلت فقط از پارامتر تاریخ‌دار قواعد خوانده می‌شود | دستگاه + job `pos.tax.deadline_watch` | `packages/pos-core/test/offline-limits.test.ts::deadline_banner`، `tests/integration/pos/test_tax_deadline_watch.py::test_alert_before_deadline`، `::test_reads_rule_param` |
 
 ### ۷-۶. همگام‌سازی (SYNC) و لبه (EDGE)
@@ -1960,7 +2073,7 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | **INV-SYNC-01** | فرمان‌های هر دستگاه یک زنجیرهٔ پیوسته‌اند: `device_seq = head+1` و `prev_hash = hash فرمان قبلی`. اولین فرمان به `sha256('hk-pos-genesis:v1:'‖device_id)` وصل است. بازبینی مستقل زنجیره پاک است | تریگر `device_command_guard` (`HK_SYNC_SEQ_GAP`، `HK_SYNC_CHAIN_BROKEN`)؛ `pos.genesis_hash`؛ `pos.verify_device_chain` | `T15 INV-SYNC-01 chain starts at the device genesis hash`، `T17 INV-SYNC-01 contiguous device_seq`، `prev_hash links to the stored head`، `independent chain verification is clean` |
 | **INV-SYNC-02** | `hash = sha256(body)`. ستون‌های فرمان (`cmd_id`، دستگاه، seq، نوع، زمان، `prev_hash`) با بدنهٔ امضاشده برابرند. `cmd_id` یکتاست | CHECK؛ تریگر (`HK_SYNC_BODY_MISMATCH`)؛ UNIQUE | `T17 INV-SYNC-02 hash = sha256(body)`، `columns equal the signed body`، `cmd_id unique (idempotency key)` |
 | **INV-SYNC-03** | فرمان‌ها فقط‌افزودنی‌اند | `core.forbid_mutation`؛ GRANT `SELECT, INSERT` | `T17 INV-SYNC-03 commands append-only` |
-| **INV-SYNC-04** | فرمانی که پس از ابطال یا مفقودی دستگاه رخ داده رد می‌شود. دستگاه قرنطینه‌شده یا بدون وضعیت همگام‌سازی فرمان نمی‌پذیرد | تریگر (`HK_SYNC_DEVICE_REVOKED`، `HK_SYNC_QUARANTINED`، `HK_SYNC_NO_STATE`) | `T17 INV-SYNC-04 commands after revocation rejected`، `T17 quarantined device stops ingestion`، `T24 device must be provisioned for sync` |
+| **INV-SYNC-04** | از دستگاه باطل یا گم‌شده فقط فرمان با `device_seq ≤ accept_through_seq` (سقف یک‌بارهٔ مدیر با دلیل) و `occurred_at < revoked_at` پذیرفته می‌شود، با پرچم `after_revocation`، و فقط از راه بازبینی حل‌شده اعمال می‌شود. زمان امضاشدهٔ دستگاه به‌تنهایی هرگز کافی نیست. دستگاه قرنطینه‌شده یا بدون وضعیت همگام‌سازی فرمان نمی‌پذیرد | تریگر (`HK_SYNC_DEVICE_REVOKED`، `HK_SYNC_ACCEPT_BOUND`، `HK_SYNC_REVIEW_REQUIRED`، `HK_SYNC_QUARANTINED`، `HK_SYNC_NO_STATE`) | `T17 RV-TP-01 backdated command of a revoked device rejected without a declared bound`، `T17 RV-TP-01 monotonic backdated command beyond the declared bound rejected`، `T17 INV-SYNC-04 command dated after revocation rejected even within the bound`، `T17 RV-X2-07 post-revocation command is never auto-applied`، `T17 acceptance bound is set once`، `T17 quarantined device stops ingestion`، `T24 device must be provisioned for sync` |
 | **INV-SYNC-05** | درج فرمان در همان تراکنش سر زنجیره را جلو می‌برد و outcome `pending` می‌سازد. outcome فقط با تریگر ساخته می‌شود. outcome نهایی تغییرناپذیر است. `review` کد خطا دارد و حلش کنشگر و یادداشت دارد | تریگر `device_command_apply`؛ `command_outcome_guard` (`HK_SYNC_OUTCOME`، `HK_SYNC_REVIEW_RESOLUTION`) | `T17 INV-SYNC-05 command stored, head advanced, outcome pending`، `T17 outcome rows are created by the command trigger only`، `final outcomes immutable`، `review needs an error code`، `review resolution needs resolver and note` |
 | **INV-SYNC-06** | outcome یک فرمان فقط وقتی از `pending` خارج می‌شود که هیچ outcome `pending` با seq کمتر در همان دستگاه نباشد | تریگر (`HK_SYNC_OUT_OF_ORDER`) | `T17 INV-SYNC-06 processed in device_seq order` |
 | **INV-SYNC-07** | سر زنجیره (`device_sync_state`) فقط با درج فرمان جلو می‌رود و با genesis آغاز می‌شود | تریگر `sync_state_guard` (`HK_SYNC_STATE_ADVANCE`، `HK_SYNC_STATE_INIT`) | `T17 INV-SYNC-07 head advances only with commands` |
@@ -1972,23 +2085,23 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | **INV-SYNC-13** | در نشست آفلاین، فروش پس از `max_hours` یا با گذر از سقف مبلغ یا نسیه روی دستگاه مسدود است. سرور نشستِ گذرکرده را `limit_exceeded` علامت می‌زند و اعلان می‌دهد | دستگاه + `pos.offline_session` | `packages/pos-core/test/offline-limits.test.ts`، `tests/integration/pos/test_offline_session.py::test_limit_exceeded_flagged` |
 | **INV-SYNC-14** | فرمان فروش با امضای معتبر هرگز دور ریخته نمی‌شود: نتیجهٔ آن `applied`، `review` یا `deferred` است. `rejected` فقط برای کدهای امنیتی (ابطال دستگاه، امضا) است و داده‌اش در `device_command` می‌ماند | سرویس `SyncProcessService` + جدول سیاست §۵-۱۷ | `tests/property/pos/test_conflict_policy.py::test_signed_sale_never_lost` (hypothesis: SKU، قیمت، موجودی، دوره، اعتبار تصادفی) |
 | **INV-SYNC-15** | پردازش دوباره یا موازی یک فرمان سند تکراری نمی‌سازد (یکتایی `origin`، `cmd_id` رسید، `number_issued_id`) | سرویس + INV-TRS-11 و INV-POS-06 | `tests/property/pos/test_sync_processor_stateful.py::SyncMachine` (hypothesis stateful: push تکراری، crash میان پردازش، دو worker) |
-| **INV-EDGE-01** | لبه هیچ سند حسابداری، فروش یا خزانه نمی‌سازد. فقط ذخیره و رله می‌کند و فرمان‌های سفارش خودش را با زنجیرهٔ جدا امضا می‌کند | نقش پایگاه دادهٔ لبه بدون دسترسی نوشتن به این اسکیماها؛ کد لبه بدون این سرویس‌ها | `tests/edge/test_edge_scope.py::test_edge_never_posts` |
-| **INV-EDGE-02** | ابر هم امضای پاکت لبه و هم امضای هر فرمان با کلید پایانهٔ خودش را می‌سنجد. لبه نمی‌تواند فرمان پایانه را بسازد یا تغییر دهد | سرویس `SyncIngestService.push` | `tests/unit/pos/test_sync_ingest.py::test_edge_relay_verifies_both_signatures`، `::test_edge_cannot_forge_terminal_command` |
-| **INV-EDGE-03** | پایانه فرمان را فقط پس از `acked_by_cloud` پاک می‌کند، حتی اگر لبه ack محلی داده باشد | `packages/sync` | `packages/sync/test/edge-ack.test.ts::deletes_only_after_cloud_ack` |
+| **INV-POSEDGE-01** | لبه هیچ سند حسابداری، فروش یا خزانه نمی‌سازد. فقط ذخیره و رله می‌کند و فرمان‌های سفارش خودش را با زنجیرهٔ جدا امضا می‌کند | نقش پایگاه دادهٔ لبه بدون دسترسی نوشتن به این اسکیماها؛ کد لبه بدون این سرویس‌ها | `tests/edge/test_edge_scope.py::test_edge_never_posts` |
+| **INV-POSEDGE-02** | ابر هم امضای پاکت لبه و هم امضای هر فرمان با کلید پایانهٔ خودش را می‌سنجد. لبه نمی‌تواند فرمان پایانه را بسازد یا تغییر دهد | سرویس `SyncIngestService.push` | `tests/unit/pos/test_sync_ingest.py::test_edge_relay_verifies_both_signatures`، `::test_edge_cannot_forge_terminal_command` |
+| **INV-POSEDGE-03** | پایانه فرمان را فقط پس از `acked_by_cloud` پاک می‌کند، حتی اگر لبه ack محلی داده باشد | `packages/sync` | `packages/sync/test/edge-ack.test.ts::deletes_only_after_cloud_ack` |
 
 ### ۷-۷. امنیت و دسترسی (SEC)
 
 | شناسه | گزاره | اجرا | آزمون |
 |---|---|---|---|
-| **INV-SEC-01** | هیچ ردیفی از `treasury` و `pos` بیرون از مستأجر جاری دیده یا نوشته نمی‌شود. ارجاع به ردیف مستأجر دیگر با FK ترکیبی ناممکن است. بدون context چیزی دیده نمی‌شود | `core.enable_tenant_rls` (FORCE)؛ FKهای `(tenant_id, …)` | `T20 tenant B sees none of tenant A rows`، `cannot write another tenant rows`، `update of another tenant row touches nothing`، `no tenant context sees nothing`، `composite FK blocks a reference to another tenant bank account` (و party و cash box) |
-| **INV-SEC-02** | `hk_readonly` همه را می‌خواند به‌جز ستون راز `gateway_account.credentials_sealed`، و چیزی نمی‌نویسد | GRANT ستونی | `T21 readonly sees tenant rows`، `readonly reads non-secret gateway columns`، `readonly cannot read sealed credentials`، `readonly cannot write` |
-| **INV-SEC-03** | هر جدول مستأجری این بخش RLS اجباری دارد، در `core.export_table_registry` ثبت است (راز با `hook`)، و GRANTهایش حداقلی است (فقط‌افزودنی: `SELECT, INSERT`؛ کاتالوگ: `SELECT`) | `core.security_lint()` | `tests/db/test_security_lint.py::test_no_findings_for_module[treasury]` و `[pos]` (اجرا شد: ۰ یافته) |
-| **INV-SEC-04** | اعتبارنامهٔ درگاه فقط مهروموم‌شده (envelope با کلید مستأجر) ذخیره می‌شود و هرگز در پاسخ API، لاگ، رخدادنگار یا خروجی ساده دیده نمی‌شود | `KeyManager.seal`؛ فیلتر redaction لاگ؛ hook خروجی | `tests/unit/treasury/test_gateway_credentials.py::test_never_returned`، `::test_redacted_in_logs`، `tests/integration/core/test_export.py::test_gateway_credentials_resealed` |
-| **INV-SEC-05** | principal دستیار هوشمند فقط می‌خواند و پیش‌نویس می‌سازد. هر مسیر ثبت، گذار چک، تطبیق، تسویه، لینک پرداخت و فرمان صندوق برای او ۴۰۳ است | وابستگی FastAPI `forbid_ai_principal` روی routerها (C-L17 بخش ۰۳) | `tests/integration/assistant/test_assistant_scope.py::test_post_endpoints_forbidden[treasury]` و `[pos]`، `::test_draft_allowed` |
+| **INV-POSSEC-01** | هیچ ردیفی از `treasury` و `pos` بیرون از مستأجر جاری دیده یا نوشته نمی‌شود. ارجاع به ردیف مستأجر دیگر با FK ترکیبی ناممکن است. بدون context چیزی دیده نمی‌شود | `core.enable_tenant_rls` (FORCE)؛ FKهای `(tenant_id, …)` | `T20 tenant B sees none of tenant A rows`، `cannot write another tenant rows`، `update of another tenant row touches nothing`، `no tenant context sees nothing`، `composite FK blocks a reference to another tenant bank account` (و party و cash box) |
+| **INV-POSSEC-02** | `hk_readonly` (و `hk_reports`) همه را می‌خواند به‌جز ستون‌های راز `gateway_account.credentials_sealed`، `gateway_payment.link_token_hash` و `card_hash` (HMAC کلیددار) و `edge_node.enrollment_code_hash`، و چیزی نمی‌نویسد. هر ستون راز در `export_table_registry.secret_columns` اعلام شده است و در خروجی ساده نمی‌آید (RV-IT2-11) | GRANT ستونی از روی رجیستری | `T21 readonly sees tenant rows`، `readonly cannot read sealed credentials`، `T21 RV-IT2-11 readonly cannot read edge enrollment hash` (و link token hash، card hash)، `T30 RV-IT2-11 every secret hash column is declared in the export registry`، `readonly cannot write` |
+| **INV-POSSEC-03** | هر جدول مستأجری این بخش RLS اجباری دارد، در `core.export_table_registry` ثبت است (راز با `hook`)، و GRANTهایش حداقلی است (فقط‌افزودنی: `SELECT, INSERT`؛ کاتالوگ: `SELECT`) | `core.security_lint()` | `tests/db/test_security_lint.py::test_no_findings_for_module[treasury]` و `[pos]` (اجرا شد: ۰ یافته) |
+| **INV-POSSEC-04** | اعتبارنامهٔ درگاه فقط مهروموم‌شده (envelope با کلید مستأجر) ذخیره می‌شود و هرگز در پاسخ API، لاگ، رخدادنگار یا خروجی ساده دیده نمی‌شود | `KeyManager.seal`؛ فیلتر redaction لاگ؛ hook خروجی | `tests/unit/treasury/test_gateway_credentials.py::test_never_returned`، `::test_redacted_in_logs`، `tests/integration/core/test_export.py::test_gateway_credentials_resealed` |
+| **INV-POSSEC-05** | principal دستیار هوشمند فقط می‌خواند و پیش‌نویس می‌سازد. هر مسیر ثبت، گذار چک، تطبیق، تسویه، لینک پرداخت و فرمان صندوق برای او ۴۰۳ است | وابستگی FastAPI `forbid_ai_principal` روی routerها (C-L17 بخش ۰۳) | `tests/integration/assistant/test_assistant_scope.py::test_post_endpoints_forbidden[treasury]` و `[pos]`، `::test_draft_allowed` |
 
-**جمع:** ۹۲ ناوردایی: TRS ۱۶، CHQ ۱۷، CRD ۳، GW ۸، BNK ۱۰، POS ۱۵، SYNC ۱۵، EDGE ۳ و SEC ۵.
-- ۷۰ مورد سد پایگاه داده‌ای دارند و در فایل آزمون SQL سبزند.
-- INV-SEC-03 با `core.security_lint()` روی همین پایگاه داده سنجیده شد (۰ یافته برای `treasury` و `pos`).
+**جمع:** ۱۰۰ ناوردایی: TRS ۲۰، CHQ ۱۸، CRD ۳، GW ۸، BNK ۱۰، POS ۱۸، SYNC ۱۵، POSEDGE ۳ و POSSEC ۵ (۷۸ با سد پایگاه داده‌ای و آزمون SQL، یکی با `core.security_lint()`، ۲۱ سرویسی، کلاینتی یا CI).
+- ۷۸ مورد سد پایگاه داده‌ای دارند و در فایل آزمون SQL سبزند.
+- INV-POSSEC-03 با `core.security_lint()` روی همین پایگاه داده سنجیده شد (۰ یافته برای `treasury` و `pos`).
 - ۲۱ مورد سرویسی، کلاینتی یا CI هستند و آزمونشان در §۹ برنامه‌ریزی شده است.
 
 ## ۸. سناریوهای مرزی و خطا
@@ -1998,9 +2111,11 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | سناریو | رفتار |
 |---|---|
 | دو کاربر هم‌زمان یک پیش‌نویس را ثبت می‌کنند | `If-Match` و قفل ردیف. دومی `412` می‌گیرد. idempotency همان کلید پاسخ ذخیره‌شده را برمی‌گرداند |
-| ثبت سند با تاریخ در دورهٔ بسته | `ledger.period_closed` (۴۲۲). سند پیش‌نویس می‌ماند |
+| ثبت سند با تاریخ در دورهٔ بسته، بستهٔ نرم، قفل ماژول یا قطعی | ledger یکی از `ledger.period.closed`، `ledger.period.soft_closed`، `ledger.period.module_locked` یا `ledger.period.finalized` (همه ۴۰۹؛ 03:1039، R-ERR) را برمی‌گرداند. treasury و pos هر چهار را می‌گیرند و سند پیش‌نویس (یا رسید صندوق `review`) می‌ماند؛ پاسخ API همان کد ledger است |
 | رسید بیش از ماندهٔ فاکتور (پیش‌دریافت) | مازاد به سطر `party_advance` یا قلم بستانکار باز می‌رود. UI پیشنهاد تخصیص بعدی می‌دهد |
-| ارز خارجی | v1: سند ارزی با نرخ ثبت‌شدهٔ ledger. تخصیص فقط هم‌ارز است. تسعیر تحقق‌یافته v2 است |
+| ارز خارجی | v1: سند ارزی با نرخ ثبت‌شدهٔ ledger. تخصیص فقط بین اقلام هم‌ارز است. تفاوت پایهٔ مصرف‌شدهٔ دو قلم (نرخ فاکتور ≠ نرخ دریافت) سود یا زیان تسعیر تحقق‌یافته است و در همان تراکنش با سند `treasury.allocation/<id>` ثبت می‌شود؛ بدون آن `HK_TRS_ALLOC_FX_JOURNAL` (INV-TRS-19، RV-X3-01). تسعیر پایان دوره (unrealized) پرسش باز صاحب محصول دربارهٔ ۰۳ است (C-L15) |
+| مطالبهٔ وصول‌نشدنی | `WriteOffService` با تأیید (critical): سند هزینه، قلم بستانکار و تخصیص `write_off`؛ گزارش سنی آن را نشان نمی‌دهد و زیردفتر = GL می‌ماند. وصول بعدی: اول برگشت سوخت (INV-TRS-20)، سپس دریافت عادی |
+| سند دستی روی دریافتنی یا پرداختنی تجاری بی‌قلم باز | `ledger.check_control_accounts` اختلاف زیردفتر `party` را نشان می‌دهد (INV-TRS-18). ۰۳ باید `allowed_source_modules` این حساب‌ها را به ماژول‌های صاحب قلم باز محدود کند (§۱۳) |
 | لغو فاکتوری که تسویه شده | sales `OpenItemService.cancel_by_source` را صدا می‌زند و `HK_TRS_OPEN_ITEM_ALLOCATED` (۴۰۹ `treasury.document.allocated`) می‌گیرد. اول تخصیص‌ها برگشت می‌خورند |
 | ادغام دو شخص با اقلام باز | اقلام قطعی دست‌نخورده می‌مانند. تخصیص بین اقلام بازنده و جانشین مجاز است (INV-TRS-08). گزارش‌ها با `canonical_party` جمع می‌زنند |
 | کسری صندوق بیش از آستانه | `approval_request`. تا تأیید، شمارش ثبت‌نشده می‌ماند. شیفت بسته می‌شود ولی سند کسری در صف است |
@@ -2062,7 +2177,7 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | شبکه وسط push قطع می‌شود | Idempotency-Key = `batch_id`. تکرار همان پاسخ. فرمان‌های پذیرفته `duplicate` گزارش می‌شوند |
 | دستگاه seq را جا انداخته (باگ) | پاسخ `gap.expected_seq`. دستگاه از آن seq دوباره می‌فرستد. اگر فرمان‌ها روی دستگاه نیستند: اعلام کسری (§۵-۱۵) |
 | بازگردانی دستگاه از پشتیبان قدیمی | seq ≤ head با بدنهٔ متفاوت = fork و قرنطینه. دستگاه باید از نو ثبت شود |
-| دستگاه دزدیده می‌شود | ابطال در پنل. فرمان‌های پیش از `revoked_at` پذیرفته و پس از آن رد می‌شوند (INV-SYNC-04) |
+| دستگاه دزدیده می‌شود | ابطال در پنل؛ توکن دستگاه دیگر حل نمی‌شود. دزد با کلید دستگاه می‌تواند فرمان با `occurred_at` عقب‌برده امضا کند، ولی پایگاه داده آن را رد می‌کند، چون سقف دنباله (`accept_through_seq`) را فقط مدیر پس از شمارش رسیدهای واقعی اعلام می‌کند و هر فرمان پذیرفته‌شده هم فقط با بازبینی اعمال می‌شود (INV-SYNC-04، RV-TP-01). فروش واقعی پیش از ابطال از مسیر بازیابی §۵-۱۵ می‌آید |
 | ساعت دستگاه ۲ روز عقب است | `clock_skew_ms` ثبت و فرمان‌ها `review: pos.sync.clock_skew` برای بخش مالیات. فروش ثبت می‌شود. تاریخ کاری از `business_day` است، نه ساعت دستگاه |
 | ۷۲ ساعت آفلاین پر می‌شود | فروش تازه روی دستگاه مسدود است. مدیر با PIN فقط «بستن شیفت» و «چاپ گزارش» دارد |
 | مهلت ارسال مؤدیان نزدیک است | بنر مسدودکنندهٔ قابل تأیید مدیر و اعلان سرور (INV-POS-15) |
@@ -2082,10 +2197,15 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 
 [`sql/tests/40_treasury_pos_test.sql`](sql/tests/40_treasury_pos_test.sql):
 - **ساختار:** یک نشست psql.
-  - بخش ۱ با `postgres` اجرا می‌شود و fixture است: دو مستأجر؛ شرکت CA، CA2 (تمیز برای زیردفتر) و CB؛ شعبه‌ها؛ کاربران و عضویت؛ چهار دستگاه؛ سری‌ها؛ اشخاص (مشتری، تأمین‌کننده، عمومی، کارمند، بازنده ادغام)؛ کالا؛ توابع کمکی.
+  - بخش ۱ با `postgres` اجرا می‌شود و fixture است: دو مستأجر؛ شرکت CA، CA2 (تمیز برای زیردفتر چک)، CA3 (تمیز برای زیردفتر اشخاص) و CB؛ شعبه‌ها؛ کاربران و عضویت؛ چهار دستگاه؛ سری‌ها؛ اشخاص (مشتری، تأمین‌کننده، عمومی، کارمند، بازنده ادغام)؛ کالا؛ توابع کمکی.
   - بخش ۲ با `SET ROLE hk_app` اجرا می‌شود (نه مالک، NOBYPASSRLS). موارد deferred درون زیرتراکنش `tp_expect` با `SET CONSTRAINTS ALL IMMEDIATE` آزموده می‌شوند.
   - بخش ۳: جداسازی مستأجر (T20)، `hk_readonly` (T21) و زیردفتر چک = GL (T22).
-- **پوشش:** ۳۰۴ ادعا (۵۰ `tp_assert`، ۲۵۰ `tp_expect` و ۴ `tp_ok`) در ۲۶ گروه. هر کد خطای `HK_*` فایل (۱۰۸ کد تریگر؛ دو کد پیش‌شرط `HK_ENCODING` و `HK_PREREQ` در سرآیند فایل‌اند) دست‌کم یک آزمون منفی با الگوی دقیق دارد.
+  - گروه‌های T30 تا T38 آزمون‌های بازگشت یافته‌های بازبینی‌اند (برچسب هر ادعا شناسهٔ یافته را دارد): T30 قراردادهای کاتالوگ، T31 شمارهٔ کارت در متن آزاد، T32 رسید = payload امضاشده، T33 قیدهای رسید، **T34 همروندی واقعی با دو نشست `dblink`** (سقف مرجوعی و تقسیم، بستن روز در برابر باز کردن شیفت)، T35 کارت/شرکت/ارز/مغایرت/درگاه/واحد خرد، T36 چک، T37 زیردفتر اشخاص، اثر چک، سوخت، تسعیر و تنخواه، T38 جهش‌های بازماندهٔ بازبینی.
+- **پوشش:** ۴۷۵ ادعا (۱۱۱ `tp_assert`، ۳۵۲ `tp_expect` و ۱۲ `tp_ok`) در ۳۵ گروه. هر کد خطای `HK_*` فایل (۱۳۰ کد، با دو کد پیش‌شرط `HK_ENCODING` و `HK_PREREQ` در سرآیند) دست‌کم یک آزمون منفی با الگوی دقیق دارد.
+- **آزمون جهش (R-QUALITY، RV-TP-12):** هر جهش یک شرط تریگر یا قید را حذف یا تضعیف می‌کند؛ اجرا: پایگاه تازه، اعمال فایل جهش‌یافته، اجرای کامل آزمون.
+  - ۵۵ جهش هدفمند بازبین: ۴۶ کشته؛ ۷ بی‌موضوع چون آن کد بازنویسی شد (نسخهٔ بازهدف‌شدهٔ هر ۷ روی کد تازه کشته شد)؛ ۲ هم‌ارز.
+  - ۶۲ جهش روی کد تازه یا بازنویسی‌شدهٔ همین دور: همه کشته جز یک هم‌ارز.
+  - سه جهش **هم‌ارز** رفتار را عوض نمی‌کنند: `crd_foreign_terminal_ok` (پایانهٔ شرکت دیگر پیش‌تر با FK سه‌ستونی و `card_txn_guard` رد می‌شود و `terminal_id` منجمد است)، `gw_irt_fraction_ok` (`api_amount` ستون عدد صحیح است) و `leaf_void_active` (برگ unused با چک فعال با `cheque_leaf_sync` دست‌نیافتنی است).
 - **اجرا:** فرمان‌ها در سرآیند فایل‌اند. خروجی موفق `ALL 40_treasury_pos TESTS PASSED` است.
 - **CI:** `pytest tests/db/test_sql_suites.py::test_treasury_pos_sql_suite` روی PostgreSQL 18 واقعی.
 - **ادغام:** FKهای بین‌ماژولی §۱۲ روی `inventory.warehouse` و `sales.invoice` واقعی (`30_commerce.sql`) و stub برای `tax` در تراکنش برگشتی سنجیده شدند.
@@ -2094,7 +2214,7 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 
 | فایل | آزمون‌ها |
 |---|---|
-| `tests/unit/treasury/test_posting_templates.py` | `test_expand_each_transition` (هر ۵۱ گذار با ctx نمونه سند تراز می‌سازد)، `test_long_term_holding_key`، `test_bounce_target_setting`، `test_dims_resolution` |
+| `tests/unit/treasury/test_posting_templates.py` | `test_expand_each_transition` (هر ۵۵ گذار با ctx نمونه سند تراز می‌سازد)، `test_long_term_holding_key`، `test_bounce_target_setting`، `test_dims_resolution` |
 | `tests/unit/treasury/test_money_document.py` | `test_balanced_validator`، `test_instrument_shapes`، `test_counter_key_by_role`، `test_change_netted_in_cash` |
 | `tests/unit/treasury/test_cheque_service.py` | `test_sayad_gate_off_warn_block`، `test_sayad_override_audited`، `test_allowed_transitions_matches_catalog`، `test_party_risk_not_color` |
 | `tests/unit/treasury/test_recon_engine.py` | `test_exact_cheque_number`، `test_deposit_id`، `test_rule_priority`، `test_fuzzy_score`، `test_subset_sum_cap_4`، `test_ambiguous_candidates_not_auto_matched`، `test_threshold` |
@@ -2153,15 +2273,16 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | ورود صورتحساب ۲۰٬۰۰۰ سطر | تجزیه + اعتبارسنجی < ۳۰ ثانیه |
 | auto_match ۱۰٬۰۰۰ سطر در برابر ۵۰٬۰۰۰ سطر GL | < ۶۰ ثانیه (ایندکس مبلغ و تاریخ) |
 | `cheque_holdings` برای ۱۰۰٬۰۰۰ چک | < ۲ ثانیه |
+| ایندکس‌های مسیر داغ (RV-TP-19) | `card_txn (tenant_id, settlement_id)`، `recon_match_item (tenant_id, match_id)`، `ticket_line (tenant_id, original_line_id)` و `(tenant_id, open_order_line_id)`؛ برنامهٔ اجرای `card_settlement_check`، `recon_match_check` و `ticket_check` روی ۱۰۰ هزار ردیف Index Scan روی همین‌هاست و هزینهٔ هر بررسی با اندازهٔ جدول رشد نمی‌کند |
 
 ## ۱۰. فازبندی
 
 | فاز | محتوا |
 |---|---|
-| **v1** | **خزانه:** همهٔ منابع وجه؛ سند دریافت و پرداخت چندابزاری؛ اقلام باز، تخصیص دستی و خودکار، تهاتر؛ انتقال با وجوه در راه؛ شمارش نقد؛ تنخواه با صورت‌خرج و SoD؛ چک کامل (همهٔ گذارها، undo، ابطال، صیاد دستی، استعلام دستی، وضعیت حقوقی، چاپ، یادآور، گزارش‌ها، ورود مهاجرت از هلو، سپیدار و حسابفا طبق Q-G)؛ ورود صورتحساب با پروفایل عمومی و پروفایل‌های بانک‌های پایلوت؛ مغایرت‌گیری چهارمرحله‌ای و صورت مغایرت؛ کارتخوان با تسویهٔ بازه‌ای؛ درگاه برای زرین‌پال، زیبال و ملت؛ رابط پیامک با دو ارائه‌دهنده.<br>**صندوق:** پایانه، روز و شیفت، فروش، مرجوعی، تعویض، hold؛ رستوران بدون لبه (میز، کورس، modifier، ایستگاه، تقسیم، حق سرویس، انعام، بیرون‌بر)؛ پروتکل کامل آفلاین؛ سقف‌ها؛ مهلت مؤدیان؛ جریان‌ها؛ چاپ رسید و ایستگاه، کشو، بارکد و کارتخوان PSP از پل سخت‌افزار. صنف‌ها طبق Q-A: کافه و رستوران، کفش و پوشاک، لوازم برقی و SME عمومی |
+| **v1** | **خزانه:** همهٔ منابع وجه؛ سند دریافت و پرداخت چندابزاری؛ اقلام باز و زیردفتر اشخاص تطبیق‌پذیر با GL، تخصیص دستی و خودکار، تهاتر و طبقه‌بندی پیش‌دریافت؛ **تسعیر تحقق‌یافته در تسویهٔ ارزی** (RV-X3-01، هم‌خوان با ۰۳ §۱۰)؛ **سوخت مطالبات با تأیید و برگشت در وصول بعدی** (RV-X2-06)؛ ارزش افزودهٔ تنخواه با دفتر خرید مالیاتی؛ انتقال با وجوه در راه؛ شمارش نقد؛ تنخواه با صورت‌خرج و SoD؛ چک کامل (همهٔ گذارها، undo، ابطال، صیاد دستی، استعلام دستی، وضعیت حقوقی، چاپ، یادآور، گزارش‌ها، ورود مهاجرت از هلو، سپیدار و حسابفا طبق Q-G)؛ ورود صورتحساب با پروفایل عمومی و پروفایل‌های بانک‌های پایلوت؛ مغایرت‌گیری چهارمرحله‌ای و صورت مغایرت؛ کارتخوان با تسویهٔ بازه‌ای؛ درگاه برای زرین‌پال، زیبال و ملت؛ رابط پیامک با دو ارائه‌دهنده.<br>**صندوق:** پایانه، روز و شیفت، فروش، مرجوعی، تعویض، hold؛ رستوران بدون لبه (میز، کورس، modifier، ایستگاه، تقسیم، حق سرویس، انعام، بیرون‌بر)؛ پروتکل کامل آفلاین؛ سقف‌ها؛ مهلت مؤدیان؛ جریان‌ها؛ چاپ رسید و ایستگاه، کشو، بارکد و کارتخوان PSP از پل سخت‌افزار. صنف‌ها طبق Q-A: کافه و رستوران، کفش و پوشاک، لوازم برقی و SME عمومی |
 | **v1.1** | استعلام صیاد و شبا با ارائه‌دهنده (فینوتک یا جیبیت)؛ فایل پنل PSP برای تسویهٔ دقیق با RRN؛ درگاه‌های سامان، پی‌پینگ، نکست‌پی، وندار، سداد و جیبیت؛ قاعده‌های مغایرت پیشرفته؛ پرتال نمایندگان برای مشاهدهٔ سلامت همگام‌سازی مشتری (Q-E)؛ مد `per_shift` |
-| **v2** | سرور لبه (اسکیما در v1 آماده است)؛ ترازو؛ تسعیر تحقق‌یافته و تخصیص ارزی؛ تسویهٔ تسهیمی کارتخوان؛ پرداخت حقوق گروهی با فایل پایا/ساتنا (همراه payroll، Q-D)؛ پیش‌بینی نقد با سناریو |
-| **بعد** | open banking در صورت ایجاد چارچوب قانونی (اتصال مستقیم صورتحساب)؛ ثبت چک در صیاد از API بانکی رسمی در صورت امکان؛ کیف پول مشتری و باشگاه مشتریان؛ صنف‌های دیگر به‌صورت بسته |
+| **v2** | سرور لبه (اسکیما در v1 آماده است)؛ ترازو؛ تسویهٔ تسهیمی کارتخوان؛ پرداخت حقوق گروهی با فایل پایا/ساتنا (همراه payroll، Q-D)؛ پیش‌بینی نقد با سناریو؛ ذخیرهٔ مطالبات مشکوک‌الوصول (روش ذخیره)؛ `import_cheque_history` برای بازپخش رویداد چک مهاجرت (CR-MG02).<br>**رستوران و خرده‌فروشی (پژوهش V2-05؛ RV-X3-10):**<br>• **KDS** (نمایشگر آشپزخانه): مالک این بخش (`pos.station` و مسیر ایستگاه از v1 هست؛ v2 جریان وضعیت آماده‌سازی را اضافه می‌کند).<br>• **منوی QR و کیوسک:** سفارش مشتری به `pos.open_order` با فرمان امضاشدهٔ دستگاه کیوسک یا سفارش وب؛ مالک این بخش، قیمت از ۰۵.<br>• **کانال سفارش بیرونی (اسنپ‌فود و مشابه):** سفارش کانال در ۰۵ (`sales`، `attr:channel`)، تحویل در صندوق از این بخش، و تسویهٔ کانال با کسر کمیسیون مثل تسویهٔ کارتخوان (`card_settlement`-مانند؛ کارمزد کانال) در treasury.<br>• **کیف پول مشتری و کارت هدیه:** بدهی به مشتری است؛ مانده و تراکنش‌ها در treasury (قلم باز `party_advance` روی حساب پیش‌دریافت)، فروش و مصرف کارت از ۰۵.<br>• **باشگاه مشتریان (امتیاز) و کوپن:** موتور قیمت ۰۵ (هم‌خوان با ۰۵ §۱۰)؛ ارزش امتیاز، اگر بدهی شود، از ۰۳ کلید می‌گیرد |
+| **بعد** | open banking در صورت ایجاد چارچوب قانونی (اتصال مستقیم صورتحساب)؛ ثبت چک در صیاد از API بانکی رسمی در صورت امکان؛ صنف‌های دیگر به‌صورت بسته |
 
 ## ۱۱. وابستگی‌ها و تصمیم‌های باز
 
@@ -2170,11 +2291,12 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | بخش | آنچه این بخش لازم دارد |
 |---|---|
 | ۰۱ معماری | DAG و `ModuleSpec`؛ `LocalStore`، `CommandQueue` و پاکت فرمان؛ `DeviceHub` و پل سخت‌افزار؛ SSE؛ صف job و `concurrency_key`؛ import-linter |
-| ۰۲ هسته | `core.device` (کلید، ابطال)، توکن دستگاه؛ شماره‌گذاری (`number_next`، `number_record_external`، `number_reserve_range`، `number_void`)؛ مجوز و دامنه‌ها (`cash_box`، `pos_terminal`)؛ PIN آفلاین؛ تنظیم‌ها، اعلان‌ها، approval و SoD؛ پیوست و ضدویروس؛ outbox و رویداد؛ `KeyManager`؛ export registry |
-| ۰۳ دفتر کل | `PostingRequest` و `LedgerPostingService`؛ کلیدها و قواعد نگاشت؛ ابعاد؛ `subledger_source` و `check_control_accounts`؛ `reverse_by_source` |
+| ۰۲ هسته | `core.device` (کلید، ابطال، `revoked_at`؛ سد ابطال روی زمان دریافت سرور، RV-TP-01)، توکن دستگاه؛ شماره‌گذاری (`number_next`، `number_record_external`، `number_reserve_range`، `number_void`)؛ مجوز و دامنه‌ها (`cash_box`، `pos_terminal`)؛ PIN آفلاین؛ تنظیم‌ها، اعلان‌ها، approval با FK چهارستونی و `approval_assert_approved` (RV-CORE-26؛ سوخت مطالبات) و SoD؛ پیوست و ضدویروس؛ outbox و رویداد؛ `KeyManager`؛ export registry و `secret_columns` (R-GRANT) |
+| ۰۳ دفتر کل | `PostingRequest` و `LedgerPostingService`؛ کلیدها و قواعد نگاشت (از جمله `ledger.fx.realized_*` و کلید تازهٔ سوخت مطالبات، §۱۳)؛ ابعاد؛ `subledger_source` (treasury زیردفتر `party` و چهار زیردفتر چک را ثبت می‌کند) و `check_control_accounts`؛ `reverse_by_source`؛ کدهای خطای دوره (`ledger.period.*`، R-ERR) |
 | ۰۴ اطلاعات پایه | اشخاص، نقش‌ها، `canonical_party`، `posting_attributes`، حساب بانکی شخص؛ کالا، بارکد، modifier SKU؛ `ref.bank` و شبا |
 | ۰۵ تجارت | `SalesInvoiceService.post_from_pos` و `ReceiptService.record_and_allocate` (§۵-۲۰)؛ `sales.gl_batch(pos_shift)`؛ ثبت اقلام باز در sales و purchase؛ کسر موجودی و دستور پخت؛ ضایعات؛ کنترل اعتبار با `ChequeQuery.party_exposure` |
-| مالیات (مرحلهٔ ۳) | `tax.memory`، `tax.invoice`، `TaxOfflineService` (سری رزرو، ابطال سریال)، پارامتر مهلت ارسال |
+| ۰۷ انطباق (مالیات) | `tax.memory`، `tax.invoice`، `TaxOfflineService` (سری رزرو، ابطال سریال)، پارامتر مهلت ارسال `tax.moadian.send_deadline_days` (CR-T09)؛ `TaxRegisterService.record_purchase` و `tax.purchase_entry` برای ارزش افزودهٔ اعتباری تنخواه (RV-TP-10)؛ نوع صورتحساب (`inty`، `inp`) رسید آفلاین از قاعدهٔ مؤدیان (RV-X2-16) |
+| ۱۰ دستیار | ابزارهای فقط‌خواندنی و پیشنهادی روی viewهای منتشرشده؛ `treasury.propose_payment_reminder` به `PartyReminderService` و مجوز `treasury.reminder.send` همین بخش تکیه دارد (C-AS-09) |
 | مهاجرت | نگاشت چک‌ها، مانده‌ها و اقلام باز از هلو، سپیدار، حسابفا و Excel (Q-G) |
 
 ### ۱۱-۲. وابستگی به تصمیم‌های مالک (پاسخ‌داده)
@@ -2186,47 +2308,56 @@ BusinessDayService.close: همهٔ شیفت‌ها بسته (تریگر) ؛ گز
 | Q-C | کلید امضای مؤدیان: پیش‌فرض نزد سرور، یا روی دستگاه مشتری | `tax_mode` پایانه: `online` (سرور امضا می‌کند) یا `device_memory` / `reserved_range` |
 | Q-D | حقوق: مشمولان قانون کار + ساعتی و پاره‌وقت | پرداخت به کارمند با نقش `employee` و کلید `payroll.salary_payable`؛ انعام از راه همین مسیر |
 | Q-E | داده‌های نماینده در v1، پرتال در v1.1 | سلامت همگام‌سازی برای نماینده در v1.1 |
-| Q-F | دستیار در محصول، فقط‌خواندنی، فقط پیش‌نویس | §۵-۲۷، INV-SEC-05 |
+| Q-F | دستیار در محصول، فقط‌خواندنی، فقط پیش‌نویس | §۵-۲۷، INV-POSSEC-05 |
 | Q-G، Q-G2 | آداپترهای هلو، سپیدار، حسابفا و Excel در v1؛ مالک نمونهٔ پشتیبان می‌دهد | `ChequeImportService` و fixtureها؛ نمونهٔ صورتحساب بانک‌ها هم از همین مسیر درخواست می‌شود |
-| Q-H | قیمت‌گذاری کاملاً پیکربندی‌پذیر | هزینهٔ استعلام و پیامک از کیف پول با نرخ پیکربندی‌پذیر |
+| Q-H | مبنای قیمت‌گذاری پلن پیکربندی‌پذیر می‌ماند | هیچ قیمت یا سقفی در این بخش ثابت نیست: هزینهٔ استعلام و پیامک از کیف پول با نرخ پیکربندی‌پذیر پلتفرم؛ شمار پایانه و دستگاه فقط از `core` و پلن خوانده می‌شود |
+| رأی یکپارچه‌سازی CR-T06 | مد `per_shift` و `post_shift_batch` در v1.1 | پاسخ Q-T7 پیشین: مد ثبت صندوق در v1 فقط `per_ticket` است |
 
 ### ۱۱-۳. پرسش‌های باز این بخش
 
+این‌ها پرسش‌های خود این بخش‌اند و صاحب محصول هنوز به آن‌ها پاسخ نداده است (در `docs/00-decisions.md` نیستند). تا پاسخ، پیش‌فرض ستون آخر اجرا می‌شود و همه با تنظیم قابل تغییرند. پرسش باز ۰۳ دربارهٔ زمان فعال‌سازی «تسعیر پایان دوره» (C-L15) به تسعیر **تحقق‌یافته** این بخش ربطی ندارد؛ آن در v1 است.
+
 | شناسه | پرسش | پیش‌فرض تا پاسخ |
 |---|---|---|
-| Q-T1 | پیش‌فرض `treasury.cheque.sayad_accept_required` برای مستأجر تازه `warn` باشد یا `block`؟ | `warn` |
-| Q-T2 | فهرست بانک‌های پایلوت برای پروفایل صورتحساب (پنج بانک پرتکرار مشتریان اول)؟ نمونهٔ ناشناس‌شده از هر کدام لازم است | ملت، ملی، صادرات، تجارت، پاسارگاد |
-| Q-T3 | ارائه‌دهندهٔ استعلام (فینوتک یا جیبیت) با قرارداد پلتفرم، یا BYO مستأجر؟ | BYO در v1.1 با رابط واحد |
-| Q-T4 | ارائه‌دهندگان پیامک پلتفرم و ترتیب failover؟ | کاوه‌نگار سپس ملی‌پیامک |
-| Q-T5 | کدام PSPها در v1 به پل سخت‌افزار وصل شوند (پروتکل کارتخوان)؟ | دو PSP پرتکرار پایلوت؛ بقیه دستی |
-| Q-T6 | سقف پیش‌فرض آفلاین ۷۲ ساعت برای همهٔ صنف‌ها مناسب است؟ | ۷۲ ساعت، قابل تنظیم برای هر شعبه |
-| Q-T7 | مد ثبت پیش‌فرض صندوق `per_ticket` یا `per_shift`؟ | `per_ticket` در v1 |
+| Q-T1 | وقتی چکی را که گیرنده هنوز در سامانهٔ صیاد تأیید نکرده به کس دیگری می‌دهیم، برنامه فقط هشدار بدهد یا جلوی کار را بگیرد؟ (تنظیم `treasury.cheque.sayad_accept_required`) | فقط هشدار (`warn`) |
+| Q-T2 | صورتحساب کدام بانک‌ها را اول پشتیبانی کنیم؟ از هر بانک یک نمونه فایل بدون نام و اطلاعات شخصی لازم داریم | ملت، ملی، صادرات، تجارت، پاسارگاد |
+| Q-T3 | استعلام چک و شبا را با قرارداد خود پلتفرم (فینوتک یا جیبیت) بدهیم، یا هر مشتری حساب خودش را وصل کند؟ | هر مشتری حساب خودش را وصل کند (v1.1) |
+| Q-T4 | پیامک‌ها از کدام شرکت فرستاده شود، و اگر آن شرکت قطع بود، کدام شرکت جایگزین شود؟ | کاوه‌نگار، سپس ملی‌پیامک |
+| Q-T5 | در نسخهٔ ۱، کارتخوان کدام شرکت‌ها (PSP) مستقیم به صندوق وصل شود؟ | دو شرکت پرکاربرد مشتریان اول؛ بقیه دستی |
+| Q-T6 | صندوق بدون اینترنت حداکثر چند ساعت کار کند؟ آیا ۷۲ ساعت برای همهٔ صنف‌ها خوب است؟ | ۷۲ ساعت، برای هر شعبه قابل تغییر |
 
 ## ۱۲. کلیدهای خارجی بین‌ماژولی
 
-ستون‌های زیر در `40_treasury_pos.sql` فقط `uuid` هستند، چون جدول مقصد در فایل‌های وابستگی این بخش نیست. این FKها در `99_cross_fk.sql` اضافه می‌شوند، پس از اعمال همهٔ بخش‌ها و پیش از هر داده:
+ستون‌های زیر در `40_treasury_pos.sql` فقط `uuid` هستند، چون جدول مقصد در فایل‌های وابستگی این بخش نیست. این FKها در `99_cross_fk.sql` اضافه می‌شوند، پس از اعمال همهٔ بخش‌ها و پیش از هر داده. نام و تعداد ستون همان `99_cross_fk.sql` است (R-XFK بند ۱ و ۳؛ RV-TP-26):
 
 ```sql
--- pos → inventory, sales (بخش ۰۵؛ مقصدها در 30_commerce.sql موجودند و سه‌ستونی هم‌شرکت‌اند)
-ALTER TABLE pos.terminal ADD CONSTRAINT terminal_warehouse_fk
+-- pos → inventory, sales (بخش ۰۵؛ سه‌ستونی هم‌شرکت؛ CR-T16)
+ALTER TABLE pos.terminal ADD CONSTRAINT fk_terminal__inventory_warehouse
   FOREIGN KEY (tenant_id, company_id, warehouse_id) REFERENCES inventory.warehouse (tenant_id, company_id, id);
-ALTER TABLE pos.ticket ADD CONSTRAINT ticket_sales_doc_fk
+ALTER TABLE pos.ticket ADD CONSTRAINT fk_ticket__sales_invoice
   FOREIGN KEY (tenant_id, company_id, sales_doc_id) REFERENCES sales.invoice (tenant_id, company_id, id);
 
--- pos → tax (بخش مالیات؛ نام جدول‌ها پیشنهادی است — CR-T09)
-ALTER TABLE pos.terminal ADD CONSTRAINT terminal_tax_memory_fk
-  FOREIGN KEY (tenant_id, tax_memory_ref) REFERENCES tax.memory (tenant_id, id);
-ALTER TABLE pos.ticket ADD CONSTRAINT ticket_tax_memory_fk
-  FOREIGN KEY (tenant_id, tax_memory_ref) REFERENCES tax.memory (tenant_id, id);
-ALTER TABLE pos.ticket ADD CONSTRAINT ticket_tax_doc_fk
-  FOREIGN KEY (tenant_id, tax_doc_id) REFERENCES tax.invoice (tenant_id, id);
+-- pos → tax (بخش ۰۷؛ سه‌ستونی؛ CR-T09، CR-CMP-05)
+ALTER TABLE pos.terminal ADD CONSTRAINT fk_terminal__tax_memory
+  FOREIGN KEY (tenant_id, company_id, tax_memory_ref) REFERENCES tax.memory (tenant_id, company_id, id);
+ALTER TABLE pos.ticket ADD CONSTRAINT fk_ticket__tax_memory
+  FOREIGN KEY (tenant_id, company_id, tax_memory_ref) REFERENCES tax.memory (tenant_id, company_id, id);
+ALTER TABLE pos.ticket ADD CONSTRAINT fk_ticket__tax_invoice
+  FOREIGN KEY (tenant_id, company_id, tax_doc_id) REFERENCES tax.invoice (tenant_id, company_id, id);
 
--- core → treasury, pos (مالک: بخش ۰۲ §۱۲؛ اینجا روی مقصدهای واقعی سنجیده شد)
-ALTER TABLE core.role_assignment_scope ADD CONSTRAINT role_assignment_scope_cash_box_fk
+-- treasury → tax (بخش ۰۷؛ RV-TP-10). دوستونی: tax.purchase_entry فقط UNIQUE (tenant_id, id) دارد و سطر صورت‌خرج company_id ندارد؛
+-- هم‌شرکتی را TaxRegisterService با منبع treasury.petty_cash_claim می‌سنجد. درخواست افزودن به 99: §۱۳ CR-T21
+ALTER TABLE treasury.petty_cash_claim_line ADD CONSTRAINT fk_petty_cash_claim_line__tax_purchase_entry
+  FOREIGN KEY (tenant_id, tax_purchase_entry_id) REFERENCES tax.purchase_entry (tenant_id, id);
+
+-- core → treasury, pos (مالک: بخش ۰۲ §۱۲؛ خلاف DAG با برچسب R-XFK بند ۵؛ دوستونی چون company_id انتساب ممکن است NULL باشد)
+ALTER TABLE core.role_assignment_scope ADD CONSTRAINT fk_role_assignment_scope__treasury_cash_box
   FOREIGN KEY (tenant_id, cash_box_id) REFERENCES treasury.cash_box (tenant_id, id);
-ALTER TABLE core.role_assignment_scope ADD CONSTRAINT role_assignment_scope_pos_terminal_fk
+ALTER TABLE core.role_assignment_scope ADD CONSTRAINT fk_role_assignment_scope__pos_terminal
   FOREIGN KEY (tenant_id, pos_terminal_id) REFERENCES pos.terminal (tenant_id, id);
 ```
+
+**استثنای DAG درون‌فایلی:** `pos.cash_movement.posting_key → ledger.posting_key` (کاتالوگ سراسری کد، تک‌ستونی) در همین فایل ساخته می‌شود و 99 آن را با نام `fk_cash_movement__ledger_posting_key` و برچسب استثنای R-XFK بند ۵ «هم‌ارز» می‌پذیرد (RV-ARCH-08). کد `pos` هرگز `ledger` را import نمی‌کند (INV-POS-14).
 
 **ارجاع‌های نرم** (عمداً بدون FK):
 - `sales.gl_batch.source_ref` به `pos.shift`: جهت pos → sales است و sales نمی‌تواند به pos وابسته باشد.
@@ -2239,21 +2370,40 @@ ALTER TABLE core.role_assignment_scope ADD CONSTRAINT role_assignment_scope_pos_
 
 ## ۱۳. تعارض‌ها و درخواست تغییر
 
-| شناسه | به بخش | موضوع | پیشنهاد |
-|---|---|---|---|
-| **CR-T01** | شرح کار (اطلاع) | شرح کار فقط Ed25519 برای کلید دستگاه گفته بود | `core.device.key_alg` در بخش ۰۲ از قبل `ed25519` و `ecdsa_p256` را دارد و این بخش از همان پیروی می‌کند (D-T33)، چون WebCrypto در برخی مرورگرها Ed25519 غیرقابل‌استخراج ندارد. تغییری در فایل‌ها لازم نیست؛ فقط ثبت انحراف از شرح کار |
-| **CR-T02** | ۰۳ دفتر کل | ده کلید ثبت تازه (`treasury.cheque_bounced`، `cheque_receivable_lt`، `cheque_payable_lt`، `cheque_protest_cost`، `gateway_clearing`، `cash_in_transit`، `cash_over_short`، `bank_interest_income`، `unidentified_receipt`، `pos.tips_payable`) در این فایل ثبت شدند ولی حساب قالب COA و قاعدهٔ نگاشت پیش‌فرض ندارند | افزودن حساب‌های قالب (مثلاً «چک‌های برگشتی» زیر دریافتنی‌ها، «اسناد دریافتنی بلندمدت»، «واسط درگاه»، «وجوه در راه»، «کسری و اضافهٔ صندوق»، «سود سپرده»، «واریزهای نامشخص»، «انعام پرداختنی») و `posting_rule` پیش‌فرض. همچنین شرط‌های `attr:party_role=other` و `attr:cheque_purpose` در قواعد |
-| **CR-T03** | ۰۲ هسته | لبه برای فرمان‌های سفارش خودش زنجیرهٔ دستگاه لازم دارد | افزودن `'edge'` به `core.device.kind` (v2). تا آن زمان `pos.edge_node` کلید خودش را دارد |
-| **CR-T04** | ۰۵ تجارت (پاسخ به CR-C05) | بخش ۰۵ گفته بود `line_rounding` پیش‌فرض `half_up` رسید با قاعدهٔ RC_IITP و CHECK `sales.invoice_line_gross` (`trunc`) ناسازگار است، و هدف `sales_doc_id` را `sales.document` نوشته بودیم | **اعمال شد:** `pos.ticket.line_rounding` فقط `truncate` می‌پذیرد و `ticket_check` ناخالص سطر را با `trunc(qty × unit_price, minor)` می‌سنجد. پس pos در SQL دیگر به `ledger.round_amount` وابسته نیست. توضیح ستون `sales_doc_id` به `sales.invoice` اصلاح و FK سه‌ستونی شد (§۱۲). نرخ و `tax_rounding` مالیات از snapshot ماشین‌حساب مالیات به دستگاه می‌رسد (جریان `tax_profile`) |
-| **CR-T05** | ۰۲ هسته | مجوزهای خزانه بُعد دامنهٔ `bank_account` ندارند (مثلاً «فقط حساب‌های شعبه X») | افزودن `bank_account` به `core.permission.scope_dimensions` و `role_assignment_scope` (v1.1). تا آن زمان دامنهٔ شرکت و شعبه |
-| **CR-T06** | ۰۵ تجارت | قرارداد ثبت رسید صندوق (§۵-۲۰) | نام‌ها با بخش ۰۵ یکی شد: `SalesInvoiceService.post_from_pos(PosTicketIn)` و `treasury.ReceiptService.record_and_allocate`. درخواست باقی‌مانده: (۱) متد `post_shift_batch(shift_id)` برای مد `per_shift` که همان `sales.gl_batch(source_kind='pos_shift')` و `gl_mode='batched'` است؛ (۲) پیشنهاد بخش ۰۵ برای FK معکوس `pos.shift.gl_batch_id → sales.gl_batch` پذیرفته است و همراه مد `per_shift` در v1.1 به `pos.shift` و §۱۲ اضافه می‌شود |
-| **CR-T07** | ۰۵ و ۰۳ | حق سرویس رستوران کلید ثبت ندارد | افزودن کلید `sales.service_charge` (درآمد) و قاعدهٔ پیش‌فرض |
-| **CR-T08** | ۰۵ و payroll | زیردفتر اقلام باز در treasury است | sales، purchase و payroll در تراکنش ثبت خود `OpenItemService.register` را صدا بزنند. بخش ۰۵ این را پذیرفته است (یادداشت‌های `30_commerce.sql`). `OpenItemService.cancel` در متن بخش ۰۵ همان `cancel_by_source` این بخش است. payroll هم برای `payroll.salary_payable` همین کار را بکند |
-| **CR-T09** | مالیات (مرحلهٔ ۳) | این بخش به `tax.memory`، `tax.invoice`، `TaxOfflineService.ensure_series` و `void_serial` و پارامتر قواعد `tax.moadian.offline_submit_deadline_days` (۷ روز، تاریخ‌دار) تکیه دارد | تعریف این‌ها با همین نام‌ها، یا اطلاع برای اصلاح §۱۲ |
-| **CR-T10** | ۰۳ دفتر کل | نوع بُعد `pos_terminal` در ledger «پایانهٔ کارتخوان» است، ولی بُعد دامنهٔ مجوز `pos_terminal` در core به `pos.terminal` (صندوق) اشاره می‌کند. این نام‌گذاری مبهم است | تغییر نام کد بُعد ledger به `card_terminal` پیش از انجماد v1. تا آن زمان این بخش `pos_terminal` ledger را فقط برای `treasury.card_terminal` به کار می‌برد |
-| **CR-T11** | ۰۴ (اطلاع) | جدول‌های `ref.sayad_credit_status` و `ref.psp` طبق CR-02 بخش ۰۴ در این فایل ساخته شدند | یکپارچه‌ساز در صورت تمایل آن‌ها را به فایل `ref` منتقل کند. GRANT فقط SELECT است |
-| **CR-T12** | ۰۲ (قرارداد مشترک) | ستون `GENERATED ... STORED` در تریگر BEFORE مقدار NULL دارد. پس مقایسهٔ `to_jsonb(OLD)` و `to_jsonb(NEW)` برای «تغییرناپذیری» روی جدول با ستون مولد خطای کاذب می‌دهد | ثبت در قراردادهای مشترک و انتقال `treasury.freeze_columns` (که ستون‌های مولد را حذف می‌کند) به `core` برای استفادهٔ همه |
-| **CR-T13** | شرح کار (اطلاع) | شرح کار یکتایی سراسری `(provider, provider_ref)` خواسته بود | پیاده‌سازی در هر مستأجر است (INV-GW-02)، چون RLS یکتایی بین مستأجرها را بی‌معنا و نشت‌زا می‌کند. مسیر callback `tenant_slug` و `order_id` را دارد (§۶-۵)، پس یکتایی سراسری لازم نیست |
-| **CR-T14** | شرح کار (اطلاع) | شرح کار «۱۴ گذار دریافتی و ۷ پرداختی» گفته بود | ردیف‌های پژوهش ۰۵ عیناً پیاده شدند: ۱۶ کد دریافتی (با R3' و R5'؛ R13 به ازای هر وضعیت مبدأ یک ردیف) و ۵ کد پرداختی در سطح چک (P5 و P6 در سطح برگ‌اند)، به‌اضافهٔ گذارهای ضمانت و ورود (۱۲ ردیف، آن‌ها هم از پژوهش) و ۱۳ افزودهٔ مستند (از جمله R7P و R7PB برای تسویهٔ قسطی چک برگشتی که در جدول پژوهش نبود). جمع کاتالوگ ۵۱ ردیف است |
-| **CR-T15** | ۰۴ (مشاهده) | `core.security_lint()` روی پایگاه دادهٔ یکپارچه ۳۹ جدول `parties` و `catalog` را بیرون از `export_table_registry` گزارش می‌کند | یافتهٔ موجود مرحلهٔ ۱؛ برای treasury و pos صفر یافته. فقط یادآوری به یکپارچه‌ساز |
-| **CR-T16** | یکپارچه‌ساز (۰۵ و ۰۶ §۱۲) | §۱۲ بخش ۰۵ هم FK `pos.terminal → inventory.warehouse` (دوستونی) و `pos.ticket → sales.invoice` (سه‌ستونی) را دارد | یک نسخه در `99_cross_fk.sql` بماند. پیشنهاد: FK سه‌ستونی هم‌شرکت این بخش برای انبار پایانه `(tenant_id, company_id, warehouse_id)`، چون انبار شرکت دیگر برای پایانه بی‌معناست. هر دو روی پایگاه دادهٔ یکپارچه آزموده شدند |
+| شناسه | به بخش | موضوع | پیشنهاد | رأی یکپارچه‌سازی (change-requests.md) و وضعیت |
+|---|---|---|---|---|
+| **CR-T01** | شرح کار (اطلاع) | شرح کار فقط Ed25519 برای کلید دستگاه گفته بود | `core.device.key_alg` در بخش ۰۲ از قبل `ed25519` و `ecdsa_p256` را دارد و این بخش از همان پیروی می‌کند (D-T33)، چون WebCrypto در برخی مرورگرها Ed25519 غیرقابل‌استخراج ندارد. تغییری در فایل‌ها لازم نیست؛ فقط ثبت انحراف از شرح کار | پذیرفته؛ **انجام‌شده** |
+| **CR-T02** | ۰۳ دفتر کل | ده کلید ثبت تازه (`treasury.cheque_bounced`، `cheque_receivable_lt`، `cheque_payable_lt`، `cheque_protest_cost`، `gateway_clearing`، `cash_in_transit`، `cash_over_short`، `bank_interest_income`، `unidentified_receipt`، `pos.tips_payable`) در این فایل ثبت شدند ولی حساب قالب COA و قاعدهٔ نگاشت پیش‌فرض ندارند | افزودن حساب‌های قالب (مثلاً «چک‌های برگشتی» زیر دریافتنی‌ها، «اسناد دریافتنی بلندمدت»، «واسط درگاه»، «وجوه در راه»، «کسری و اضافهٔ صندوق»، «سود سپرده»، «واریزهای نامشخص»، «انعام پرداختنی») و `posting_rule` پیش‌فرض. همچنین شرط‌های `attr:party_role=other` و `attr:cheque_purpose` در قواعد | پذیرفته؛ **باز** (مسئول ۰۳). کلید سوخت مطالبات (CR-T17) هم به همین فهرست افزوده شد |
+| **CR-T03** | ۰۲ هسته | لبه برای فرمان‌های سفارش خودش زنجیرهٔ دستگاه لازم دارد | افزودن `'edge'` به `core.device.kind` (v2). تا آن زمان `pos.edge_node` کلید خودش را دارد | پذیرفته برای v2؛ **به تعویق (v2)** |
+| **CR-T04** | ۰۵ تجارت (پاسخ به CR-C05) | بخش ۰۵ گفته بود `line_rounding` پیش‌فرض `half_up` رسید با قاعدهٔ RC_IITP و CHECK `sales.invoice_line_gross` (`trunc`) ناسازگار است، و هدف `sales_doc_id` را `sales.document` نوشته بودیم | **اعمال شد:** `pos.ticket.line_rounding` فقط `truncate` می‌پذیرد و `ticket_check` ناخالص سطر را با `trunc(qty × unit_price, minor)` می‌سنجد. پس pos در SQL دیگر به `ledger.round_amount` وابسته نیست. توضیح ستون `sales_doc_id` به `sales.invoice` اصلاح و FK سه‌ستونی شد (§۱۲). نرخ و `tax_rounding` مالیات از snapshot ماشین‌حساب مالیات به دستگاه می‌رسد (جریان `tax_profile`) | پذیرفته (پاسخ CR-C05)؛ **انجام‌شده** |
+| **CR-T05** | ۰۲ هسته | مجوزهای خزانه بُعد دامنهٔ `bank_account` ندارند (مثلاً «فقط حساب‌های شعبه X») | افزودن `bank_account` به `core.permission.scope_dimensions` و `role_assignment_scope` (v1.1). تا آن زمان دامنهٔ شرکت و شعبه | پذیرفته برای v1.1؛ **به تعویق (v1.1)** |
+| **CR-T06** | ۰۵ تجارت | قرارداد ثبت رسید صندوق (§۵-۲۰) | نام‌ها با بخش ۰۵ یکی شد: `SalesInvoiceService.post_from_pos(PosTicketIn)` و `treasury.ReceiptService.record_and_allocate`. درخواست باقی‌مانده: (۱) متد `post_shift_batch(shift_id)` برای مد `per_shift` که همان `sales.gl_batch(source_kind='pos_shift')` و `gl_mode='batched'` است؛ (۲) پیشنهاد بخش ۰۵ برای FK معکوس `pos.shift.gl_batch_id → sales.gl_batch` پذیرفته است و همراه مد `per_shift` در v1.1 به `pos.shift` و §۱۲ اضافه می‌شود | پذیرفته؛ **به تعویق (v1.1)**. Q-T7 با همین رأی بسته شد (§۱۱-۲) |
+| **CR-T07** | ۰۵ و ۰۳ | حق سرویس رستوران کلید ثبت ندارد | افزودن کلید `sales.service_charge` (درآمد) و قاعدهٔ پیش‌فرض | پذیرفته؛ **باز** (مسئول ۰۵ و ۰۳) |
+| **CR-T08** | ۰۵ و payroll | زیردفتر اقلام باز در treasury است | sales، purchase و payroll در تراکنش ثبت خود `OpenItemService.register` را صدا بزنند. بخش ۰۵ این را پذیرفته است (یادداشت‌های `30_commerce.sql`). `OpenItemService.cancel` در متن بخش ۰۵ همان `cancel_by_source` این بخش است. payroll هم برای `payroll.salary_payable` همین کار را بکند | پذیرفته؛ **انجام‌شده** (۰۵ و ۰۷). قرارداد تکمیلی در CR-T19 |
+| **CR-T09** | مالیات (مرحلهٔ ۳) | این بخش به `tax.memory`، `tax.invoice`، `TaxOfflineService.ensure_series` و `void_serial` و پارامتر قواعد `tax.moadian.send_deadline_days` (۷ روز، تاریخ‌دار؛ نام نهایی طبق CR-CMP-05) تکیه دارد | تعریف این‌ها با همین نام‌ها، یا اطلاع برای اصلاح §۱۲ | پذیرفته؛ نام پارامتر = `tax.moadian.send_deadline_days`. **انجام‌شده در این دور** (§۵-۱۸؛ RV-IT-11) |
+| **CR-T10** | ۰۳ دفتر کل | نوع بُعد `pos_terminal` در ledger «پایانهٔ کارتخوان» است، ولی بُعد دامنهٔ مجوز `pos_terminal` در core به `pos.terminal` (صندوق) اشاره می‌کند. این نام‌گذاری مبهم است | تغییر نام کد بُعد ledger به `card_terminal` پیش از انجماد v1. تا آن زمان این بخش `pos_terminal` ledger را فقط برای `treasury.card_terminal` به کار می‌برد | پذیرفته؛ **باز** (مسئول ۰۳ و ۰۶؛ پیش از انجماد v1). این بخش پس از تغییر نام ۰۳ کد بُعد را عوض می‌کند |
+| **CR-T11** | ۰۴ (اطلاع) | جدول‌های `ref.sayad_credit_status` و `ref.psp` طبق CR-02 بخش ۰۴ در این فایل ساخته شدند | یکپارچه‌ساز در صورت تمایل آن‌ها را به فایل `ref` منتقل کند. GRANT فقط SELECT است | به تعویق؛ R-REF: مالکیت با ۰۶ می‌ماند. **انجام‌شده (قاعده)** |
+| **CR-T12** | ۰۲ (قرارداد مشترک) | ستون `GENERATED ... STORED` در تریگر BEFORE مقدار NULL دارد. پس مقایسهٔ `to_jsonb(OLD)` و `to_jsonb(NEW)` برای «تغییرناپذیری» روی جدول با ستون مولد خطای کاذب می‌دهد | ثبت در قراردادهای مشترک و انتقال `treasury.freeze_columns` (که ستون‌های مولد را حذف می‌کند) به `core` برای استفادهٔ همه | پذیرفته؛ **باز** (مسئول ۰۲) |
+| **CR-T13** | شرح کار (اطلاع) | شرح کار یکتایی سراسری `(provider, provider_ref)` خواسته بود | پیاده‌سازی در هر مستأجر است (INV-GW-02)، چون RLS یکتایی بین مستأجرها را بی‌معنا و نشت‌زا می‌کند. مسیر callback `tenant_slug` و `order_id` را دارد (§۶-۵)، پس یکتایی سراسری لازم نیست | پذیرفته؛ **انجام‌شده** |
+| **CR-T14** | شرح کار (اطلاع) | شرح کار «۱۴ گذار دریافتی و ۷ پرداختی» گفته بود | ردیف‌های پژوهش ۰۵ عیناً پیاده شدند: ۱۶ کد دریافتی (با R3' و R5'؛ R13 به ازای هر وضعیت مبدأ یک ردیف) و ۵ کد پرداختی در سطح چک (P5 و P6 در سطح برگ‌اند)، به‌اضافهٔ گذارهای ضمانت و ورود (۱۲ ردیف، آن‌ها هم از پژوهش) و ۱۳ افزودهٔ مستند (از جمله R7P و R7PB برای تسویهٔ قسطی چک برگشتی که در جدول پژوهش نبود). جمع کاتالوگ ۵۱ ردیف بود و پس از بازبینی ۵۵ ردیف است | پذیرفته (اطلاعی)؛ **انجام‌شده**. پس از بازبینی کاتالوگ ۵۵ ردیف است (R2B، R2C، R2D، R7PC) |
+| **CR-T15** | ۰۴ (مشاهده) | `core.security_lint()` روی پایگاه دادهٔ یکپارچه ۳۹ جدول `parties` و `catalog` را بیرون از `export_table_registry` گزارش می‌کند | یافتهٔ موجود مرحلهٔ ۱؛ برای treasury و pos صفر یافته. فقط یادآوری به یکپارچه‌ساز | پذیرفته؛ **باز** (مسئول ۰۴؛ RV-IT-01) |
+| **CR-T16** | یکپارچه‌ساز (۰۵ و ۰۶ §۱۲) | §۱۲ بخش ۰۵ هم FK `pos.terminal → inventory.warehouse` (دوستونی) و `pos.ticket → sales.invoice` (سه‌ستونی) را دارد | یک نسخه در `99_cross_fk.sql` بماند. پیشنهاد: FK سه‌ستونی هم‌شرکت این بخش برای انبار پایانه `(tenant_id, company_id, warehouse_id)`، چون انبار شرکت دیگر برای پایانه بی‌معناست. هر دو روی پایگاه دادهٔ یکپارچه آزموده شدند | پذیرفته (R-XFK بند ۱: سه‌ستونی)؛ **انجام‌شده** در 99 |
+| **CR-T17** | ۰۳ دفتر کل | سوخت مطالبات (RV-X2-06) کلید ثبت ندارد. کلید تازه بدون نگاشت `ir.general` دروازهٔ پوشش قالب (`ledger.posting_key_coverage`) را می‌شکند، پس این بخش نمی‌تواند خودش آن را ثبت کند | ثبت کلید `treasury.bad_debt_expense` (هزینه) با حساب قالب «هزینهٔ مطالبات سوخت‌شده» زیر 72 و نگاشت `ir.general`. در v2 کلید `treasury.doubtful_debt_allowance` (ذخیرهٔ مطالبات مشکوک‌الوصول، کاهندهٔ دریافتنی). تا آن زمان `WriteOffService` حساب هزینه را صریح (`account_id`) می‌گیرد و پایگاه داده فقط منبع سند و حساب کنترل را می‌سنجد | تازه (این دور) |
+| **CR-T18** | ۰۳ دفتر کل | سند دستی روی دریافتنی و پرداختنی تجاری (1201، 3101) زیردفتر `party` را از GL جدا می‌کند. `check_control_accounts` آن را کشف می‌کند ولی جلویش را نمی‌گیرد | محدود کردن `allowed_source_modules` حساب‌های `subledger_kind='party'` در بسته‌های قالب v1 به ماژول‌هایی که قلم باز ثبت می‌کنند (`sales`، `purchase`، `treasury`، `payroll`، `migration`) | تازه (این دور) |
+| **CR-T19** | ۰۵ تجارت | قرارداد اقلام باز، صندوق و اعتبار پس از بازبینی | (۱) `OpenItemRegistration.account_id` = حساب کنترل سطر شخص در `PostingResult` و `cancel_by_source(..., cancel_date)` با تاریخ سند برگشت (RV-IT2-04)؛ (۲) تخصیص پیش‌دریافت به فاکتور با `AllocationService.reclass` (دو حساب کنترل؛ سند طبقه‌بندی)؛ (۳) کنترل اعتبار از `ChequeExposure` با جمع `uncleared` (طبق تنظیم) و همیشه `bounced_outside_ar` (RV-TP-22)؛ (۴) `post_from_pos`: خالص و مالیات سطر برگشتی رسید (که پایگاه داده آن را ≤ سهم نسبی سطر فروش اصل نگه می‌دارد، INV-POS-09) عیناً به برگشت از فروش می‌رود، نه قیمت دلخواه؛ نسیه فقط برای `customer_party_id` رسید؛ سطرهای سریال و دسته (`ticket_line_tracking`) و نوع صورتحساب (`tax_inty`، `tax_inp`) (RV-TP-15، RV-TP-16، RV-TP-09، RV-X2-16) | تازه (این دور) |
+| **CR-T20** | ۰۷ انطباق | ارزش افزودهٔ تنخواه و رسید آفلاین | (۱) `TaxRegisterService.record_purchase` منبع `treasury` / `treasury.petty_cash_claim` را بپذیرد و شناسهٔ ورودی را برگرداند تا `petty_cash_claim_line.tax_purchase_entry_id` پر شود (RV-TP-10)؛ (۲) قاعدهٔ تاریخ‌دار انتخاب `inty`/`inp` رسید صندوق (نوع ۲ بدون شناسهٔ خریدار؛ نسیهٔ رسمی با شناسهٔ خریدار؛ RV-X2-16)؛ (۳) دستهٔ توضیح `pos_late_ticket` در تطبیق GL با مؤدیان و اظهارنامهٔ ارزش افزوده، برای رسید دیررسی که در سال قفل با `prior_period_adjustment` ثبت می‌شود و سند مؤدیانش تاریخ دستگاه را دارد (§۵-۱۷؛ RV-X2-13) | تازه (این دور) |
+| **CR-T21** | یکپارچه‌ساز (`99_cross_fk.sql`) | FK تازهٔ §۱۲ | `fk_petty_cash_claim_line__tax_purchase_entry`: `treasury.petty_cash_claim_line (tenant_id, tax_purchase_entry_id) → tax.purchase_entry (tenant_id, id)` (دوستونی؛ دلیل در §۱۲) | تازه (این دور) |
+| **CR-T22** | ۰۳ دفتر کل | بستن دوره (نه فقط سال) پیش از رسیدن فرمان‌های آفلاین آن دوره (RV-X2-13) | قلاب `PeriodCloseHook` هم‌شکل `YearEndHook` (03 §۵-۷) که `FiscalCalendarService.set_period_status(..., to=closed|soft_closed)` و `lock_module` پیش از تغییر وضعیت صدا بزنند؛ pos `pos.close_blockers(company_id, from, to)` را برای هر دو ثبت می‌کند. عبور فقط با `ledger.period.close` و دلیل | تازه (این دور) |
+
+### ۱۳-۱. رأی‌های یکپارچه‌سازی خطاب به این بخش (پیروی‌شده)
+
+| رأی | خواسته | وضعیت در این بخش |
+|---|---|---|
+| 10:C-AS-17، R-INV (RV-IT-09) | تغییر نام `INV-SEC-*` و `INV-EDGE-*` | **انجام‌شده:** `INV-POSSEC-01..05` و `INV-POSEDGE-01..03` در سند و برچسب آزمون‌ها |
+| 10:C-AS-09 | `PartyReminderService` و مجوز `treasury.reminder.send` | **انجام‌شده:** امضا در §۵-۳؛ مجوز (sensitive، فقط با رضایت ثبت‌شدهٔ شخص) در `core.permission` و قالب نقش accountant؛ آزمون `T30 C-AS-09 permissions registered in core.permission` |
+| 08:CR-MG02 | `source_module='migration'` بی‌سند؛ `TreasuryImportService.*`؛ `import_cheque_history` (v2) | **انجام‌شده:** CHECK `source_module` از پیش `migration` را می‌پذیرد؛ امضاهای `TreasuryImportService` در §۵-۳؛ `import_cheque_history` در §۱۰ (v2) |
+| 06:CR-T09 (RV-IT-11) | نام پارامتر مهلت = `tax.moadian.send_deadline_days` | **انجام‌شده** (§۵-۱۸) |
+| RV-ARCH-08 | FK `pos.cash_movement.posting_key` استثنای برچسب‌دار R-XFK بند ۵ | **انجام‌شده** در متن (§۱ بند ۸ و §۱۲). نام اختیاری `fk_cash_movement__ledger_posting_key` در 40 اعمال نشد چون 99 قید موجود را «هم‌ارز» برچسب می‌زند |
+| R-ERR (RV-LEDGER-23) | کد خطای دورهٔ بسته از ۰۳ | **انجام‌شده:** هر چهار کد `ledger.period.*` (۴۰۹) در §۸-۱ و §۵-۲۶ |
+| 05:CR-C19 / D-C30 (RV-X2-14) | گرد کردن نقدی: کمتر پرداخت‌شده = تخفیف `rounding` فاکتور؛ بیشتر = `treasury.cash_over_short`؛ تنظیم واحد `sales.cash_rounding.increment` | **انجام‌شده:** §۵-۲۰ گام ۵؛ سطر طرف منفی حذف و `pos.cash_rounding_increment` برداشته شد؛ آزمون `T33 RV-X2-14 receipt = invoice item + cash over/short` |
+| R-GRANT (RV-IT2-11) | ستون راز در `export_table_registry.secret_columns` و پنهان از نقش‌های فقط‌خواندنی | **انجام‌شده:** `edge_node.enrollment_code_hash` و `gateway_payment.card_hash` افزوده شد؛ آزمون T30 |

@@ -1645,6 +1645,8 @@ CREATE TABLE IF NOT EXISTS catalog.item (
   shelf_life_days             integer CHECK (shelf_life_days BETWEEN 1 AND 36500),
   warranty_days               integer CHECK (warranty_days BETWEEN 1 AND 36500),
   warranty_provider_party_id  uuid,
+  -- آغاز گارانتی هر سریال (05:CR-C08): تاریخ فروش (موتور سریال بخش ۰۵) یا فعال‌سازی کارت گارانتی توسط خریدار
+  warranty_basis              text NOT NULL DEFAULT 'sale_date' CHECK (warranty_basis IN ('sale_date','activation')),
   sstid                       text CHECK (sstid ~ '^[0-9]{13}$'),
   sstid_kind                  text CHECK (sstid_kind IN ('general','specific')),
   moadian_title               text CHECK (moadian_title = core.fa_normalize_text(moadian_title) AND char_length(moadian_title) BETWEEN 1 AND 400),
@@ -2879,7 +2881,8 @@ CREATE OR REPLACE VIEW catalog.v_category_effective WITH (security_invoker = tru
          uom_id AS effective_uom_id, attribute_set_id AS effective_attribute_set_id
     FROM t;
 
--- SKU (05:CR-C08: warranty_days و warranty_provider_party_id برای گارانتی سریال در فروش)
+-- SKU (05:CR-C08: warranty_days، warranty_provider_party_id و warranty_basis برای گارانتی سریال در فروش؛ ستون تازه همیشه
+-- در انتهای فهرست می‌آید تا CREATE OR REPLACE VIEW روی پایگاه موجود هم اعمال شود)
 CREATE OR REPLACE VIEW catalog.v_sku WITH (security_invoker = true) AS
   SELECT v.tenant_id, v.id AS variant_id, v.item_id, v.code AS sku_code, i.code AS item_code,
          CASE WHEN v.name_suffix IS NULL THEN i.name ELSE i.name || ' — ' || v.name_suffix END AS display_name,
@@ -2892,7 +2895,7 @@ CREATE OR REPLACE VIEW catalog.v_sku WITH (security_invoker = true) AS
          i.is_sellable, i.is_purchasable, i.allow_discount, i.allow_price_override,
          (i.status = 'active' AND v.status = 'active') AS is_active,
          v.is_default, v.axis1_value_id, v.axis2_value_id, v.axis3_value_id, v.plu_code, i.company_id,
-         i.warranty_days, i.warranty_provider_party_id
+         i.warranty_days, i.warranty_provider_party_id, i.warranty_basis
     FROM catalog.item_variant v
     JOIN catalog.item i ON i.tenant_id = v.tenant_id AND i.id = v.item_id;
 
@@ -3204,4 +3207,41 @@ BEGIN
     PERFORM core.attach_custom_fields('parties.party', 'parties.party');
     PERFORM core.attach_custom_fields('catalog.item', 'catalog.item');
   END IF;
+END $$;
+
+-- FKهای این بخش به core (R-ORDER: «FKهای ۰۳ و ۰۴ به core به فایل خودشان برود»؛ R-ACTOR). کنشگر هر عمل عضو مستأجر
+-- است و کنشگر سیستمی NULL. تصویر کالا فایل core.attachment است. FK به rules.tax_category (لایهٔ بالاتر در ترتیب فایل‌ها)
+-- در 99_cross_fk.sql می‌ماند. idempotent: FK هم‌ارز (همان ستون‌ها به همان جدول، با هر نامی، مثلاً ساختهٔ 99 در اجرای
+-- پیشین) دوباره ساخته نمی‌شود؛ روی زنجیرهٔ «00 → 25» (بی core) کاری نمی‌کند.
+DO $$
+DECLARE r record; v_src regclass; v_dst regclass;
+BEGIN
+  IF to_regclass('core.tenant_membership') IS NULL THEN RETURN; END IF;
+  FOR r IN SELECT * FROM (VALUES
+    ('fk_party__created_by',                   'parties.party',                  'created_by',              'core.tenant_membership', 'user_id'),
+    ('fk_party__national_id_override_by',      'parties.party',                  'national_id_override_by', 'core.tenant_membership', 'user_id'),
+    ('fk_party_hold__placed_by',               'parties.party_hold',             'placed_by',               'core.tenant_membership', 'user_id'),
+    ('fk_party_hold__released_by',             'parties.party_hold',             'released_by',             'core.tenant_membership', 'user_id'),
+    ('fk_party_merge__merged_by',              'parties.party_merge',            'merged_by',               'core.tenant_membership', 'user_id'),
+    ('fk_duplicate_dismissal__dismissed_by',   'parties.duplicate_dismissal',    'dismissed_by',            'core.tenant_membership', 'user_id'),
+    ('fk_party_taxpayer_inquiry__inquired_by', 'parties.party_taxpayer_inquiry', 'inquired_by',             'core.tenant_membership', 'user_id'),
+    ('fk_item__created_by',                    'catalog.item',                   'created_by',              'core.tenant_membership', 'user_id'),
+    ('fk_barcode__created_by',                 'catalog.barcode',                'created_by',              'core.tenant_membership', 'user_id'),
+    ('fk_price_list__created_by',              'catalog.price_list',             'created_by',              'core.tenant_membership', 'user_id'),
+    ('fk_price_list_item__created_by',         'catalog.price_list_item',        'created_by',              'core.tenant_membership', 'user_id'),
+    ('fk_bom__created_by',                     'catalog.bom',                    'created_by',              'core.tenant_membership', 'user_id'),
+    ('fk_bom__activated_by',                   'catalog.bom',                    'activated_by',            'core.tenant_membership', 'user_id'),
+    ('fk_item_image__attachment',              'catalog.item_image',             'attachment_id',           'core.attachment',        'id')
+  ) AS v(fk, src, col, dst, refcol) LOOP
+    v_dst := to_regclass(r.dst);
+    CONTINUE WHEN v_dst IS NULL;
+    v_src := r.src::regclass;
+    CONTINUE WHEN EXISTS (
+      SELECT 1 FROM pg_constraint c
+       WHERE c.conrelid = v_src AND c.contype = 'f' AND c.confrelid = v_dst
+         AND c.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = v_src AND attname = 'tenant_id'),
+                              (SELECT attnum FROM pg_attribute WHERE attrelid = v_src AND attname = r.col)]::int2[]);
+    EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I FOREIGN KEY (tenant_id, %I) REFERENCES %s (tenant_id, %I)',
+                   v_src, r.fk, r.col, v_dst, r.refcol);
+  END LOOP;
 END $$;

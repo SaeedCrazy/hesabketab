@@ -113,9 +113,10 @@ INSERT INTO treasury.cheque_state (direction, purpose, state, is_holding, is_ter
   ('issued','payment','cancelled',                 false, true,  false, 'ابطال ثبت'),
   ('issued','guarantee','issued',                  true,  false, true,  'ضمانت صادره'),
   ('issued','guarantee','returned',                false, true,  true,  'ضمانت عودت‌شده'),
-  ('issued','guarantee','enforced',                false, true,  true,  'ضمانت اجراشده'),
+  ('issued','guarantee','enforced',                false, true,  false, 'ضمانت اجراشده (برگ و صیاد به چک پرداخت تبدیل‌شده می‌رسد؛ RV-TP-06)'),
   ('issued','guarantee','cancelled',               false, true,  false, 'ابطال ثبت')
-ON CONFLICT DO NOTHING;
+ON CONFLICT (direction, purpose, state) DO UPDATE SET is_holding = EXCLUDED.is_holding, is_terminal = EXCLUDED.is_terminal,
+  sayad_unique = EXCLUDED.sayad_unique, name_fa = EXCLUDED.name_fa;
 
 -- گذارهای مجاز. جدول پژوهش ۰۵ §۲-۲-۲ (R1..R14 با R3' و R5') و §۲-۲-۳ (P1..P7) عیناً (is_research_row)،
 -- به‌اضافهٔ گذارهای ضمانت (G*)، ورود مهاجرت (IMP_*) و چند افزودهٔ مستند (X*).
@@ -156,8 +157,8 @@ INSERT INTO treasury.cheque_transition (code, direction, purpose, from_state, to
   ('R2',  'received','payment', 'in_hand',     'deposited', 'deposit',          true, 'face', true, false,
    '[{"side":"debit","key":"treasury.cheque_in_collection","amount":"face","dim":"fund"},{"side":"credit","key":"@holding","amount":"face","dim":"party:from"}]',
    'واگذاری به بانک', '05 §2-2-2 R2', true),
-  ('R3',  'received','payment', 'deposited',   'collected', 'collect',          true, 'face', true, false,
-   '[{"side":"debit","key":"@fund","amount":"face","dim":"fund"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"face","dim":"deposit_bank"}]',
+  ('R3',  'received','payment', 'deposited',   'collected', 'collect',          true, 'outstanding', true, false,
+   '[{"side":"debit","key":"@fund","amount":"outstanding","dim":"fund"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"outstanding","dim":"deposit_bank"}]',
    'وصول', '05 §2-2-2 R3', true),
   ('R3B', 'received','payment', 'in_hand',     'collected', 'collect_direct',   true, 'face', true, false,
    '[{"side":"debit","key":"@fund","amount":"face","dim":"fund"},{"side":"credit","key":"@holding","amount":"face","dim":"party:from"}]',
@@ -165,8 +166,8 @@ INSERT INTO treasury.cheque_transition (code, direction, purpose, from_state, to
   ('R4',  'received','payment', 'deposited',   'partially_collected', 'collect_partial', true, 'partial', true, false,
    '[{"side":"debit","key":"@fund","amount":"partial","dim":"fund"},{"side":"debit","key":"@bounce_target","amount":"remainder","dim":"party:from"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"partial","dim":"deposit_bank"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"remainder","dim":"deposit_bank"}]',
    'وصول بخشی', '05 §2-2-2 R4', true),
-  ('R5',  'received','payment', 'deposited',   'bounced',   'bounce',           true, 'face', false, false,
-   '[{"side":"debit","key":"@bounce_target","amount":"face","dim":"party:from"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"face","dim":"deposit_bank"}]',
+  ('R5',  'received','payment', 'deposited',   'bounced',   'bounce',           true, 'outstanding', false, false,
+   '[{"side":"debit","key":"@bounce_target","amount":"outstanding","dim":"party:from"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"outstanding","dim":"deposit_bank"}]',
    'برگشت از بانک', '05 §2-2-2 R5', true),
   ('R5B', 'received','payment', 'in_hand',     'bounced',   'bounce_at_counter', true, 'face', false, false,
    '[{"side":"debit","key":"@bounce_target","amount":"face","dim":"party:from"},{"side":"credit","key":"@holding","amount":"face","dim":"party:from"}]',
@@ -196,6 +197,9 @@ INSERT INTO treasury.cheque_transition (code, direction, purpose, from_state, to
   ('R7PB','received','payment', 'partially_collected', 'partially_collected', 'settle_partial', true, 'installment', true, false,
    '[{"side":"debit","key":"@fund","amount":"explicit","dim":"fund"},{"side":"credit","key":"@bounce_target","amount":"explicit","dim":"party:from"}]',
    'تسویهٔ قسطی باقی‌ماندهٔ وصول بخشی', '05 §2-2-2 R7 (installment after R4)', false),
+  ('R7PC','received','payment', 'returned_by_third_party', 'returned_by_third_party', 'settle_partial', true, 'installment', true, false,
+   '[{"side":"debit","key":"@fund","amount":"explicit","dim":"fund"},{"side":"credit","key":"treasury.cheque_bounced","amount":"explicit","dim":"party:from"}]',
+   'تسویهٔ قسطی چک برگشتی از ثالث', '05 §2-2-2 R7 (installment after R10; RV-TP-23)', false),
   ('R8',  'received','payment', 'bounced',     'replaced',  'replace',          true, 'outstanding', false, false,
    '[{"side":"debit","key":"@holding","amount":"outstanding","dim":"party:from"},{"side":"credit","key":"@bounce_target","amount":"outstanding","dim":"party:from"}]',
    'تعویض چک برگشتی', '05 §2-2-2 R8', true),
@@ -214,9 +218,20 @@ INSERT INTO treasury.cheque_transition (code, direction, purpose, from_state, to
   ('R11', 'received','payment', 'in_hand',     'returned_to_drawer', 'return_to_drawer', true, 'face', false, false,
    '[{"side":"debit","key":"@counter","amount":"face","dim":"party:from"},{"side":"credit","key":"@holding","amount":"face","dim":"party:from"}]',
    'عودت به صادرکننده', '05 §2-2-2 R11', true),
-  ('R12', 'received','payment', 'deposited',   'in_hand',   'withdraw_deposit', true, 'face', false, false,
-   '[{"side":"debit","key":"@holding","amount":"face","dim":"party:from"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"face","dim":"deposit_bank"}]',
+  ('R12', 'received','payment', 'deposited',   'in_hand',   'withdraw_deposit', true, 'outstanding', false, false,
+   '[{"side":"debit","key":"@holding","amount":"outstanding","dim":"party:from"},{"side":"credit","key":"treasury.cheque_in_collection","amount":"outstanding","dim":"deposit_bank"}]',
    'برگشت از بانک بدون ارائه', '05 §2-2-2 R12', true),
+  -- ارائهٔ دوبارهٔ چک برگشتی (RV-X2-02؛ افزوده): مانده دوباره «در جریان وصول» می‌شود و R3/R4/R5 از deposited دوباره ممکن است.
+  -- مبالغ R3/R4/R5/R12 «مانده» است (برای واگذاری نخست = اسمی).
+  ('R2B', 'received','payment', 'bounced',     'deposited', 'deposit',          true, 'outstanding', true, false,
+   '[{"side":"debit","key":"treasury.cheque_in_collection","amount":"outstanding","dim":"fund"},{"side":"credit","key":"@bounce_target","amount":"outstanding","dim":"party:from"}]',
+   'ارائهٔ دوبارهٔ چک برگشتی به بانک', 'design addition (re-presentation, RV-X2-02)', false),
+  ('R2C', 'received','payment', 'partially_collected', 'deposited', 'deposit',  true, 'outstanding', true, false,
+   '[{"side":"debit","key":"treasury.cheque_in_collection","amount":"outstanding","dim":"fund"},{"side":"credit","key":"@bounce_target","amount":"outstanding","dim":"party:from"}]',
+   'ارائهٔ دوبارهٔ باقی‌ماندهٔ وصول بخشی', 'design addition (re-presentation, RV-X2-02)', false),
+  ('R2D', 'received','payment', 'returned_by_third_party', 'deposited', 'deposit', true, 'outstanding', true, false,
+   '[{"side":"debit","key":"treasury.cheque_in_collection","amount":"outstanding","dim":"fund"},{"side":"credit","key":"treasury.cheque_bounced","amount":"outstanding","dim":"party:from"}]',
+   'واگذاری چک برگشتی از ثالث به بانک', 'design addition (re-presentation, RV-X2-02)', false),
   ('R13A','received','payment', 'in_hand',     'cancelled', 'cancel',           false,'none', false, false, '[]', 'ابطال ثبت', '05 §2-2-2 R13', true),
   ('R13B','received','payment', 'deposited',   'cancelled', 'cancel',           false,'none', false, false, '[]', 'ابطال ثبت', '05 §2-2-2 R13', true),
   ('R13C','received','payment', 'partially_collected','cancelled','cancel',     false,'none', false, false, '[]', 'ابطال ثبت', '05 §2-2-2 R13', true),
@@ -249,6 +264,9 @@ INSERT INTO treasury.cheque_transition (code, direction, purpose, from_state, to
    'عودت برگ برگشتی پس از تسویهٔ دیگر', 'design addition (after P3, no journal)', false),
   ('XC1', 'issued','payment', 'issued',       'cancelled', 'cancel',           false,'none', false, false, '[]', 'ابطال ثبت', 'design addition (mirror of R13)', false),
   -- ---------- چک تضمینی (فقط حساب‌های انتظامی) ----------
+  -- G4..G6 (ضمانت صادره): طرف‌ها عمداً برعکس متن پژوهش ۰۵ §۲-۲-۳ است (RV-TP-25): حساب نگهداری زیردفتر 8102
+  -- «اسناد تضمینی پرداختی» در قالب ledger ماهیت بدهکار دارد، مثل 8101؛ پس صدور آن را بدهکار می‌کند تا
+  -- check_control_accounts برای هر دو نوع ضمانت ماندهٔ هم‌علامت بسنجد. جمع انتظامی و افشا تغییر نمی‌کند (D-T08).
   ('G1',  'received','guarantee', NULL,       'held',      'receive',          true, 'face', false, false,
    '[{"side":"debit","key":"treasury.guarantee_received","amount":"face","dim":"party:from"},{"side":"credit","key":"treasury.guarantee_received_contra","amount":"face","dim":"party:from"}]',
    'دریافت چک تضمینی', '05 §2-2-2 (guarantee)', true),
@@ -261,13 +279,13 @@ INSERT INTO treasury.cheque_transition (code, direction, purpose, from_state, to
   ('GXR', 'received','guarantee', 'held',     'cancelled', 'cancel',           false,'none', false, false, '[]', 'ابطال ثبت', '05 §2-2-2 R13 (guarantee)', false),
   ('G4',  'issued','guarantee', NULL,         'issued',    'issue',            true, 'face', false, false,
    '[{"side":"debit","key":"treasury.guarantee_given","amount":"face","dim":"party:payee"},{"side":"credit","key":"treasury.guarantee_given_contra","amount":"face","dim":"party:payee"}]',
-   'صدور چک تضمینی', '05 §2-2-3 (guarantee)', true),
+   'صدور چک تضمینی', '05 §2-2-3 (guarantee; memo sides deviate: holding 8102 debit-nature, D-T08)', false),
   ('G5',  'issued','guarantee', 'issued',     'returned',  'return',           true, 'face', false, false,
    '[{"side":"debit","key":"treasury.guarantee_given_contra","amount":"face","dim":"party:payee"},{"side":"credit","key":"treasury.guarantee_given","amount":"face","dim":"party:payee"}]',
-   'عودت چک تضمینی ما', '05 §2-2-3 (guarantee)', true),
+   'عودت چک تضمینی ما', '05 §2-2-3 (guarantee; memo sides deviate, D-T08)', false),
   ('G6',  'issued','guarantee', 'issued',     'enforced',  'enforce',          true, 'face', false, false,
    '[{"side":"debit","key":"treasury.guarantee_given_contra","amount":"face","dim":"party:payee"},{"side":"credit","key":"treasury.guarantee_given","amount":"face","dim":"party:payee"}]',
-   'اجرای ضمانت علیه ما (سپس P1 روی چک تبدیل‌شده)', '05 §2-2-3 (guarantee)', true),
+   'اجرای ضمانت علیه ما (سپس P1 روی چک تبدیل‌شده)', '05 §2-2-3 (guarantee; memo sides deviate, D-T08)', false),
   ('GXI', 'issued','guarantee', 'issued',     'cancelled', 'cancel',           false,'none', false, false, '[]', 'ابطال ثبت', 'design addition (guarantee)', false),
   -- ---------- ورود از نرم‌افزار قبلی: رکورد چک با وضعیت جاری، بدون سند (مانده از افتتاحیه) ----------
   ('IMP_RP_IN_HAND',   'received','payment', NULL, 'in_hand',   'import', false, 'none', false, false, '[]', 'ورود: نزد صندوق', '05 §3-9', true),
@@ -276,7 +294,12 @@ INSERT INTO treasury.cheque_transition (code, direction, purpose, from_state, to
   ('IMP_RG_HELD',      'received','guarantee', NULL, 'held',    'import', false, 'none', false, false, '[]', 'ورود: ضمانت نزد ما', '05 §3-9', true),
   ('IMP_IP_ISSUED',    'issued','payment', NULL, 'issued',      'import', false, 'none', false, false, '[]', 'ورود: صادرهٔ پاس‌نشده', '05 §3-9', true),
   ('IMP_IG_ISSUED',    'issued','guarantee', NULL, 'issued',    'import', false, 'none', false, false, '[]', 'ورود: ضمانت صادره', '05 §3-9', true)
-ON CONFLICT (code) DO NOTHING;
+ON CONFLICT (code) DO UPDATE SET
+  direction = EXCLUDED.direction, purpose = EXCLUDED.purpose, from_state = EXCLUDED.from_state, to_state = EXCLUDED.to_state,
+  op = EXCLUDED.op, requires_journal = EXCLUDED.requires_journal, amount_rule = EXCLUDED.amount_rule,
+  requires_fund = EXCLUDED.requires_fund, requires_counterparty = EXCLUDED.requires_counterparty,
+  journal_template = EXCLUDED.journal_template, name_fa = EXCLUDED.name_fa, research_ref = EXCLUDED.research_ref,
+  is_research_row = EXCLUDED.is_research_row;
 
 -- درگاه‌های پرداخت (رجیستری آداپترهای integrations). status=blocked یعنی پیکربندی جدید ممنوع.
 -- واحد مبلغ API فقط برای تبدیل در آداپتر است؛ ذخیره همیشه ریال صحیح.
@@ -316,7 +339,8 @@ ON CONFLICT (code) DO NOTHING;
 -- فرهنگ مترادف سرستون صورتحساب (تشخیص خودکار). synonym نرمال‌شده با core.fa_search_key.
 CREATE TABLE IF NOT EXISTS treasury.statement_header_synonym (
   field         text NOT NULL CHECK (field IN ('date','time','datetime','value_date','description','debit','credit',
-                                               'amount','balance','reference','cheque_no','deposit_id','branch','counterparty')),
+                                               'amount','balance','reference','cheque_no','deposit_id','branch','counterparty',
+                                               'counterparty_card')),
   synonym       text NOT NULL CHECK (synonym = core.fa_search_key(synonym) AND char_length(synonym) BETWEEN 1 AND 80),
   weight        numeric(4,2) NOT NULL DEFAULT 1 CHECK (weight > 0 AND weight <= 10),
   data_version  text NOT NULL,
@@ -335,7 +359,9 @@ SELECT v.f, core.fa_search_key(v.s), v.w, 'stmt-syn-v1' FROM (VALUES
   ('cheque_no','شماره چک',3.0), ('cheque_no','سریال چک',3.0),
   ('deposit_id','شناسه واریز',3.0), ('deposit_id','شناسه پرداخت',2.5),
   ('branch','کد شعبه',2.0), ('branch','شعبه',1.0), ('branch','نام شعبه',1.5),
-  ('counterparty','نام واریزکننده',2.5), ('counterparty','شماره کارت مبدا',2.0), ('counterparty','شبای مقصد',2.0)
+  ('counterparty','نام واریزکننده',2.5), ('counterparty','شبای مقصد',2.0),
+  -- شمارهٔ کارت مبدأ هرگز در counterparty نمی‌رود: نرمال‌ساز آن را ماسک و در counterparty_card_masked می‌گذارد (RV-TP-08)
+  ('counterparty_card','شماره کارت مبدا',2.5), ('counterparty_card','کارت مبدا',2.0)
 ) AS v(f, s, w)
 ON CONFLICT DO NOTHING;
 
@@ -390,10 +416,53 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
   SELECT coalesce(bool_and(treasury.is_masked_pan(x)), true) FROM unnest(p) AS x
 $$;
 
+-- شمارهٔ کامل کارت در متن آزاد (RV-TP-08، INV-TRS-02): هر رشتهٔ ۱۶ رقمی جدا (ارقام فارسی/عربی هم)، با جداکنندهٔ
+-- اختیاری فاصله یا خط تیره بین گروه‌های ۴تایی، که از Luhn بگذرد «کارت» است. نرمال‌ساز (statement/normalize.py) و
+-- سرویس‌ها همین الگو را پیش از ذخیره با treasury.mask_pans ماسک می‌کنند؛ CHECK ستون‌های متن آزاد همین را می‌سنجد.
+CREATE OR REPLACE FUNCTION treasury.luhn_ok(p_digits text) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT p_digits ~ '^[0-9]{12,19}$' AND
+         (SELECT sum(CASE WHEN (n - i) % 2 = 1 THEN (CASE WHEN d * 2 > 9 THEN d * 2 - 9 ELSE d * 2 END) ELSE d END) % 10 = 0
+            FROM (SELECT i, substr(p_digits, i, 1)::int AS d, char_length(p_digits) AS n
+                    FROM generate_series(1, char_length(p_digits)) AS i) x)
+$$;
+CREATE OR REPLACE FUNCTION treasury.pan_candidates(p text) RETURNS SETOF text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT m[1] FROM regexp_matches(translate(coalesce(p, ''), '۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789'),
+                                  '(?<![0-9])([0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4})(?![0-9])', 'g') AS m
+$$;
+CREATE OR REPLACE FUNCTION treasury.contains_pan(p text) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT coalesce(bool_or(treasury.luhn_ok(regexp_replace(c, '[ -]', '', 'g'))), false) FROM treasury.pan_candidates(p) AS c
+$$;
+-- ماسک: ۶ رقم اول + ****** + ۴ رقم آخر (همان قالب is_masked_pan). ارقام فارسی پیش از جست‌وجو به لاتین برگردانده می‌شوند.
+CREATE OR REPLACE FUNCTION treasury.mask_pans(p text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE v text := translate(p, '۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789'); c text; d text;
+BEGIN
+  IF p IS NULL OR NOT treasury.contains_pan(p) THEN RETURN p; END IF;
+  FOR c IN SELECT * FROM treasury.pan_candidates(v) LOOP
+    d := regexp_replace(c, '[ -]', '', 'g');
+    IF treasury.luhn_ok(d) THEN
+      v := replace(v, c, left(d, 6) || '******' || right(d, 4));
+    END IF;
+  END LOOP;
+  RETURN v;
+END $$;
+
 -- شخص مؤثر (پس از ادغام). parties ادغام زنجیره‌ای را فشرده می‌کند، پس یک گام کافی است.
 CREATE OR REPLACE FUNCTION treasury.canonical_party(p_tenant uuid, p_party uuid) RETURNS uuid
 LANGUAGE sql STABLE AS $$
   SELECT coalesce(p.merged_into_id, p.id) FROM parties.party p WHERE p.tenant_id = p_tenant AND p.id = p_party
+$$;
+
+-- مقدار بُعد «شخص» مؤثر (پس از ادغام بُعدها) برای یک شخص؛ مبنای مقایسهٔ زیردفتر اشخاص با GL
+CREATE OR REPLACE FUNCTION treasury.party_dim(p_tenant uuid, p_party uuid) RETURNS uuid
+LANGUAGE sql STABLE AS $$
+  SELECT coalesce(dv.merged_into_id, dv.id) FROM ledger.dimension_value dv
+    JOIN ledger.dimension_type t ON t.tenant_id = dv.tenant_id AND t.id = dv.dimension_type_id AND t.code = 'party'
+   WHERE dv.tenant_id = p_tenant AND dv.source_module = 'parties' AND dv.source_entity_id = p_party
+   ORDER BY dv.merged_into_id NULLS FIRST LIMIT 1
 $$;
 
 -- مقدار بُعد دفتر کل یک «منبع وجه» باید از نوع درست و متعلق به همین موجودیت باشد.
@@ -690,20 +759,25 @@ CREATE TABLE IF NOT EXISTS treasury.open_item (
   allocated_amount  core.amount NOT NULL DEFAULT 0 CHECK (allocated_amount >= 0),
   status            text NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed','cancelled')),
   journal_id        uuid,
+  account_id        uuid,     -- حساب کنترل GL سطر شخص در سند مبدأ (RV-IT2-04)؛ اگر داده نشود از سند حل می‌شود؛ در commit اجباری
   cancelled_at      timestamptz,
+  cancel_date       date,      -- تاریخ دفتری ابطال (= تاریخ سند برگشت؛ پیش‌فرض روز ابطال)؛ مبنای زیردفتر «در تاریخ»
   cancel_reason     text,
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
   row_version       integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, branch_id) REFERENCES core.branch(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, party_id) REFERENCES parties.party(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, account_id) REFERENCES ledger.account(tenant_id, company_id, id),
   CONSTRAINT open_item_allocated CHECK (allocated_amount <= amount),
   CONSTRAINT open_item_status CHECK (status = 'cancelled' OR (status = 'closed') = (allocated_amount = amount)),
   CONSTRAINT open_item_cancel CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL)
+                                     AND (status = 'cancelled') = (cancel_date IS NOT NULL)
                                      AND (status <> 'cancelled' OR allocated_amount = 0)),
   CONSTRAINT open_item_due CHECK (due_date >= doc_date)
 );
@@ -724,10 +798,16 @@ CREATE TABLE IF NOT EXISTS treasury.allocation (
   currency         char(3) NOT NULL REFERENCES ref.currency(code),
   allocation_date  date NOT NULL,
   kind             text NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal','offset')),
-  journal_id       uuid,
-  source           text NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','auto','pos','gateway','statement','migration','payroll')),
+  journal_id       uuid,     -- سند تهاتر، طبقه‌بندی بین دو حساب کنترل، یا تفاوت تسعیر تحقق‌یافته (source = treasury.allocation/<id>)
+  -- مبلغ پایهٔ مصرف‌شده از هر قلم (به نسبت مبلغ؛ آخرین تخصیص باقی‌مانده) و تفاوت تسعیر تحقق‌یافته = credit_base − debit_base (RV-X3-01)
+  debit_base       core.amount NOT NULL DEFAULT 0 CHECK (debit_base >= 0),
+  credit_base      core.amount NOT NULL DEFAULT 0 CHECK (credit_base >= 0),
+  fx_diff_base     core.amount NOT NULL DEFAULT 0,
+  reverse_journal_id uuid,
+  source           text NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','auto','pos','gateway','statement','migration','payroll','write_off')),
   status           text NOT NULL DEFAULT 'active' CHECK (status IN ('active','reversed')),
   reversed_at      timestamptz,
+  reverse_date     date,       -- تاریخ دفتری برگشت تخصیص (پیش‌فرض روز برگشت)؛ مبنای زیردفتر «در تاریخ»
   reversed_by      uuid,
   reverse_reason   text,
   created_by       uuid,
@@ -738,16 +818,61 @@ CREATE TABLE IF NOT EXISTS treasury.allocation (
   FOREIGN KEY (tenant_id, debit_item_id) REFERENCES treasury.open_item(tenant_id, id),
   FOREIGN KEY (tenant_id, credit_item_id) REFERENCES treasury.open_item(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, reverse_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, reversed_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   CONSTRAINT allocation_distinct CHECK (debit_item_id <> credit_item_id),
-  CONSTRAINT allocation_reversed CHECK ((status = 'reversed') = (reversed_at IS NOT NULL)
+  CONSTRAINT allocation_fx CHECK (fx_diff_base = credit_base - debit_base AND (fx_diff_base = 0 OR journal_id IS NOT NULL)),
+  CONSTRAINT allocation_reverse_journal CHECK (status <> 'reversed' OR journal_id IS NULL OR reverse_journal_id IS NOT NULL),
+  CONSTRAINT allocation_reversed CHECK ((status = 'reversed') = (reversed_at IS NOT NULL) AND (status = 'reversed') = (reverse_date IS NOT NULL)
                                        AND (status <> 'reversed' OR char_length(btrim(coalesce(reverse_reason, ''))) >= 5)),
   CONSTRAINT allocation_offset_journal CHECK (kind <> 'offset' OR journal_id IS NOT NULL)
 );
 SELECT core.enable_tenant_rls('treasury.allocation');
 CREATE INDEX IF NOT EXISTS allocation_debit_idx ON treasury.allocation (tenant_id, debit_item_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS allocation_credit_idx ON treasury.allocation (tenant_id, credit_item_id) WHERE status = 'active';
+
+-- سوخت مطالبات (RV-X2-06): بدهی وصول‌نشدنی شخص با سند «هزینهٔ مطالبات سوخت‌شده / دریافتنی[شخص]» (کلید treasury.bad_debt_expense)
+-- بسته می‌شود؛ یک قلم باز بستانکار با منبع treasury.write_off/<id> ساخته و با تخصیص source='write_off' به قلم بدهکار جفت می‌شود، پس
+-- سنی بدهی و GL هم‌خوان می‌مانند. مجوز critical و تأیید اجباری. وصول بعدی: برگشت سوخت (سند برگشت، برگشت تخصیص، ابطال قلم) و
+-- سپس دریافت عادی. مالیات بر ارزش افزودهٔ صورتحساب ثبت‌شده در مؤدیان برگشت نمی‌خورد.
+CREATE TABLE IF NOT EXISTS treasury.receivable_write_off (
+  tenant_id            uuid NOT NULL REFERENCES core.tenant(id),
+  id                   uuid NOT NULL DEFAULT uuidv7(),
+  company_id           uuid NOT NULL,
+  party_id             uuid NOT NULL,
+  debit_item_id        uuid NOT NULL,
+  credit_item_id       uuid,
+  amount               core.amount NOT NULL CHECK (amount > 0),
+  currency             char(3) NOT NULL REFERENCES ref.currency(code),
+  write_off_date       date NOT NULL,
+  reason               text NOT NULL CHECK (char_length(btrim(reason)) >= 10),
+  approval_request_id  uuid NOT NULL,
+  approval_subject     text NOT NULL DEFAULT 'treasury.write_off' CHECK (approval_subject = 'treasury.write_off'),
+  journal_id           uuid NOT NULL,
+  status               text NOT NULL DEFAULT 'posted' CHECK (status IN ('posted','reversed')),
+  reverse_journal_id   uuid,
+  reversed_at          timestamptz,
+  reverse_reason       text,
+  created_by           uuid,
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  row_version          integer NOT NULL DEFAULT 1,
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
+  FOREIGN KEY (tenant_id, party_id) REFERENCES parties.party(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, debit_item_id) REFERENCES treasury.open_item(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, credit_item_id) REFERENCES treasury.open_item(tenant_id, company_id, id),
+  -- قرارداد RV-CORE-26: تأیید «همین سند» (FK چهارستونی)؛ وضعیت approved در درج با core.approval_assert_approved
+  FOREIGN KEY (tenant_id, approval_request_id, approval_subject, id) REFERENCES core.approval_request(tenant_id, id, subject_type, subject_id),
+  FOREIGN KEY (tenant_id, company_id, journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, reverse_journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership(tenant_id, user_id),
+  CONSTRAINT write_off_reversed CHECK ((status = 'reversed') = (reverse_journal_id IS NOT NULL AND reversed_at IS NOT NULL
+                                       AND char_length(btrim(coalesce(reverse_reason, ''))) >= 10))
+);
+SELECT core.enable_tenant_rls('treasury.receivable_write_off');
 
 -- انتقال وجه داخلی بین صندوق، بانک و تنخواه (واریز نقد به بانک، برداشت، جایگزینی تنخواه، تخلیهٔ کشوی صندوق).
 -- via_in_transit: دو مرحله (ارسال ← «وجوه در راه» ← دریافت). draft → sent → posted یا draft → posted؛ لغو با سند برگشت.
@@ -788,6 +913,7 @@ CREATE TABLE IF NOT EXISTS treasury.fund_transfer (
   row_version              integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, branch_id) REFERENCES core.branch(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, from_cash_box_id) REFERENCES treasury.cash_box(tenant_id, company_id, id),
@@ -915,6 +1041,13 @@ CREATE TABLE IF NOT EXISTS treasury.petty_cash_claim_line (
   project_value_id      uuid,
   vendor_party_id       uuid,
   attachment_id         uuid,
+  -- اعتبار مالیات خرید (RV-TP-10): فقط صورتحساب ثبت‌شده در سامانهٔ مؤدیان (پژوهش ۰۳؛ از ۱ دی ۱۴۰۴). بقیه (رسید کاغذی، نوع ۲)
+  -- ارزش افزوده را به هزینه می‌برند (کلید tax.vat_input_nondeductible). input_credit یعنی TaxRegisterService.record_purchase ثبت
+  -- و صلاحیت را قاعدهٔ تاریخ‌دار tax.vat.input_credit_rule در دفتر خرید مالیات تعیین می‌کند.
+  vat_treatment         text NOT NULL DEFAULT 'expense' CHECK (vat_treatment IN ('expense','input_credit')),
+  seller_taxid          text CHECK (seller_taxid ~ '^([0-9]{10,12}|[0-9]{14})$'),
+  tax_invoice_taxid     text CHECK (tax_invoice_taxid ~ '^[0-9A-Z]{22}$'),
+  tax_purchase_entry_id uuid,     -- tax.purchase_entry (FK دوستونی fk_petty_cash_claim_line__tax_purchase_entry در 99_cross_fk؛ §۱۲)؛ برای input_credit در ثبت اجباری
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, claim_id, line_no),
@@ -925,7 +1058,9 @@ CREATE TABLE IF NOT EXISTS treasury.petty_cash_claim_line (
   FOREIGN KEY (tenant_id, vendor_party_id) REFERENCES parties.party(tenant_id, id),
   FOREIGN KEY (tenant_id, attachment_id) REFERENCES core.attachment(tenant_id, id),
   CONSTRAINT petty_line_account CHECK (num_nonnulls(posting_key, account_id) = 1),
-  CONSTRAINT petty_line_vat CHECK (vat_amount < amount)
+  CONSTRAINT petty_line_vat CHECK (vat_amount < amount),
+  CONSTRAINT petty_line_vat_credit CHECK (vat_treatment = 'expense'
+                                          OR (vat_amount > 0 AND seller_taxid IS NOT NULL AND tax_invoice_taxid IS NOT NULL))
 );
 SELECT core.enable_tenant_rls('treasury.petty_cash_claim_line');
 
@@ -1082,9 +1217,10 @@ SELECT core.enable_tenant_rls('treasury.cheque');
 -- یکتایی صیاد فقط روی چک‌های «فعال» هر جهت (چک خرج‌شده ممکن است دوباره از شخص دیگری برگردد)
 CREATE UNIQUE INDEX IF NOT EXISTS cheque_sayad_active_uq ON treasury.cheque (tenant_id, direction, sayad_id)
   WHERE sayad_id IS NOT NULL AND sayad_unique;
--- هر برگ دسته‌چک حداکثر یک چک صادرهٔ ابطال‌نشده
+-- هر برگ دسته‌چک حداکثر یک چک صادرهٔ فعال؛ ضمانت اجراشده برگش را به چک پرداخت تبدیل‌شده می‌سپارد (RV-TP-06)
+DROP INDEX IF EXISTS treasury.cheque_leaf_active_uq;
 CREATE UNIQUE INDEX IF NOT EXISTS cheque_leaf_active_uq ON treasury.cheque (tenant_id, cheque_leaf_id)
-  WHERE cheque_leaf_id IS NOT NULL AND state <> 'cancelled';
+  WHERE cheque_leaf_id IS NOT NULL AND state NOT IN ('cancelled','enforced');
 CREATE INDEX IF NOT EXISTS cheque_due_idx ON treasury.cheque (tenant_id, company_id, direction, due_date) WHERE sayad_unique;
 CREATE INDEX IF NOT EXISTS cheque_party_idx ON treasury.cheque (tenant_id, received_from_party_id);
 CREATE INDEX IF NOT EXISTS cheque_payee_idx ON treasury.cheque (tenant_id, payee_party_id);
@@ -1094,6 +1230,7 @@ CREATE INDEX IF NOT EXISTS cheque_payee_idx ON treasury.cheque (tenant_id, payee
 CREATE TABLE IF NOT EXISTS treasury.cheque_event (
   tenant_id              uuid NOT NULL REFERENCES core.tenant(id),
   id                     uuid NOT NULL DEFAULT uuidv7(),
+  company_id             uuid NOT NULL,               -- از چک (تریگر)؛ همهٔ ارجاع‌ها «همان شرکت» (RV-TP-07)
   cheque_id              uuid NOT NULL,
   seq                    integer NOT NULL CHECK (seq >= 1),
   kind                   text NOT NULL CHECK (kind IN ('transition','undo')),
@@ -1124,18 +1261,18 @@ CREATE TABLE IF NOT EXISTS treasury.cheque_event (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, cheque_id, seq),
-  FOREIGN KEY (tenant_id, cheque_id) REFERENCES treasury.cheque(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, cheque_id) REFERENCES treasury.cheque(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, undoes_event_id) REFERENCES treasury.cheque_event(tenant_id, id),
-  FOREIGN KEY (tenant_id, bank_account_id) REFERENCES treasury.bank_account(tenant_id, id),
-  FOREIGN KEY (tenant_id, cash_box_id) REFERENCES treasury.cash_box(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, bank_account_id) REFERENCES treasury.bank_account(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, cash_box_id) REFERENCES treasury.cash_box(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, counterparty_party_id) REFERENCES parties.party(tenant_id, id),
-  FOREIGN KEY (tenant_id, deposit_bank_after) REFERENCES treasury.bank_account(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, deposit_bank_after) REFERENCES treasury.bank_account(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, endorsee_after) REFERENCES parties.party(tenant_id, id),
-  FOREIGN KEY (tenant_id, holding_account_id) REFERENCES ledger.account(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, holding_account_id) REFERENCES ledger.account(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, holding_dim_value_id) REFERENCES ledger.dimension_value(tenant_id, id),
-  FOREIGN KEY (tenant_id, journal_id) REFERENCES ledger.journal(tenant_id, id),
-  FOREIGN KEY (tenant_id, money_document_id) REFERENCES treasury.money_document(tenant_id, id),
-  FOREIGN KEY (tenant_id, related_cheque_id) REFERENCES treasury.cheque(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, money_document_id) REFERENCES treasury.money_document(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, related_cheque_id) REFERENCES treasury.cheque(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, actor_id) REFERENCES core.tenant_membership(tenant_id, user_id),
   CONSTRAINT cheque_event_kind CHECK ((kind = 'transition') = (transition_code IS NOT NULL)
                                       AND (kind = 'undo') = (undoes_event_id IS NOT NULL)),
@@ -1245,6 +1382,7 @@ CREATE TABLE IF NOT EXISTS treasury.card_txn (
   row_version        integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, card_terminal_id) REFERENCES treasury.card_terminal(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, company_id, money_document_id) REFERENCES treasury.money_document(tenant_id, company_id, id),
@@ -1259,6 +1397,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS card_txn_source_uq ON treasury.card_txn (tenan
   WHERE source_ref IS NOT NULL AND status <> 'void';
 CREATE INDEX IF NOT EXISTS card_txn_unsettled_idx ON treasury.card_txn (tenant_id, card_terminal_id, business_date)
   WHERE settlement_id IS NULL AND status = 'approved';
+-- جست‌وجوی تراکنش‌های یک تسویه (card_settlement_check، آزادسازی، حذف پیش‌نویس؛ RV-TP-19)
+CREATE INDEX IF NOT EXISTS card_txn_settlement_idx ON treasury.card_txn (tenant_id, settlement_id) WHERE settlement_id IS NOT NULL;
 
 -- تسویهٔ شاپرک: یک واریز تجمیعی پایانه (سطر صورتحساب) در برابر مجموعهٔ تراکنش‌های تسویه‌نشده.
 CREATE TABLE IF NOT EXISTS treasury.card_settlement (
@@ -1344,7 +1484,7 @@ CREATE TABLE IF NOT EXISTS treasury.gateway_payment (
   provider_ref        text CHECK (char_length(provider_ref) BETWEEN 1 AND 100),
   provider_txn_ref    text CHECK (char_length(provider_txn_ref) BETWEEN 1 AND 64),
   card_masked         text CHECK (card_masked IS NULL OR treasury.is_masked_pan(card_masked)),
-  card_hash           bytea CHECK (card_hash IS NULL OR octet_length(card_hash) = 32),
+  card_hash           bytea CHECK (card_hash IS NULL OR octet_length(card_hash) = 32),   -- HMAC-SHA256(کلید مستأجر، PAN)؛ راز (RV-IT2-11)
   verified_amount     core.amount,
   fee_amount          core.amount CHECK (fee_amount >= 0),
   last_response_code  text CHECK (char_length(last_response_code) <= 32),
@@ -1365,6 +1505,7 @@ CREATE TABLE IF NOT EXISTS treasury.gateway_payment (
   row_version         integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, company_id, id),
   UNIQUE (tenant_id, order_id),
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, gateway_account_id) REFERENCES treasury.gateway_account(tenant_id, company_id, id),
@@ -1412,6 +1553,7 @@ SELECT core.enable_tenant_rls('treasury.gateway_event');
 CREATE TABLE IF NOT EXISTS treasury.money_instrument (
   tenant_id                 uuid NOT NULL REFERENCES core.tenant(id),
   id                        uuid NOT NULL DEFAULT uuidv7(),
+  company_id                uuid NOT NULL,             -- از سند (تریگر)؛ منبع وجه «همان شرکت» با FK سه‌ستونی (RV-TP-07)
   document_id               uuid NOT NULL,
   line_no                   smallint NOT NULL CHECK (line_no BETWEEN 1 AND 500),
   kind                      text NOT NULL CHECK (kind IN ('cash','card_pos','bank_transfer','card_to_card','cheque',
@@ -1437,14 +1579,14 @@ CREATE TABLE IF NOT EXISTS treasury.money_instrument (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, document_id, line_no),
-  FOREIGN KEY (tenant_id, document_id) REFERENCES treasury.money_document(tenant_id, id) ON DELETE CASCADE,
-  FOREIGN KEY (tenant_id, cash_box_id) REFERENCES treasury.cash_box(tenant_id, id),
-  FOREIGN KEY (tenant_id, bank_account_id) REFERENCES treasury.bank_account(tenant_id, id),
-  FOREIGN KEY (tenant_id, card_terminal_id) REFERENCES treasury.card_terminal(tenant_id, id),
-  FOREIGN KEY (tenant_id, gateway_payment_id) REFERENCES treasury.gateway_payment(tenant_id, id),
-  FOREIGN KEY (tenant_id, cheque_id) REFERENCES treasury.cheque(tenant_id, id),
-  FOREIGN KEY (tenant_id, petty_cash_fund_id) REFERENCES treasury.petty_cash_fund(tenant_id, id),
-  FOREIGN KEY (tenant_id, card_txn_id) REFERENCES treasury.card_txn(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, document_id) REFERENCES treasury.money_document(tenant_id, company_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, company_id, cash_box_id) REFERENCES treasury.cash_box(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, bank_account_id) REFERENCES treasury.bank_account(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, card_terminal_id) REFERENCES treasury.card_terminal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, gateway_payment_id) REFERENCES treasury.gateway_payment(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, cheque_id) REFERENCES treasury.cheque(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, petty_cash_fund_id) REFERENCES treasury.petty_cash_fund(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, card_txn_id) REFERENCES treasury.card_txn(tenant_id, company_id, id),
   CONSTRAINT instrument_shape CHECK (
        (kind = 'cash'           AND cash_box_id IS NOT NULL
                                 AND num_nonnulls(bank_account_id, card_terminal_id, gateway_payment_id, cheque_id, petty_cash_fund_id) = 0)
@@ -1465,13 +1607,17 @@ CREATE TABLE IF NOT EXISTS treasury.money_instrument (
   CONSTRAINT instrument_card_txn CHECK (card_txn_id IS NULL OR kind = 'card_pos')
 );
 SELECT core.enable_tenant_rls('treasury.money_instrument');
-CREATE UNIQUE INDEX IF NOT EXISTS money_instrument_gateway_uq ON treasury.money_instrument (tenant_id, gateway_payment_id)
+-- یک سند زندهٔ دریافت برای هر پرداخت درگاه با تریگر (money_line_guard) سنجیده می‌شود، نه ایندکس یکتا: سند ابطال‌شده جای
+-- رسید اصلاحی را نمی‌گیرد (RV-TP-17)
+DROP INDEX IF EXISTS treasury.money_instrument_gateway_uq;
+CREATE INDEX IF NOT EXISTS money_instrument_gateway_idx ON treasury.money_instrument (tenant_id, gateway_payment_id)
   WHERE gateway_payment_id IS NOT NULL;
 
 -- طرف دیگر سند: شخص (حساب دریافتنی/پرداختنی طبق نقش)، پیش‌دریافت/پیش‌پرداخت، حساب صریح، یا تسویهٔ چک برگشتی.
 CREATE TABLE IF NOT EXISTS treasury.money_counter_line (
   tenant_id             uuid NOT NULL REFERENCES core.tenant(id),
   id                    uuid NOT NULL DEFAULT uuidv7(),
+  company_id            uuid NOT NULL,                 -- از سند (تریگر)؛ حساب و چک «همان شرکت» (RV-TP-07)
   document_id           uuid NOT NULL,
   line_no               smallint NOT NULL CHECK (line_no BETWEEN 1 AND 500),
   kind                  text NOT NULL CHECK (kind IN ('party','party_advance','account','bounced_cheque')),
@@ -1487,10 +1633,12 @@ CREATE TABLE IF NOT EXISTS treasury.money_counter_line (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, document_id, line_no),
-  FOREIGN KEY (tenant_id, document_id) REFERENCES treasury.money_document(tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, company_id, document_id) REFERENCES treasury.money_document(tenant_id, company_id, id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, party_id) REFERENCES parties.party(tenant_id, id),
-  FOREIGN KEY (tenant_id, account_id) REFERENCES ledger.account(tenant_id, id),
-  FOREIGN KEY (tenant_id, cheque_id) REFERENCES treasury.cheque(tenant_id, id),
+  -- گرد کردن نقدی صندوق (RV-X2-14، قرارداد ۰۵ D-C30): کمتر پرداخت‌شده = تخفیف «rounding» در خود فاکتور؛ بیشتر پرداخت‌شده = سطر
+  -- «account» با کلید treasury.cash_over_short. پس هیچ سطر طرف منفی نیست و حساب «گرد کردن» جدایی لازم نیست.
+  FOREIGN KEY (tenant_id, company_id, account_id) REFERENCES ledger.account(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, cheque_id) REFERENCES treasury.cheque(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, cost_center_value_id) REFERENCES ledger.dimension_value(tenant_id, id),
   FOREIGN KEY (tenant_id, project_value_id) REFERENCES ledger.dimension_value(tenant_id, id),
   CONSTRAINT counter_line_shape CHECK (
@@ -1602,6 +1750,7 @@ CREATE TABLE IF NOT EXISTS treasury.statement_line (
   cheque_no           text CHECK (char_length(cheque_no) <= 30),
   deposit_id          text CHECK (char_length(deposit_id) <= 40),
   counterparty        text CHECK (char_length(counterparty) <= 200),
+  counterparty_card_masked text CHECK (counterparty_card_masked IS NULL OR treasury.is_masked_pan(counterparty_card_masked)),
   branch_code         text CHECK (char_length(branch_code) <= 20),
   terminal_no         text CHECK (terminal_no ~ '^[0-9A-Za-z]{4,16}$'),
   txn_class           text CHECK (txn_class IN ('paya','satna','pol','card_transfer','pos_settlement','ipg_settlement',
@@ -1721,6 +1870,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS recon_item_statement_active_uq ON treasury.rec
   WHERE is_active AND statement_line_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS recon_item_book_active_uq ON treasury.recon_match_item (tenant_id, journal_line_id)
   WHERE is_active AND journal_line_id IS NOT NULL;
+-- اقلام یک گروه تطبیق (recon_match_check برای هر قلم، undo، محافظ؛ RV-TP-19)
+CREATE INDEX IF NOT EXISTS recon_match_item_match_idx ON treasury.recon_match_item (tenant_id, match_id);
 
 -- صورت مغایرت بانکی در تاریخ as_of. اتحاد: مانده بانک + اقلام دفتری تطبیق‌نشده = ماندهٔ دفتر + اقلام بانکی تطبیق‌نشده.
 CREATE TABLE IF NOT EXISTS treasury.bank_reconciliation (
@@ -1752,6 +1903,85 @@ CREATE TABLE IF NOT EXISTS treasury.bank_reconciliation (
 );
 SELECT core.enable_tenant_rls('treasury.bank_reconciliation');
 
+-- ---------- واحد خرد ارز (RV-TP-20): هر مبلغ پولی treasury و pos با minor_unit ارز خودش گرد است (مثل سطر journal ledger) ----------
+-- TG_ARGV[0] منبع ارز: 'col:<ستون>'، 'company' (ارز پایهٔ شرکت)، 'doc' (سند دریافت/پرداخت)، 'cheque'، 'cash_box'، 'terminal'
+-- (حساب تسویهٔ کارتخوان)، 'bank'، 'claim' (تنخواه صورت‌خرج)، 'fund' (تنخواه)، 'ticket'، 'shift' (کشوی شیفت). بقیه نام ستون‌های مبلغ‌اند.
+CREATE OR REPLACE FUNCTION treasury.minor_unit_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE j jsonb := to_jsonb(NEW); v_cur char(3); v_minor smallint; i int; v numeric;
+BEGIN
+  v_cur := CASE
+    WHEN TG_ARGV[0] LIKE 'col:%' THEN j ->> substr(TG_ARGV[0], 5)
+    WHEN TG_ARGV[0] = 'company' THEN (SELECT base_currency FROM core.company WHERE tenant_id = NEW.tenant_id AND id = (j ->> 'company_id')::uuid)
+    WHEN TG_ARGV[0] = 'doc' THEN (SELECT currency FROM treasury.money_document WHERE tenant_id = NEW.tenant_id AND id = (j ->> 'document_id')::uuid)
+    WHEN TG_ARGV[0] = 'cheque' THEN (SELECT currency FROM treasury.cheque WHERE tenant_id = NEW.tenant_id AND id = (j ->> 'cheque_id')::uuid)
+    WHEN TG_ARGV[0] = 'cash_box' THEN (SELECT currency FROM treasury.cash_box WHERE tenant_id = NEW.tenant_id AND id = (j ->> 'cash_box_id')::uuid)
+    WHEN TG_ARGV[0] = 'bank' THEN (SELECT currency FROM treasury.bank_account WHERE tenant_id = NEW.tenant_id AND id = (j ->> 'bank_account_id')::uuid)
+    WHEN TG_ARGV[0] = 'terminal' THEN (SELECT b.currency FROM treasury.card_terminal t JOIN treasury.bank_account b
+                                         ON b.tenant_id = t.tenant_id AND b.id = t.settlement_bank_account_id
+                                        WHERE t.tenant_id = NEW.tenant_id AND t.id = (j ->> 'card_terminal_id')::uuid)
+    WHEN TG_ARGV[0] = 'fund' THEN (SELECT currency FROM treasury.petty_cash_fund WHERE tenant_id = NEW.tenant_id AND id = (j ->> 'fund_id')::uuid)
+    WHEN TG_ARGV[0] = 'claim' THEN (SELECT f.currency FROM treasury.petty_cash_claim c JOIN treasury.petty_cash_fund f ON f.tenant_id = c.tenant_id AND f.id = c.fund_id
+                                     WHERE c.tenant_id = NEW.tenant_id AND c.id = (j ->> 'claim_id')::uuid)
+    WHEN TG_ARGV[0] = 'ticket' THEN (SELECT currency FROM pos.ticket WHERE tenant_id = NEW.tenant_id AND id = (j ->> 'ticket_id')::uuid)
+    WHEN TG_ARGV[0] = 'shift' THEN (SELECT b.currency FROM pos.shift sh JOIN treasury.cash_box b ON b.tenant_id = sh.tenant_id AND b.id = sh.cash_box_id
+                                     WHERE sh.tenant_id = NEW.tenant_id AND sh.id = (j ->> CASE WHEN TG_TABLE_NAME = 'shift' THEN 'id' ELSE 'shift_id' END)::uuid)
+  END;
+  SELECT minor_unit INTO v_minor FROM ref.currency WHERE code = v_cur;
+  IF v_minor IS NULL THEN RETURN NEW; END IF;      -- والد ناموجود را FK خودش رد می‌کند
+  FOR i IN 1 .. TG_NARGS - 1 LOOP
+    v := (j ->> TG_ARGV[i])::numeric;
+    IF v IS NOT NULL AND v <> round(v, v_minor) THEN
+      PERFORM core.raise_hk('HK_TRS_MINOR_UNIT', format('%s.%s = %s is finer than the %s minor unit (%s decimals)', TG_TABLE_NAME, TG_ARGV[i], v, v_cur, v_minor));
+    END IF;
+  END LOOP;
+  RETURN NEW;
+END $$;
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT * FROM (VALUES
+      ('treasury','open_item','trg_minor','col:currency','{amount}'), ('treasury','open_item','trg_minor_base','company','{amount_base}'),
+      ('treasury','allocation','trg_minor','col:currency','{amount}'),
+      ('treasury','money_document','trg_minor','col:currency','{total_amount}'),
+      ('treasury','money_instrument','trg_minor','doc','{amount,fee_amount}'),
+      ('treasury','money_counter_line','trg_minor','doc','{amount}'),
+      ('treasury','fund_transfer','trg_minor','col:currency','{amount,fee_amount}'),
+      ('treasury','cash_count','trg_minor','cash_box','{expected_amount,counted_amount}'),
+      ('treasury','petty_cash_fund','trg_minor','col:currency','{imprest_amount}'),
+      ('treasury','petty_cash_claim','trg_minor','fund','{total_amount}'),
+      ('treasury','petty_cash_claim_line','trg_minor','claim','{amount,vat_amount}'),
+      ('treasury','cheque','trg_minor','col:currency','{amount,collected_amount}'), ('treasury','cheque','trg_minor_base','company','{amount_base}'),
+      ('treasury','cheque_event','trg_minor','cheque','{amount,collected_after,holding_amount}'),
+      ('treasury','cheque_event','trg_minor_base','company','{holding_amount_base}'),
+      ('treasury','card_txn','trg_minor','terminal','{amount}'),
+      ('treasury','card_settlement','trg_minor','bank','{gross_amount,fee_amount}'),
+      ('treasury','receivable_write_off','trg_minor','col:currency','{amount}'),
+      ('treasury','allocation','trg_minor_base','company','{debit_base,credit_base,fx_diff_base}')) AS v(sch, tbl, trg, src, cols) LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I.%I', r.trg, r.sch, r.tbl);
+    EXECUTE format('CREATE TRIGGER %I BEFORE INSERT OR UPDATE ON %I.%I FOR EACH ROW EXECUTE FUNCTION treasury.minor_unit_guard(%s)',
+                   r.trg, r.sch, r.tbl, (SELECT string_agg(quote_literal(x), ', ') FROM unnest(r.src || r.cols::text[]) x));
+  END LOOP;
+END $$;
+
+-- ---------- هیچ شمارهٔ کامل کارت در متن آزاد خزانه (RV-TP-08، INV-TRS-02) ----------
+-- deposit_id عمداً بیرون است: شناسهٔ واریز کلید تطبیق است و ماسک نمی‌شود؛ کارت هرگز در آن نمی‌آید (نرمال‌ساز سرستون).
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT * FROM (VALUES
+      ('money_document','description'), ('money_document','cancel_reason'), ('money_instrument','reference_no'), ('money_instrument','note'),
+      ('money_counter_line','description'), ('fund_transfer','reference_no'), ('fund_transfer','description'), ('fund_transfer','cancel_reason'),
+      ('cash_count','note'), ('petty_cash_claim','note'), ('petty_cash_claim','reject_reason'), ('petty_cash_claim_line','description'),
+      ('cheque','note'), ('cheque_event','reason'), ('card_txn','void_reason'), ('card_day_close','resolution_note'),
+      ('gateway_payment','failure_reason'), ('gateway_event','note'), ('statement_line','description_raw'), ('statement_line','reference'),
+      ('statement_line','counterparty'), ('statement_line','cheque_no'), ('recon_match','note'), ('recon_match','undo_reason')) AS v(tbl, col) LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = format('treasury.%I', r.tbl)::regclass AND conname = r.col || '_no_pan') THEN
+      EXECUTE format('ALTER TABLE treasury.%I ADD CONSTRAINT %I CHECK (NOT treasury.contains_pan(%I))', r.tbl, r.col || '_no_pan', r.col);
+    END IF;
+  END LOOP;
+END $$;
+
 -- =====================================================================
 -- ۱۱. تریگرهای treasury
 -- =====================================================================
@@ -1762,7 +1992,7 @@ BEGIN
   FOREACH t IN ARRAY ARRAY['bank_account','cash_box','petty_cash_fund','card_terminal','gateway_account','money_document',
                            'open_item','fund_transfer','cash_count','petty_cash_claim','cheque_book','cheque_leaf','cheque',
                            'cheque_print_template','card_txn','card_settlement','gateway_payment','statement_profile',
-                           'statement_import','recon_rule','bank_reconciliation'] LOOP
+                           'statement_import','recon_rule','bank_reconciliation','receivable_write_off'] LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS trg_touch ON treasury.%I', t);
     EXECUTE format('CREATE TRIGGER trg_touch BEFORE UPDATE ON treasury.%I FOR EACH ROW EXECUTE FUNCTION core.touch_row()', t);
   END LOOP;
@@ -1778,7 +2008,7 @@ BEGIN
   END LOOP;
   -- حذف ممنوع (به‌روزرسانی با محافظ جدا)
   FOREACH t IN ARRAY ARRAY['open_item','allocation','cheque','cheque_leaf','cheque_book','card_txn','recon_match','recon_match_item',
-                           'bank_reconciliation','gateway_payment'] LOOP
+                           'bank_reconciliation','gateway_payment','receivable_write_off'] LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS trg_no_delete ON treasury.%I', t);
     EXECUTE format('CREATE TRIGGER trg_no_delete BEFORE DELETE ON treasury.%I FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation()', t);
   END LOOP;
@@ -1794,7 +2024,7 @@ BEGIN
       ('cheque','received_from_party_id','INSERT'), ('cheque','drawer_party_id','INSERT'), ('cheque','payee_party_id','INSERT'),
       ('money_counter_line','party_id','INSERT OR UPDATE'), ('petty_cash_fund','custodian_party_id','INSERT OR UPDATE'),
       ('gateway_payment','party_id','INSERT'), ('petty_cash_claim_line','vendor_party_id','INSERT OR UPDATE'),
-      ('recon_rule','party_id','INSERT OR UPDATE')) AS v(tbl, col, ev) LOOP
+      ('recon_rule','party_id','INSERT OR UPDATE'), ('receivable_write_off','party_id','INSERT')) AS v(tbl, col, ev) LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON treasury.%I', 'trg_party_guard_' || r.col, r.tbl);
     EXECUTE format('CREATE TRIGGER %I BEFORE %s ON treasury.%I FOR EACH ROW EXECUTE FUNCTION parties.child_party_guard(%L)',
                    'trg_party_guard_' || r.col, r.ev, r.tbl, r.col);
@@ -1931,15 +2161,33 @@ BEGIN
   IF TG_OP = 'UPDATE' AND NEW.document_id <> OLD.document_id THEN
     PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', 'line cannot move to another document');
   END IF;
+  NEW.company_id := d.company_id;     -- FKهای سه‌ستونی منبع وجه، چک و حساب را به همین شرکت می‌بندد (RV-TP-07)
   IF TG_TABLE_NAME = 'money_instrument' THEN
+    -- ارز منبع وجه = ارز سند (RV-TP-07)
+    IF coalesce((SELECT currency FROM treasury.cash_box WHERE tenant_id = NEW.tenant_id AND id = NEW.cash_box_id),
+                (SELECT currency FROM treasury.bank_account WHERE tenant_id = NEW.tenant_id AND id = NEW.bank_account_id),
+                (SELECT currency FROM treasury.petty_cash_fund WHERE tenant_id = NEW.tenant_id AND id = NEW.petty_cash_fund_id),
+                (SELECT b.currency FROM treasury.card_terminal ct JOIN treasury.bank_account b ON b.tenant_id = ct.tenant_id AND b.id = ct.settlement_bank_account_id
+                  WHERE ct.tenant_id = NEW.tenant_id AND ct.id = NEW.card_terminal_id),
+                (SELECT currency FROM treasury.cheque WHERE tenant_id = NEW.tenant_id AND id = NEW.cheque_id),
+                CASE WHEN NEW.gateway_payment_id IS NOT NULL THEN 'IRR' END,
+                d.currency) <> d.currency THEN
+      PERFORM core.raise_hk('HK_TRS_INSTRUMENT_CURRENCY', format('instrument fund currency differs from the %s document currency', d.currency));
+    END IF;
     IF (d.direction = 'receipt' AND NEW.kind NOT IN ('cash','card_pos','bank_transfer','card_to_card','cheque','gateway'))
        OR (d.direction = 'payment' AND NEW.kind NOT IN ('cash','bank_transfer','card_to_card','cheque','cheque_endorse','petty_cash')) THEN
       PERFORM core.raise_hk('HK_TRS_INSTRUMENT_DIRECTION', format('instrument %s is not allowed in a %s', NEW.kind, d.direction));
     END IF;
     IF NEW.kind = 'gateway' THEN
-      SELECT * INTO g FROM treasury.gateway_payment WHERE tenant_id = NEW.tenant_id AND id = NEW.gateway_payment_id;
+      SELECT * INTO g FROM treasury.gateway_payment WHERE tenant_id = NEW.tenant_id AND id = NEW.gateway_payment_id FOR UPDATE;
       IF g.state IS DISTINCT FROM 'verified' OR g.amount <> NEW.amount OR g.company_id <> d.company_id THEN
         PERFORM core.raise_hk('HK_GW_NOT_VERIFIED', 'gateway instrument needs a verified gateway payment of the same company and amount');
+      END IF;
+      -- یک سند زنده (پیش‌نویس یا ثبت‌شده) برای هر پرداخت درگاه؛ سند ابطال‌شده جا را آزاد می‌کند (RV-TP-17، INV-GW-03)
+      IF EXISTS (SELECT 1 FROM treasury.money_instrument mi JOIN treasury.money_document md ON md.tenant_id = mi.tenant_id AND md.id = mi.document_id
+                  WHERE mi.tenant_id = NEW.tenant_id AND mi.gateway_payment_id = NEW.gateway_payment_id AND mi.id <> NEW.id
+                    AND md.status <> 'cancelled') THEN
+        PERFORM core.raise_hk('HK_GW_DUPLICATE_RECEIPT', 'the gateway payment already has a live receipt');
       END IF;
     END IF;
     IF NEW.cheque_id IS NOT NULL THEN
@@ -1954,7 +2202,8 @@ BEGIN
   ELSE
     IF NEW.kind = 'bounced_cheque' THEN
       SELECT * INTO c FROM treasury.cheque WHERE tenant_id = NEW.tenant_id AND id = NEW.cheque_id;
-      IF c.direction <> 'received' OR c.state NOT IN ('bounced','partially_collected','returned_by_third_party') OR d.direction <> 'receipt' THEN
+      IF c.direction <> 'received' OR c.state NOT IN ('bounced','partially_collected','returned_by_third_party') OR d.direction <> 'receipt'
+         OR c.currency <> d.currency THEN
         PERFORM core.raise_hk('HK_TRS_COUNTER_CHEQUE', 'bounced-cheque settlement line needs a bounced received cheque in a receipt');
       END IF;
     END IF;
@@ -1970,8 +2219,11 @@ CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON treasury.money_cou
 CREATE OR REPLACE FUNCTION treasury.open_item_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-  IF (to_jsonb(NEW) - ARRAY['allocated_amount','status','cancelled_at','cancel_reason','updated_at','row_version'])
-     IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['allocated_amount','status','cancelled_at','cancel_reason','updated_at','row_version']) THEN
+  IF NEW.status = 'cancelled' AND OLD.status <> 'cancelled' THEN
+    NEW.cancel_date := coalesce(NEW.cancel_date, NEW.cancelled_at::date);
+  END IF;
+  IF (to_jsonb(NEW) - ARRAY['allocated_amount','status','cancelled_at','cancel_date','cancel_reason','updated_at','row_version'])
+     IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['allocated_amount','status','cancelled_at','cancel_date','cancel_reason','updated_at','row_version']) THEN
     PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', 'open item identity, amount and dates cannot change');
   END IF;
   IF OLD.status = 'cancelled' THEN
@@ -1989,16 +2241,53 @@ END $$;
 DROP TRIGGER IF EXISTS trg_guard ON treasury.open_item;
 CREATE TRIGGER trg_guard BEFORE UPDATE ON treasury.open_item FOR EACH ROW EXECUTE FUNCTION treasury.open_item_guard();
 
--- در commit: مبلغ تخصیص‌یافتهٔ هر قلم = جمع تخصیص‌های فعالِ آن (هیچ مسیری جز allocation آن را عوض نمی‌کند)
+-- حساب کنترل قلم باز (RV-IT2-04): اگر سرویس نداده باشد از سند مبدأ حل می‌شود — سطر همان سمت با بُعد همان شخص؛ اگر چند حساب
+-- بخورد، حساب subledger_kind='party' ترجیح دارد. حل‌نشده در commit خطاست (open_item_check).
+CREATE OR REPLACE FUNCTION treasury.open_item_resolve() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_pd uuid;
+BEGIN
+  IF NEW.account_id IS NULL AND NEW.journal_id IS NOT NULL THEN
+    v_pd := treasury.party_dim(NEW.tenant_id, NEW.party_id);
+    WITH c AS (
+      SELECT DISTINCT l.account_id, a.subledger_kind
+        FROM ledger.journal_line l
+        JOIN ledger.account a ON a.tenant_id = l.tenant_id AND a.id = l.account_id
+        LEFT JOIN ledger.dimension_value dv ON dv.tenant_id = l.tenant_id AND dv.id = l.dim1_id
+       WHERE l.tenant_id = NEW.tenant_id AND l.journal_id = NEW.journal_id
+         AND ((NEW.direction = 'debit' AND l.debit_base > 0) OR (NEW.direction = 'credit' AND l.credit_base > 0))
+         AND coalesce(dv.merged_into_id, dv.id) = v_pd)
+    SELECT CASE WHEN (SELECT count(*) FROM c WHERE subledger_kind = 'party') = 1 THEN (SELECT account_id FROM c WHERE subledger_kind = 'party')
+                WHEN (SELECT count(*) FROM c) = 1 THEN (SELECT account_id FROM c) END
+      INTO NEW.account_id;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_resolve ON treasury.open_item;
+CREATE TRIGGER trg_resolve BEFORE INSERT ON treasury.open_item FOR EACH ROW EXECUTE FUNCTION treasury.open_item_resolve();
+
+-- در commit: مبلغ تخصیص‌یافتهٔ هر قلم = جمع تخصیص‌های فعالِ آن (هیچ مسیری جز allocation آن را عوض نمی‌کند)؛ حساب کنترل معلوم است
+-- و اگر قلم سند دارد، آن سند سطری به همان سمت روی همان حساب (و برای حساب شخص‌محور با بُعد همان شخص) دارد (RV-IT2-04)
 CREATE OR REPLACE FUNCTION treasury.open_item_check() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_alloc numeric; v_cur numeric;
+DECLARE v_alloc numeric; o treasury.open_item;
 BEGIN
-  SELECT allocated_amount INTO v_cur FROM treasury.open_item WHERE tenant_id = NEW.tenant_id AND id = NEW.id;
+  SELECT * INTO o FROM treasury.open_item WHERE tenant_id = NEW.tenant_id AND id = NEW.id;
   SELECT coalesce(sum(amount), 0) INTO v_alloc FROM treasury.allocation
    WHERE tenant_id = NEW.tenant_id AND status = 'active' AND (debit_item_id = NEW.id OR credit_item_id = NEW.id);
-  IF v_cur IS DISTINCT FROM v_alloc THEN
-    PERFORM core.raise_hk('HK_TRS_ALLOC_DRIFT', format('open item %s allocated_amount %s <> active allocations %s', NEW.id, v_cur, v_alloc));
+  IF o.allocated_amount IS DISTINCT FROM v_alloc THEN
+    PERFORM core.raise_hk('HK_TRS_ALLOC_DRIFT', format('open item %s allocated_amount %s <> active allocations %s', NEW.id, o.allocated_amount, v_alloc));
+  END IF;
+  IF o.account_id IS NULL
+     OR (o.journal_id IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM ledger.journal_line l
+             JOIN ledger.account a ON a.tenant_id = l.tenant_id AND a.id = l.account_id
+             LEFT JOIN ledger.dimension_value dv ON dv.tenant_id = l.tenant_id AND dv.id = l.dim1_id
+            WHERE l.tenant_id = o.tenant_id AND l.journal_id = o.journal_id AND l.account_id = o.account_id
+              AND ((o.direction = 'debit' AND l.debit_base > 0) OR (o.direction = 'credit' AND l.credit_base > 0))
+              AND (a.subledger_kind IS DISTINCT FROM 'party' OR coalesce(dv.merged_into_id, dv.id) = treasury.party_dim(o.tenant_id, o.party_id)))) THEN
+    PERFORM core.raise_hk('HK_TRS_OPEN_ITEM_ACCOUNT',
+      format('open item %s needs the GL control account its source journal posted for this party on the %s side', o.id, o.direction));
   END IF;
   RETURN NULL;
 END $$;
@@ -2008,12 +2297,13 @@ CREATE CONSTRAINT TRIGGER trg_check AFTER INSERT OR UPDATE ON treasury.open_item
 
 CREATE OR REPLACE FUNCTION treasury.allocation_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE d treasury.open_item; c treasury.open_item;
+DECLARE d treasury.open_item; c treasury.open_item; v_base char(3); v_minor smallint;
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    IF OLD.status <> 'active' OR NEW.status <> 'reversed'
-       OR (to_jsonb(NEW) - ARRAY['status','reversed_at','reversed_by','reverse_reason'])
-          IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['status','reversed_at','reversed_by','reverse_reason']) THEN
+    NEW.reverse_date := coalesce(NEW.reverse_date, NEW.reversed_at::date);
+    IF OLD.status <> 'active' OR NEW.status <> 'reversed' OR NEW.reverse_date < OLD.allocation_date
+       OR (to_jsonb(NEW) - ARRAY['status','reversed_at','reverse_date','reversed_by','reverse_reason','reverse_journal_id'])
+          IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['status','reversed_at','reverse_date','reversed_by','reverse_reason','reverse_journal_id']) THEN
       PERFORM core.raise_hk('HK_TRS_ALLOC_IMMUTABLE', 'an allocation can only be reversed (active -> reversed)');
     END IF;
     RETURN NEW;
@@ -2047,6 +2337,32 @@ BEGIN
   IF d.allocated_amount + NEW.amount > d.amount OR c.allocated_amount + NEW.amount > c.amount THEN
     PERFORM core.raise_hk('HK_TRS_ALLOC_EXCEEDS', format('allocation %s exceeds the outstanding amount of an item', NEW.amount));
   END IF;
+  -- دو حساب کنترل متفاوت (مثلاً پیش‌دریافت و دریافتنی) بدون سند طبقه‌بندی، زیردفتر را از GL جدا می‌کند (RV-IT2-04)
+  IF NEW.kind = 'normal' AND d.account_id IS DISTINCT FROM c.account_id AND NEW.journal_id IS NULL THEN
+    PERFORM core.raise_hk('HK_TRS_ALLOC_ACCOUNT', 'allocating items of two control accounts needs a reclassification journal');
+  END IF;
+  -- مبلغ پایهٔ مصرف‌شده از هر قلم و سود/زیان تسعیر تحقق‌یافته (RV-X3-01): ارز پایه = همان مبلغ؛ ارز دیگر = به نسبت، و تخصیص
+  -- آخرینِ قلم باقی‌ماندهٔ پایه را می‌گیرد تا جمع دقیقاً amount_base شود. تفاوت ≠ ۰ سند treasury.allocation/<id> می‌خواهد.
+  SELECT co.base_currency, cur.minor_unit INTO v_base, v_minor
+    FROM core.company co JOIN ref.currency cur ON cur.code = co.base_currency WHERE co.tenant_id = NEW.tenant_id AND co.id = NEW.company_id;
+  NEW.debit_base := CASE WHEN d.currency = v_base THEN NEW.amount
+                         WHEN d.allocated_amount + NEW.amount = d.amount
+                           THEN d.amount_base - (SELECT coalesce(sum(x.debit_base), 0) FROM treasury.allocation x
+                                                  WHERE x.tenant_id = NEW.tenant_id AND x.debit_item_id = d.id AND x.status = 'active')
+                         ELSE round(NEW.amount * d.amount_base / d.amount, v_minor) END;
+  NEW.credit_base := CASE WHEN c.currency = v_base THEN NEW.amount
+                          WHEN c.allocated_amount + NEW.amount = c.amount
+                            THEN c.amount_base - (SELECT coalesce(sum(x.credit_base), 0) FROM treasury.allocation x
+                                                   WHERE x.tenant_id = NEW.tenant_id AND x.credit_item_id = c.id AND x.status = 'active')
+                          ELSE round(NEW.amount * c.amount_base / c.amount, v_minor) END;
+  NEW.fx_diff_base := NEW.credit_base - NEW.debit_base;
+  IF NEW.fx_diff_base <> 0 AND NOT EXISTS (
+       SELECT 1 FROM ledger.journal j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.journal_id AND j.source_module = 'treasury'
+          AND j.source_doc_type = 'treasury.allocation' AND j.source_doc_id = NEW.id AND j.status <> 'voided') THEN
+    PERFORM core.raise_hk('HK_TRS_ALLOC_FX_JOURNAL',
+      format('allocation consumes base %s of the debit item and %s of the credit item: post the realized FX difference %s (ledger.fx.realized_*)',
+             NEW.debit_base, NEW.credit_base, NEW.fx_diff_base));
+  END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON treasury.allocation;
@@ -2063,6 +2379,61 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS trg_apply ON treasury.allocation;
 CREATE TRIGGER trg_apply AFTER INSERT OR UPDATE OF status ON treasury.allocation FOR EACH ROW EXECUTE FUNCTION treasury.allocation_apply();
+
+-- ---------- سوخت مطالبات (RV-X2-06) ----------
+CREATE OR REPLACE FUNCTION treasury.write_off_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE d treasury.open_item; j ledger.journal;
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    IF NOT (OLD.status = 'posted' AND NEW.status = 'reversed')
+       OR (to_jsonb(NEW) - ARRAY['status','reverse_journal_id','reversed_at','reverse_reason','updated_at','row_version'])
+          IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['status','reverse_journal_id','reversed_at','reverse_reason','updated_at','row_version']) THEN
+      PERFORM core.raise_hk('HK_TRS_WRITE_OFF_IMMUTABLE', 'a write-off is immutable and can only be reversed once');
+    END IF;
+    RETURN NEW;
+  END IF;
+  SELECT * INTO d FROM treasury.open_item WHERE tenant_id = NEW.tenant_id AND id = NEW.debit_item_id FOR UPDATE;
+  SELECT * INTO j FROM ledger.journal WHERE tenant_id = NEW.tenant_id AND id = NEW.journal_id;
+  IF d.direction <> 'debit' OR d.account_class <> 'receivable' OR d.status <> 'open' OR d.currency <> NEW.currency
+     OR treasury.canonical_party(NEW.tenant_id, d.party_id) IS DISTINCT FROM treasury.canonical_party(NEW.tenant_id, NEW.party_id)
+     OR NEW.amount > d.amount - d.allocated_amount THEN
+    PERFORM core.raise_hk('HK_TRS_WRITE_OFF_ITEM', 'a write-off closes at most the outstanding amount of an open receivable of the same party and currency');
+  END IF;
+  IF j.source_module IS DISTINCT FROM 'treasury' OR j.source_doc_type IS DISTINCT FROM 'treasury.write_off' OR j.source_doc_id IS DISTINCT FROM NEW.id
+     OR NEW.status <> 'posted' THEN
+    PERFORM core.raise_hk('HK_TRS_WRITE_OFF_JOURNAL', 'a write-off is posted with its own treasury.write_off journal');
+  END IF;
+  PERFORM core.approval_assert_approved(NEW.approval_request_id, 'treasury.write_off', NEW.id);
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON treasury.receivable_write_off;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON treasury.receivable_write_off FOR EACH ROW EXECUTE FUNCTION treasury.write_off_guard();
+
+-- در commit: ثبت‌شده ⇔ قلم بستانکار زندهٔ همان مبلغ، شخص، حساب و سند، و تخصیص فعال write_off به قلم بدهکار؛
+-- برگشت‌خورده ⇔ تخصیص برگشت خورده و قلم بستانکار باطل است
+CREATE OR REPLACE FUNCTION treasury.write_off_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE w treasury.receivable_write_off; d treasury.open_item; c treasury.open_item; v_alloc int;
+BEGIN
+  SELECT * INTO w FROM treasury.receivable_write_off WHERE tenant_id = NEW.tenant_id AND id = NEW.id;
+  SELECT * INTO d FROM treasury.open_item WHERE tenant_id = w.tenant_id AND id = w.debit_item_id;
+  SELECT * INTO c FROM treasury.open_item WHERE tenant_id = w.tenant_id AND id = w.credit_item_id;
+  SELECT count(*) INTO v_alloc FROM treasury.allocation x
+   WHERE x.tenant_id = w.tenant_id AND x.debit_item_id = w.debit_item_id AND x.credit_item_id = w.credit_item_id
+     AND x.source = 'write_off' AND x.amount = w.amount AND x.status = 'active';
+  IF c.id IS NULL OR c.direction <> 'credit' OR c.source_module <> 'treasury' OR c.source_doc_type <> 'treasury.write_off' OR c.source_doc_id <> w.id
+     OR c.amount <> w.amount OR c.account_id IS DISTINCT FROM d.account_id OR c.journal_id IS DISTINCT FROM w.journal_id
+     OR treasury.canonical_party(w.tenant_id, c.party_id) IS DISTINCT FROM treasury.canonical_party(w.tenant_id, d.party_id)
+     OR (w.status = 'posted' AND (c.status = 'cancelled' OR v_alloc <> 1))
+     OR (w.status = 'reversed' AND (c.status <> 'cancelled' OR v_alloc <> 0)) THEN
+    PERFORM core.raise_hk('HK_TRS_WRITE_OFF_ITEM', format('write-off %s must own a live credit item allocated (source write_off) to its receivable, or a cancelled one once reversed', w.id));
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_check ON treasury.receivable_write_off;
+CREATE CONSTRAINT TRIGGER trg_check AFTER INSERT OR UPDATE ON treasury.receivable_write_off
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION treasury.write_off_check();
 
 -- ---------- انتقال وجه، شمارش نقد، تنخواه ----------
 CREATE OR REPLACE FUNCTION treasury.fund_currency(p_tenant uuid, p_cash uuid, p_bank uuid, p_petty uuid) RETURNS char(3)
@@ -2164,6 +2535,10 @@ BEGIN
     IF v_sum <> v_total THEN
       PERFORM core.raise_hk('HK_TRS_DOC_UNBALANCED', format('petty cash claim lines %s <> total %s', v_sum, v_total));
     END IF;
+    IF v_status = 'posted' AND EXISTS (SELECT 1 FROM treasury.petty_cash_claim_line l WHERE l.tenant_id = NEW.tenant_id AND l.claim_id = NEW.id
+                                         AND l.vat_treatment = 'input_credit' AND l.tax_purchase_entry_id IS NULL) THEN
+      PERFORM core.raise_hk('HK_TRS_PETTY_VAT_REGISTER', 'input VAT of a posted petty cash claim is recorded in the tax purchase register first');
+    END IF;
   END IF;
   RETURN NULL;
 END $$;
@@ -2205,7 +2580,7 @@ BEGIN
   IF NEW.state IS DISTINCT FROM OLD.state THEN
     v_active := EXISTS (SELECT 1 FROM treasury.cheque c WHERE c.tenant_id = NEW.tenant_id AND c.cheque_leaf_id = NEW.id AND c.state <> 'cancelled');
     IF NOT ((OLD.state = 'unused' AND NEW.state = 'issued' AND v_active)
-         OR (OLD.state = 'unused' AND NEW.state IN ('void','lost'))
+         OR (OLD.state = 'unused' AND NEW.state IN ('void','lost') AND NOT v_active)
          OR (OLD.state = 'issued' AND NEW.state = 'unused' AND NOT v_active)) THEN
       PERFORM core.raise_hk('HK_CHQ_LEAF_TRANSITION', format('leaf %s -> %s is not allowed', OLD.state, NEW.state));
     END IF;
@@ -2239,6 +2614,14 @@ BEGIN
   IF TG_OP = 'INSERT' THEN
     IF NEW.last_event_seq <> 0 THEN
       PERFORM core.raise_hk('HK_CHQ_EVENT_SEQ', 'a new cheque starts with last_event_seq = 0; its creation event follows');
+    END IF;
+    -- چک پرداخت تبدیل‌شده از ضمانت اجراشده (D-T08؛ RV-TP-06): همان جهت، ضمانتِ enforced، همان صیاد
+    IF NEW.converted_from_cheque_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM treasury.cheque g
+          WHERE g.tenant_id = NEW.tenant_id AND g.id = NEW.converted_from_cheque_id AND g.purpose = 'guarantee'
+            AND g.direction = NEW.direction AND g.state = 'enforced' AND g.sayad_id IS NOT DISTINCT FROM NEW.sayad_id
+            AND (NEW.direction = 'received' OR g.cheque_leaf_id IS NOT DISTINCT FROM NEW.cheque_leaf_id)) THEN
+      PERFORM core.raise_hk('HK_CHQ_CONVERSION', 'a converted payment cheque needs an enforced guarantee of the same direction, sayad id and leaf');
     END IF;
     RETURN NEW;
   END IF;
@@ -2307,6 +2690,13 @@ BEGIN
   IF TG_OP = 'INSERT' THEN
     SELECT * INTO l FROM treasury.cheque_leaf WHERE tenant_id = NEW.tenant_id AND id = NEW.cheque_leaf_id FOR UPDATE;
     SELECT * INTO b FROM treasury.cheque_book WHERE tenant_id = NEW.tenant_id AND id = l.cheque_book_id;
+    IF NEW.converted_from_cheque_id IS NOT NULL THEN
+      -- برگ ضمانت اجراشده (همان برگ فیزیکی) به چک پرداخت می‌رسد و issued می‌ماند
+      IF l.state <> 'issued' OR b.bank_account_id <> NEW.bank_account_id THEN
+        PERFORM core.raise_hk('HK_CHQ_LEAF_MISMATCH', 'a converted cheque keeps the issued leaf of its enforced guarantee');
+      END IF;
+      RETURN NULL;
+    END IF;
     IF l.state <> 'unused' OR b.bank_account_id <> NEW.bank_account_id OR b.medium <> NEW.medium OR b.status <> 'active'
        OR (l.sayad_id IS NOT NULL AND NEW.sayad_id IS NOT NULL AND l.sayad_id <> NEW.sayad_id) THEN
       PERFORM core.raise_hk('HK_CHQ_LEAF_MISMATCH', 'issued cheque needs an unused leaf of an active book of the same bank account, medium and sayad id');
@@ -2314,7 +2704,9 @@ BEGIN
     UPDATE treasury.cheque_leaf SET state = 'issued', sayad_id = coalesce(sayad_id, NEW.sayad_id)
      WHERE tenant_id = NEW.tenant_id AND id = NEW.cheque_leaf_id;
   ELSIF NEW.state = 'cancelled' AND OLD.state <> 'cancelled' THEN
-    UPDATE treasury.cheque_leaf SET state = 'unused' WHERE tenant_id = NEW.tenant_id AND id = NEW.cheque_leaf_id AND state = 'issued';
+    UPDATE treasury.cheque_leaf SET state = 'unused' WHERE tenant_id = NEW.tenant_id AND id = NEW.cheque_leaf_id AND state = 'issued'
+       AND NOT EXISTS (SELECT 1 FROM treasury.cheque x WHERE x.tenant_id = NEW.tenant_id AND x.cheque_leaf_id = NEW.cheque_leaf_id
+                         AND x.id <> NEW.id AND x.state <> 'cancelled');
   END IF;
   RETURN NULL;
 END $$;
@@ -2325,10 +2717,11 @@ CREATE TRIGGER trg_leaf_sync AFTER INSERT OR UPDATE OF state ON treasury.cheque 
 CREATE OR REPLACE FUNCTION treasury.cheque_event_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE c treasury.cheque; t treasury.cheque_transition; u treasury.cheque_event; p treasury.cheque_event;
-        v_hold boolean; v_last_date date; v_outstanding numeric;
+        v_hold boolean; v_last_date date; v_outstanding numeric; j ledger.journal; v_ut treasury.cheque_transition; prv treasury.cheque_event;
 BEGIN
   SELECT * INTO c FROM treasury.cheque WHERE tenant_id = NEW.tenant_id AND id = NEW.cheque_id FOR UPDATE;
   IF NOT FOUND THEN PERFORM core.raise_hk('HK_CHQ_NOT_FOUND', 'cheque not found'); END IF;
+  NEW.company_id := c.company_id;    -- ارجاع‌های منبع وجه، سند و حساب «همان شرکت» با FK سه‌ستونی (RV-TP-07)
   IF NEW.seq <> c.last_event_seq + 1 THEN
     PERFORM core.raise_hk('HK_CHQ_EVENT_SEQ', format('next event seq for cheque %s must be %s, got %s', c.id, c.last_event_seq + 1, NEW.seq));
   END IF;
@@ -2370,7 +2763,7 @@ BEGIN
       PERFORM core.raise_hk('HK_CHQ_COUNTERPARTY_REQUIRED', format('transition %s needs a counterparty', t.code));
     END IF;
     v_outstanding := c.amount - c.collected_amount;
-    IF (t.amount_rule = 'partial' AND (NEW.amount IS NULL OR NEW.amount >= c.amount))
+    IF (t.amount_rule = 'partial' AND (NEW.amount IS NULL OR NEW.amount >= v_outstanding))
        OR (t.amount_rule = 'explicit' AND NEW.amount IS NULL)
        OR (t.amount_rule = 'face' AND NEW.amount IS NOT NULL AND NEW.amount <> c.amount)
        OR (t.amount_rule = 'outstanding' AND NEW.amount IS NOT NULL AND NEW.amount <> v_outstanding)
@@ -2390,7 +2783,7 @@ BEGIN
         PERFORM core.raise_hk('HK_CHQ_AFTER_VALUES', 'only reclassify_current changes the long-term flag (true -> false)');
       END IF;
       IF NEW.collected_after IS DISTINCT FROM (CASE t.op WHEN 'collect' THEN c.amount WHEN 'collect_direct' THEN c.amount
-                                                         WHEN 'collect_partial' THEN NEW.amount
+                                                         WHEN 'collect_partial' THEN c.collected_amount + NEW.amount
                                                          WHEN 'settle_partial' THEN c.collected_amount + NEW.amount
                                                          ELSE c.collected_amount END) THEN
         PERFORM core.raise_hk('HK_CHQ_AFTER_VALUES', format('collected amount after %s is inconsistent', t.op));
@@ -2408,10 +2801,40 @@ BEGIN
        OR (NEW.holding_amount IS NOT NULL AND NEW.holding_amount <> c.amount - NEW.collected_after) THEN
       PERFORM core.raise_hk('HK_CHQ_HOLDING', 'holding account/amount must be set exactly for holding states and equal the outstanding amount');
     END IF;
+    -- سند گذار از خود همین چک (یا سند دریافت/پرداخت یا واگذاری گروهی آن) است و اگر ارزش چک به حساب یا بُعد تازه‌ای
+    -- رفته باشد، سطر بدهکار همان حساب نگهداری با همان بُعد و همان مبلغ را دارد (RV-IT2-10، INV-CHQ-04)
+    IF NEW.journal_id IS NOT NULL THEN
+      SELECT * INTO j FROM ledger.journal WHERE tenant_id = NEW.tenant_id AND id = NEW.journal_id;
+      SELECT * INTO prv FROM treasury.cheque_event WHERE tenant_id = NEW.tenant_id AND cheque_id = NEW.cheque_id AND seq = NEW.seq - 1;
+      IF j.company_id IS DISTINCT FROM c.company_id OR j.source_module IS DISTINCT FROM 'treasury' OR j.status = 'voided'
+         OR NOT ((j.source_doc_type = 'treasury.cheque' AND j.source_doc_id = c.id AND j.source_event = lower(t.code) || ':' || NEW.seq)
+                 OR (NEW.money_document_id IS NOT NULL AND j.source_doc_id = NEW.money_document_id)
+                 OR j.source_doc_type = 'treasury.cheque_batch')
+         OR (NEW.holding_account_id IS NOT NULL
+             AND (NEW.seq = 1 OR (NEW.holding_account_id, NEW.holding_dim_value_id) IS DISTINCT FROM (prv.holding_account_id, prv.holding_dim_value_id))
+             AND NOT EXISTS (SELECT 1 FROM ledger.journal_line l
+                               LEFT JOIN ledger.dimension_value dv ON dv.tenant_id = l.tenant_id AND dv.id = l.dim1_id
+                              WHERE l.tenant_id = NEW.tenant_id AND l.journal_id = j.id AND l.account_id = NEW.holding_account_id
+                                AND l.debit_base = NEW.holding_amount_base
+                                AND (NEW.holding_dim_value_id IS NULL
+                                     OR coalesce(dv.merged_into_id, dv.id) = (SELECT coalesce(h.merged_into_id, h.id) FROM ledger.dimension_value h
+                                                                              WHERE h.tenant_id = NEW.tenant_id AND h.id = NEW.holding_dim_value_id))
+                                AND (j.source_doc_id = c.id OR l.source_line_ref IS NULL OR l.source_line_ref = 'chq:' || c.id))) THEN
+        PERFORM core.raise_hk('HK_CHQ_JOURNAL_SOURCE',
+          format('journal of transition %s must come from treasury for this cheque (or its document/batch) and debit the holding account %s', t.code, NEW.holding_account_id));
+      END IF;
+    END IF;
   ELSE
     SELECT * INTO u FROM treasury.cheque_event WHERE tenant_id = NEW.tenant_id AND id = NEW.undoes_event_id;
-    IF NOT FOUND OR u.cheque_id <> NEW.cheque_id OR u.seq = 1 OR u.kind <> 'transition' THEN
-      PERFORM core.raise_hk('HK_CHQ_UNDO_TARGET', 'only a later transition of the same cheque can be undone (use cancel for the creation)');
+    SELECT * INTO v_ut FROM treasury.cheque_transition WHERE code = u.transition_code;
+    IF NOT FOUND OR u.cheque_id <> NEW.cheque_id OR u.seq = 1 OR u.kind <> 'transition' OR v_ut.op = 'cancel' THEN
+      PERFORM core.raise_hk('HK_CHQ_UNDO_TARGET', 'only a later, non-cancel transition of the same cheque can be undone (cancellation is final)');
+    END IF;
+    -- undo تعویض یا اجرای ضمانت: چک تازه/تبدیل‌شده باید پیش‌تر در همین تراکنش ابطال شده باشد (RV-TP-05)
+    IF v_ut.op IN ('replace','enforce') AND EXISTS (
+         SELECT 1 FROM treasury.cheque x WHERE x.tenant_id = NEW.tenant_id AND x.state <> 'cancelled'
+            AND (x.replaces_cheque_id = c.id OR x.converted_from_cheque_id = c.id)) THEN
+      PERFORM core.raise_hk('HK_CHQ_UNDO_DEPENDENT', 'cancel the replacement or converted cheque before undoing the replacement or enforcement');
     END IF;
     IF EXISTS (SELECT 1 FROM treasury.cheque_event x
                 WHERE x.tenant_id = NEW.tenant_id AND x.cheque_id = NEW.cheque_id AND x.kind = 'transition' AND x.seq > u.seq
@@ -2432,11 +2855,72 @@ BEGIN
     IF (u.journal_id IS NOT NULL) <> (NEW.journal_id IS NOT NULL) OR NEW.journal_id = u.journal_id THEN
       PERFORM core.raise_hk('HK_CHQ_JOURNAL_REQUIRED', 'undo references the reversal journal exactly when the undone event had a journal');
     END IF;
+    IF NEW.journal_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM ledger.journal x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.journal_id AND x.company_id = c.company_id
+            AND x.source_module = 'treasury' AND (x.source_doc_id = c.id OR x.reversal_of_journal_id = u.journal_id)) THEN
+      PERFORM core.raise_hk('HK_CHQ_JOURNAL_SOURCE', 'undo journal must be the treasury reversal for this cheque');
+    END IF;
   END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON treasury.cheque_event;
 CREATE TRIGGER trg_guard BEFORE INSERT ON treasury.cheque_event FOR EACH ROW EXECUTE FUNCTION treasury.cheque_event_guard();
+
+-- در commit (RV-TP-11، RV-X2-01): هر سطر سند گذار چک که روی حساب کنترل اشخاص (subledger_kind='party') نشسته، قلم بازِ همان
+-- حساب، شخص، سمت و مبلغ پایه دارد (منبع treasury.cheque/<چک>، source_line_key = '<lower(code)>:<seq>[:n]'): برگشت به دریافتنی شخص
+-- (R5، R5B، R4 باقی‌مانده با bounce_target=party_receivable)، هزینهٔ واخواست به حساب شخص (R6*)، تسویه و تعویض برگشتی (R7*، R8*)،
+-- برگشت از ثالث که بدهی ما به گیرندهٔ انتقال را زنده می‌کند (R10)، عودت (R11، P4)، برگشت چک ما (P3)، و خرج چک (R9). سند
+-- دریافت/پرداخت (R1/P1 درون سند) اقلام خودش را دارد. undo: اقلام گذار undo‌شده باطل‌اند؛ ابطال ثبت: همهٔ اقلام چک باطل‌اند.
+CREATE OR REPLACE FUNCTION treasury.cheque_event_open_items_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE j ledger.journal; t treasury.cheque_transition; u treasury.cheque_event; v_bad text;
+BEGIN
+  IF NEW.kind = 'transition' THEN
+    SELECT * INTO t FROM treasury.cheque_transition WHERE code = NEW.transition_code;
+    IF t.op = 'cancel' THEN
+      IF EXISTS (SELECT 1 FROM treasury.open_item o WHERE o.tenant_id = NEW.tenant_id AND o.source_module = 'treasury'
+                   AND o.source_doc_type = 'treasury.cheque' AND o.source_doc_id = NEW.cheque_id AND o.status <> 'cancelled') THEN
+        PERFORM core.raise_hk('HK_CHQ_OPEN_ITEM', 'cancelling a cheque registration cancels its open items (reverse their allocations first)');
+      END IF;
+      RETURN NULL;
+    END IF;
+    IF NEW.journal_id IS NULL THEN RETURN NULL; END IF;
+    SELECT * INTO j FROM ledger.journal WHERE tenant_id = NEW.tenant_id AND id = NEW.journal_id;
+    IF j.source_doc_type IS DISTINCT FROM 'treasury.cheque' OR j.source_doc_id IS DISTINCT FROM NEW.cheque_id THEN RETURN NULL; END IF;
+    WITH gl AS (
+      SELECT l.account_id AS acc, coalesce(dv.merged_into_id, dv.id) AS dim, sum(l.debit_base - l.credit_base) AS b
+        FROM ledger.journal_line l
+        JOIN ledger.account a ON a.tenant_id = l.tenant_id AND a.id = l.account_id AND a.subledger_kind = 'party'
+        LEFT JOIN ledger.dimension_value dv ON dv.tenant_id = l.tenant_id AND dv.id = l.dim1_id
+       WHERE l.tenant_id = NEW.tenant_id AND l.journal_id = NEW.journal_id GROUP BY 1, 2),
+    oi AS (
+      SELECT o.account_id AS acc, treasury.party_dim(o.tenant_id, o.party_id) AS dim,
+             sum(CASE o.direction WHEN 'debit' THEN o.amount_base ELSE -o.amount_base END) AS b
+        FROM treasury.open_item o
+       WHERE o.tenant_id = NEW.tenant_id AND o.source_module = 'treasury' AND o.source_doc_type = 'treasury.cheque'
+         AND o.source_doc_id = NEW.cheque_id AND o.status <> 'cancelled'
+         AND (o.source_line_key = lower(t.code) || ':' || NEW.seq OR o.source_line_key LIKE lower(t.code) || ':' || NEW.seq || ':%')
+       GROUP BY 1, 2)
+    SELECT string_agg(coalesce(gl.acc, oi.acc)::text || '/' || coalesce(gl.b, 0) || '<>' || coalesce(oi.b, 0), ', ') INTO v_bad
+      FROM gl FULL JOIN oi ON gl.acc = oi.acc AND gl.dim IS NOT DISTINCT FROM oi.dim
+     WHERE coalesce(gl.b, 0) <> coalesce(oi.b, 0);
+    IF v_bad IS NOT NULL THEN
+      PERFORM core.raise_hk('HK_CHQ_OPEN_ITEM', format('cheque %s transition %s: party control lines and open items differ (%s)', NEW.cheque_id, t.code, v_bad));
+    END IF;
+  ELSE
+    SELECT * INTO u FROM treasury.cheque_event WHERE tenant_id = NEW.tenant_id AND id = NEW.undoes_event_id;
+    SELECT * INTO t FROM treasury.cheque_transition WHERE code = u.transition_code;
+    IF EXISTS (SELECT 1 FROM treasury.open_item o WHERE o.tenant_id = NEW.tenant_id AND o.source_module = 'treasury'
+                 AND o.source_doc_type = 'treasury.cheque' AND o.source_doc_id = NEW.cheque_id AND o.status <> 'cancelled'
+                 AND (o.source_line_key = lower(t.code) || ':' || u.seq OR o.source_line_key LIKE lower(t.code) || ':' || u.seq || ':%')) THEN
+      PERFORM core.raise_hk('HK_CHQ_OPEN_ITEM', format('undo of %s cancels the open items that transition registered', t.code));
+    END IF;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_open_items ON treasury.cheque_event;
+CREATE CONSTRAINT TRIGGER trg_open_items AFTER INSERT ON treasury.cheque_event
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION treasury.cheque_event_open_items_check();
 
 CREATE OR REPLACE FUNCTION treasury.cheque_event_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -2472,11 +2956,21 @@ CREATE TRIGGER trg_apply AFTER INSERT ON treasury.cheque_sayad_inquiry FOR EACH 
 -- ---------- کارتخوان ----------
 CREATE OR REPLACE FUNCTION treasury.card_txn_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_set_status text;
+DECLARE v_set_status text; st treasury.card_settlement;
   k_frozen CONSTANT text[] := ARRAY['tenant_id','company_id','card_terminal_id','txn_at','business_date','amount','entry_mode',
                                     'source','source_ref','created_at'];
   c text;
 BEGIN
+  -- اتصال به تسویه فقط به تسویهٔ پیش‌نویس همان پایانه و شرکت، با قفل ردیف تسویه؛ تسویهٔ ثبت‌شده یا ابطال‌شده هرگز تراکنش تازه
+  -- نمی‌گیرد (RV-TP-04، INV-CRD-02). ثبت تسویه همان قفل را می‌گیرد و card_settlement_check جمع را در commit می‌سنجد.
+  IF NEW.settlement_id IS NOT NULL AND (TG_OP = 'INSERT' OR OLD.settlement_id IS NULL) THEN
+    SELECT * INTO st FROM treasury.card_settlement WHERE tenant_id = NEW.tenant_id AND id = NEW.settlement_id FOR UPDATE;
+    IF st.status IS DISTINCT FROM 'draft' OR st.card_terminal_id <> NEW.card_terminal_id OR st.company_id <> NEW.company_id
+       OR NEW.status <> 'approved' THEN
+      PERFORM core.raise_hk('HK_CRD_SETTLEMENT_STATE', 'an approved card transaction joins only a draft settlement of its own terminal');
+    END IF;
+  END IF;
+  IF TG_OP = 'INSERT' THEN RETURN NEW; END IF;
   FOREACH c IN ARRAY k_frozen LOOP
     IF (to_jsonb(OLD) -> c) IS DISTINCT FROM (to_jsonb(NEW) -> c) THEN
       PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', format('card_txn.%s cannot change', c));
@@ -2500,7 +2994,7 @@ BEGIN
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON treasury.card_txn;
-CREATE TRIGGER trg_guard BEFORE UPDATE ON treasury.card_txn FOR EACH ROW EXECUTE FUNCTION treasury.card_txn_guard();
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON treasury.card_txn FOR EACH ROW EXECUTE FUNCTION treasury.card_txn_guard();
 
 CREATE OR REPLACE FUNCTION treasury.card_settlement_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -2584,8 +3078,9 @@ BEGIN
   END LOOP;
   IF (OLD.provider_ref IS NOT NULL AND NEW.provider_ref IS DISTINCT FROM OLD.provider_ref)
      OR (OLD.provider_txn_ref IS NOT NULL AND NEW.provider_txn_ref IS DISTINCT FROM OLD.provider_txn_ref)
-     OR (OLD.money_document_id IS NOT NULL AND NEW.money_document_id IS DISTINCT FROM OLD.money_document_id) THEN
-    PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', 'provider refs and receipt link are set once');
+     OR (OLD.money_document_id IS NOT NULL AND NEW.money_document_id IS DISTINCT FROM OLD.money_document_id
+         AND (SELECT status FROM treasury.money_document WHERE tenant_id = OLD.tenant_id AND id = OLD.money_document_id) <> 'cancelled') THEN
+    PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', 'provider refs are set once; the receipt link changes only after that receipt is cancelled');
   END IF;
   IF NEW.state IS DISTINCT FROM OLD.state AND NOT (
        (OLD.state = 'created'           AND NEW.state IN ('redirected','failed','expired'))
@@ -2607,24 +3102,36 @@ DROP TRIGGER IF EXISTS trg_guard ON treasury.gateway_payment;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON treasury.gateway_payment FOR EACH ROW EXECUTE FUNCTION treasury.gateway_payment_guard();
 
 -- ---------- صورتحساب و مغایرت ----------
+-- شکست‌های پیوستگی ماندهٔ فایل (RV-TP-18): ماندهٔ هر سطر = آخرین ماندهٔ ناتهیِ پیشین (یا ماندهٔ اول دوره) + جمع علامت‌دار سطرهای
+-- میانی، پس سلول خالی شکست بعدی را پنهان نمی‌کند. سطر بی‌مانده خودش «no_balance» است، پس فایل بی‌ستون مانده بدون override
+-- قطعی نمی‌شود (§۸-۳). kind: balance | opening | closing | no_balance.
+DROP FUNCTION IF EXISTS treasury.statement_continuity_breaks(uuid);
 CREATE OR REPLACE FUNCTION treasury.statement_continuity_breaks(p_import_id uuid)
-RETURNS TABLE (line_no integer, expected_balance numeric, actual_balance numeric)
+RETURNS TABLE (line_no integer, kind text, expected_balance numeric, actual_balance numeric)
 LANGUAGE sql STABLE AS $$
   WITH imp AS (SELECT * FROM treasury.statement_import WHERE id = p_import_id),
   l AS (SELECT s.line_no, s.signed_amount, s.balance,
-               lag(s.balance) OVER (ORDER BY s.line_no) AS prev_balance,
-               row_number() OVER (ORDER BY s.line_no) AS rn,
+               sum(s.signed_amount) OVER (ORDER BY s.line_no) AS cum,
+               max(CASE WHEN s.balance IS NOT NULL THEN s.line_no END)
+                 OVER (ORDER BY s.line_no ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_ln,
                row_number() OVER (ORDER BY s.line_no DESC) AS rn_desc
-          FROM treasury.statement_line s WHERE s.import_id = p_import_id)
-  SELECT l.line_no, l.prev_balance + l.signed_amount, l.balance FROM l
-   WHERE l.balance IS NOT NULL AND l.prev_balance IS NOT NULL AND l.balance <> l.prev_balance + l.signed_amount
+          FROM treasury.statement_line s WHERE s.import_id = p_import_id),
+  lastb AS (SELECT l.line_no, l.balance, l.cum FROM l WHERE l.balance IS NOT NULL ORDER BY l.line_no DESC LIMIT 1),
+  tot AS (SELECT coalesce(max(l.cum) FILTER (WHERE l.rn_desc = 1), 0) AS cum, max(l.line_no) FILTER (WHERE l.rn_desc = 1) AS last_ln FROM l)
+  SELECT k.line_no, 'balance', p.balance + (k.cum - p.cum), k.balance FROM l k JOIN l p ON p.line_no = k.prev_ln
+   WHERE k.balance IS NOT NULL AND k.balance <> p.balance + (k.cum - p.cum)
   UNION ALL
-  SELECT l.line_no, imp.opening_balance + l.signed_amount, l.balance FROM l, imp
-   WHERE l.rn = 1 AND imp.opening_balance IS NOT NULL AND l.balance IS NOT NULL AND l.balance <> imp.opening_balance + l.signed_amount
+  SELECT k.line_no, 'opening', imp.opening_balance + k.cum, k.balance FROM l k, imp
+   WHERE k.prev_ln IS NULL AND k.balance IS NOT NULL AND imp.opening_balance IS NOT NULL AND k.balance <> imp.opening_balance + k.cum
   UNION ALL
-  SELECT l.line_no, imp.closing_balance, l.balance FROM l, imp
-   WHERE l.rn_desc = 1 AND imp.closing_balance IS NOT NULL AND l.balance IS NOT NULL AND l.balance <> imp.closing_balance
-  ORDER BY 1
+  SELECT tot.last_ln, 'closing', imp.closing_balance,
+         coalesce((SELECT b.balance + (tot.cum - b.cum) FROM lastb b), imp.opening_balance + tot.cum)
+    FROM tot, imp
+   WHERE imp.closing_balance IS NOT NULL AND tot.last_ln IS NOT NULL
+     AND imp.closing_balance IS DISTINCT FROM coalesce((SELECT b.balance + (tot.cum - b.cum) FROM lastb b), imp.opening_balance + tot.cum)
+  UNION ALL
+  SELECT k.line_no, 'no_balance', NULL, NULL FROM l k WHERE k.balance IS NULL
+  ORDER BY 1, 2
 $$;
 
 CREATE OR REPLACE FUNCTION treasury.statement_import_guard() RETURNS trigger
@@ -2726,7 +3233,7 @@ CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON treasury.recon_rule FOR EACH
 CREATE OR REPLACE FUNCTION treasury.recon_item_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE m treasury.recon_match; s treasury.statement_line; v_imp_status text; ba treasury.bank_account;
-        jl record; v_ok boolean;
+        jl record; v_ok boolean; v_final date;
 BEGIN
   SELECT * INTO m FROM treasury.recon_match WHERE tenant_id = NEW.tenant_id AND id = NEW.match_id;
   IF TG_OP = 'UPDATE' THEN
@@ -2740,6 +3247,14 @@ BEGIN
     PERFORM core.raise_hk('HK_BNK_MATCH_STATE', 'items are added active to an active match');
   END IF;
   SELECT * INTO ba FROM treasury.bank_account WHERE tenant_id = NEW.tenant_id AND id = m.bank_account_id;
+  -- صورت مغایرت نهایی تطبیق‌های تا تاریخش را قفل می‌کند: تطبیق تازه برای سطر صورتحساب یا سطر دفتری تا as_of ممنوع (RV-TP-13، INV-BNK-07)
+  SELECT max(as_of) INTO v_final FROM treasury.bank_reconciliation
+   WHERE tenant_id = NEW.tenant_id AND bank_account_id = m.bank_account_id AND status = 'finalized';
+  IF v_final IS NOT NULL AND (
+       (NEW.side = 'statement' AND (SELECT txn_date FROM treasury.statement_line WHERE tenant_id = NEW.tenant_id AND id = NEW.statement_line_id) <= v_final)
+    OR (NEW.side = 'book' AND (SELECT journal_date FROM ledger.journal_line WHERE tenant_id = NEW.tenant_id AND id = NEW.journal_line_id) <= v_final)) THEN
+    PERFORM core.raise_hk('HK_BNK_RECON_FINALIZED', format('item dated on or before the finalized reconciliation of %s cannot be matched', v_final));
+  END IF;
   IF NEW.side = 'statement' THEN
     SELECT * INTO s FROM treasury.statement_line WHERE tenant_id = NEW.tenant_id AND id = NEW.statement_line_id;
     SELECT status INTO v_imp_status FROM treasury.statement_import WHERE tenant_id = s.tenant_id AND id = s.import_id;
@@ -2869,13 +3384,23 @@ CREATE OR REPLACE VIEW treasury.v_cheque_due WITH (security_invoker = true) AS
     JOIN treasury.cheque_state s ON s.direction = c.direction AND s.purpose = c.purpose AND s.state = c.state
    WHERE s.is_holding;
 
--- مصرف اعتبار شخص از چک‌ها (برای کنترل اعتبار sales): وصول‌نشده و برگشتی، به شخص مؤثر
-CREATE OR REPLACE VIEW treasury.v_party_cheque_exposure WITH (security_invoker = true) AS
+-- مصرف اعتبار شخص از چک‌ها (ChequeQuery.party_exposure → ChequeExposure؛ RV-TP-22)، به شخص مؤثر:
+--   uncleared_amount   : چک نزد ما یا در جریان وصول (هنوز بدهی شخص را صاف نکرده؛ فقط وقتی credit_includes_uncleared_cheques)
+--   bounced_outside_ar : ماندهٔ برگشتی که بیرون از دریافتنی تجاری نشسته (حساب نگهداری subledger_kind ≠ party: چک برگشتی، برگشت از ثالث).
+--                        همیشه جزء exposure است؛ برگشتی که در AR است (bounce_target=party_receivable) همین‌جا شمرده نمی‌شود چون در AR هست.
+--   endorsed_contingent: چک خرج‌شده که ممکن است از ثالث برگردد (R10)؛ فقط نمایش و هشدار، جزء exposure نیست
+DROP VIEW IF EXISTS treasury.v_party_cheque_exposure;
+CREATE VIEW treasury.v_party_cheque_exposure WITH (security_invoker = true) AS
   SELECT c.tenant_id, c.company_id, treasury.canonical_party(c.tenant_id, c.received_from_party_id) AS party_id, c.currency,
-         sum(c.amount - c.collected_amount) FILTER (WHERE c.state IN ('in_hand','deposited')) AS uncleared_amount,
-         sum(c.amount - c.collected_amount) FILTER (WHERE c.state IN ('bounced','partially_collected','returned_by_third_party')) AS bounced_amount,
+         coalesce(sum(c.amount - c.collected_amount) FILTER (WHERE c.state IN ('in_hand','deposited')), 0) AS uncleared_amount,
+         coalesce(sum(c.amount - c.collected_amount) FILTER (WHERE c.state IN ('bounced','partially_collected','returned_by_third_party')
+                                                            AND a.subledger_kind IS DISTINCT FROM 'party'), 0) AS bounced_outside_ar,
+         coalesce(sum(c.amount) FILTER (WHERE c.state = 'endorsed'), 0) AS endorsed_contingent,
          count(*) FILTER (WHERE c.state IN ('bounced','partially_collected','returned_by_third_party')) AS bounced_count
     FROM treasury.cheque c
+    LEFT JOIN LATERAL (SELECT e.holding_account_id FROM treasury.cheque_event e
+                        WHERE e.tenant_id = c.tenant_id AND e.cheque_id = c.id ORDER BY e.seq DESC LIMIT 1) le ON true
+    LEFT JOIN ledger.account a ON a.tenant_id = c.tenant_id AND a.id = le.holding_account_id
    WHERE c.direction = 'received' AND c.purpose = 'payment' AND c.received_from_party_id IS NOT NULL
    GROUP BY 1, 2, 3, 4;
 
@@ -2921,6 +3446,31 @@ LANGUAGE sql STABLE AS $$ SELECT * FROM treasury.cheque_holdings('guarantee_rece
 CREATE OR REPLACE FUNCTION treasury.subledger_guarantee_given(p_company_id uuid, p_as_of date)
 RETURNS TABLE (account_id uuid, dim_value_id uuid, currency char(3), balance_base numeric, balance_txn numeric)
 LANGUAGE sql STABLE AS $$ SELECT * FROM treasury.cheque_holdings('guarantee_given', p_company_id, p_as_of) $$;
+
+-- زیردفتر اشخاص (دریافتنی و پرداختنی تجاری؛ subledger_kind='party'؛ RV-IT2-04): ماندهٔ اقلام باز در تاریخ، به ازای حساب کنترل،
+-- بُعد شخص مؤثر و ارز. قلم تا doc_date و تا تاریخ ابطال؛ تخصیص تا allocation_date و تا تاریخ برگشت. مانده = مبلغ − تخصیص‌ها
+-- (پایه: amount_base − پایهٔ مصرف‌شدهٔ تخصیص‌ها)؛ بدهکار مثبت، بستانکار منفی. تخصیص عادی دو قلم یک حساب اثر خالص ندارد،
+-- و تهاتر، طبقه‌بندی و تفاوت تسعیر سند خودشان را دارند؛ پس این تابع = GL حساب کنترل به تفکیک شخص.
+CREATE OR REPLACE FUNCTION treasury.subledger_party(p_company_id uuid, p_as_of date)
+RETURNS TABLE (account_id uuid, dim_value_id uuid, currency char(3), balance_base numeric, balance_txn numeric)
+LANGUAGE sql STABLE AS $$
+  WITH items AS (
+    SELECT o.* FROM treasury.open_item o JOIN ledger.account a ON a.tenant_id = o.tenant_id AND a.id = o.account_id
+     WHERE o.company_id = p_company_id AND a.subledger_kind = 'party' AND o.doc_date <= p_as_of
+       AND (o.status <> 'cancelled' OR o.cancel_date > p_as_of)),
+  alloc AS (
+    SELECT x.debit_item_id AS item_id, x.amount, x.debit_base AS base FROM treasury.allocation x
+     WHERE x.company_id = p_company_id AND x.allocation_date <= p_as_of AND (x.status = 'active' OR x.reverse_date > p_as_of)
+    UNION ALL
+    SELECT x.credit_item_id, x.amount, x.credit_base FROM treasury.allocation x
+     WHERE x.company_id = p_company_id AND x.allocation_date <= p_as_of AND (x.status = 'active' OR x.reverse_date > p_as_of))
+  SELECT i.account_id, treasury.party_dim(i.tenant_id, i.party_id), i.currency,
+         sum(CASE i.direction WHEN 'debit' THEN 1 ELSE -1 END * (i.amount_base - coalesce(a.base, 0))),
+         sum(CASE i.direction WHEN 'debit' THEN 1 ELSE -1 END * (i.amount - coalesce(a.amt, 0)))
+    FROM items i
+    LEFT JOIN (SELECT item_id, sum(amount) AS amt, sum(base) AS base FROM alloc GROUP BY item_id) a ON a.item_id = i.id
+   GROUP BY 1, 2, 3
+$$;
 
 -- =====================================================================
 -- ۱۳. صندوق فروشگاهی (pos) — کاتالوگ نوع فرمان
@@ -3105,7 +3655,7 @@ CREATE TABLE IF NOT EXISTS pos.shift (
   FOREIGN KEY (tenant_id, opened_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, closed_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   FOREIGN KEY (tenant_id, company_id, cash_count_id) REFERENCES treasury.cash_count(tenant_id, company_id, id),
-  CONSTRAINT shift_closed CHECK ((status = 'closed') = (closed_at IS NOT NULL AND counted_cash IS NOT NULL
+  CONSTRAINT shift_closed CHECK ((status = 'closed') = (closed_at IS NOT NULL AND counted_cash IS NOT NULL AND over_short IS NOT NULL
                                                        AND expected_cash IS NOT NULL AND close_cmd_id IS NOT NULL AND closed_by IS NOT NULL)),
   CONSTRAINT shift_over_short CHECK (over_short IS NULL OR over_short = counted_cash - expected_cash),
   CONSTRAINT shift_time CHECK (closed_at IS NULL OR closed_at >= opened_at)
@@ -3134,6 +3684,7 @@ SELECT core.enable_tenant_rls('pos.shift_count');
 CREATE TABLE IF NOT EXISTS pos.cash_movement (
   tenant_id          uuid NOT NULL REFERENCES core.tenant(id),
   id                 uuid NOT NULL,
+  company_id         uuid NOT NULL,                    -- از شیفت (تریگر)؛ صندوق مقصد و سندها «همان شرکت» (RV-TP-07)
   shift_id           uuid NOT NULL,
   kind               text NOT NULL CHECK (kind IN ('pay_in','pay_out','drop','pickup')),
   amount             core.amount NOT NULL CHECK (amount > 0),
@@ -3149,9 +3700,9 @@ CREATE TABLE IF NOT EXISTS pos.cash_movement (
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, cmd_id),
   FOREIGN KEY (tenant_id, shift_id) REFERENCES pos.shift(tenant_id, id),
-  FOREIGN KEY (tenant_id, target_cash_box_id) REFERENCES treasury.cash_box(tenant_id, id),
-  FOREIGN KEY (tenant_id, money_document_id) REFERENCES treasury.money_document(tenant_id, id),
-  FOREIGN KEY (tenant_id, fund_transfer_id) REFERENCES treasury.fund_transfer(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, target_cash_box_id) REFERENCES treasury.cash_box(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, money_document_id) REFERENCES treasury.money_document(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, fund_transfer_id) REFERENCES treasury.fund_transfer(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, actor_id) REFERENCES core.tenant_membership(tenant_id, user_id),
   CONSTRAINT cash_movement_target CHECK ((kind IN ('drop','pickup')) = (target_cash_box_id IS NOT NULL)),
   CONSTRAINT cash_movement_counter CHECK (kind IN ('drop','pickup') OR posting_key IS NOT NULL),
@@ -3333,6 +3884,12 @@ CREATE TABLE IF NOT EXISTS pos.device_sync_state (
   highest_occurred_at      timestamptz,
   status                   text NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','quarantined','retired')),
   quarantine_reason        text,
+  -- سقف دنبالهٔ پذیرش پس از ابطال/گم شدن دستگاه (RV-TP-01): مدیر پس از شمارش رسیدهای همگام‌نشدهٔ دستگاه اعلام می‌کند.
+  -- بدون آن هیچ فرمانی از دستگاه باطل‌شده پذیرفته نمی‌شود، هرچه occurred_at بگوید (زمان را دستگاه امضا می‌کند).
+  accept_through_seq       bigint CHECK (accept_through_seq >= 0),
+  accept_reason            text,
+  accepted_by              uuid,
+  accepted_at              timestamptz,
   updated_at               timestamptz NOT NULL DEFAULT now(),
   row_version              integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
@@ -3340,7 +3897,11 @@ CREATE TABLE IF NOT EXISTS pos.device_sync_state (
   UNIQUE (tenant_id, device_id),
   FOREIGN KEY (tenant_id, device_id) REFERENCES core.device(tenant_id, id),
   FOREIGN KEY (tenant_id, terminal_id) REFERENCES pos.terminal(tenant_id, id),
-  CONSTRAINT sync_state_quarantine CHECK ((status = 'quarantined') = (quarantine_reason IS NOT NULL))
+  FOREIGN KEY (tenant_id, accepted_by) REFERENCES core.tenant_membership(tenant_id, user_id),
+  CONSTRAINT sync_state_quarantine CHECK ((status = 'quarantined') = (quarantine_reason IS NOT NULL)),
+  CONSTRAINT sync_state_accept CHECK ((accept_through_seq IS NULL) = (accepted_by IS NULL)
+                                      AND (accept_through_seq IS NULL) = (accepted_at IS NULL)
+                                      AND (accept_through_seq IS NULL OR char_length(btrim(coalesce(accept_reason, ''))) >= 10))
 );
 SELECT core.enable_tenant_rls('pos.device_sync_state');
 
@@ -3389,6 +3950,7 @@ CREATE TABLE IF NOT EXISTS pos.device_command (
   sig_alg          text NOT NULL CHECK (sig_alg IN ('ed25519','ecdsa_p256')),
   batch_id         uuid NOT NULL,
   edge_node_id     uuid,
+  after_revocation boolean NOT NULL DEFAULT false,   -- سرور می‌گذارد: دستگاه هنگام دریافت باطل یا گم‌شده بود (فقط با بازبینی اعمال می‌شود)
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, cmd_id),
@@ -3608,6 +4170,7 @@ CREATE TABLE IF NOT EXISTS pos.open_order_line (
   sent_at            timestamptz,
   voided_after_send  boolean NOT NULL DEFAULT false,
   void_reason        text,
+  billed_qty         core.qty NOT NULL DEFAULT 0 CHECK (billed_qty >= 0),   -- جمع فروش رسیدها (تقسیم صورتحساب؛ RV-TP-02)
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, order_id, line_no),
@@ -3618,7 +4181,8 @@ CREATE TABLE IF NOT EXISTS pos.open_order_line (
   FOREIGN KEY (tenant_id, station_id) REFERENCES pos.station(tenant_id, id),
   CONSTRAINT open_line_parent CHECK (parent_line_no IS NULL OR parent_line_no < line_no),
   CONSTRAINT open_line_sent CHECK (status = 'pending' OR status = 'voided' OR sent_at IS NOT NULL),
-  CONSTRAINT open_line_void CHECK ((status = 'voided') = (void_reason IS NOT NULL) AND (NOT voided_after_send OR status = 'voided'))
+  CONSTRAINT open_line_void CHECK ((status = 'voided') = (void_reason IS NOT NULL) AND (NOT voided_after_send OR status = 'voided')),
+  CONSTRAINT open_line_billed CHECK (billed_qty <= qty AND (status <> 'voided' OR billed_qty = 0))
 );
 SELECT core.enable_tenant_rls('pos.open_order_line');
 
@@ -3659,6 +4223,8 @@ CREATE TABLE IF NOT EXISTS pos.ticket (
   tax_rule_version        text,
   taxid                   text CHECK (taxid ~ '^[0-9A-Z]{22}$'),
   tax_indatim_ms          bigint CHECK (tax_indatim_ms > 0),
+  tax_inty                smallint CHECK (tax_inty IN (1, 2, 3)),     -- نوع صورتحساب مؤدیان که دستگاه صادر کرد (RV-X2-16)
+  tax_inp                 smallint CHECK (tax_inp BETWEEN 1 AND 13),  -- الگوی صورتحساب
   tax_memory_ref          uuid,                           -- tax.memory (FK در 99_cross_fk)
   tax_doc_id              uuid,                           -- tax.invoice (FK در 99_cross_fk)
   occurred_at             timestamptz NOT NULL,
@@ -3696,7 +4262,8 @@ CREATE TABLE IF NOT EXISTS pos.ticket (
                             AND (kind <> 'return' OR (total <= 0 AND subtotal <= 0 AND order_discount <= 0 AND service_charge <= 0))),
   CONSTRAINT ticket_posted CHECK ((posting_status = 'posted') = (posted_at IS NOT NULL)
                                   AND (posting_status <> 'posted' OR sales_doc_id IS NOT NULL)),
-  CONSTRAINT ticket_tax_pair CHECK ((taxid IS NULL) = (tax_indatim_ms IS NULL)),
+  CONSTRAINT ticket_tax_pair CHECK ((taxid IS NULL) = (tax_indatim_ms IS NULL) AND (taxid IS NULL) = (tax_inty IS NULL)
+                                    AND (taxid IS NULL) = (tax_inp IS NULL)),
   CONSTRAINT ticket_offline CHECK (NOT created_offline OR offline_session_id IS NOT NULL)
 );
 SELECT core.enable_tenant_rls('pos.ticket');
@@ -3730,6 +4297,11 @@ CREATE TABLE IF NOT EXISTS pos.ticket_line (
   open_order_line_id   uuid,
   original_line_id     uuid,
   note                 text CHECK (char_length(note) <= 300),
+  -- شمارنده‌های مرجوعی روی سطر فروش اصلی (RV-TP-02، RV-TP-15): فقط تریگر ticket_line_apply زیر قفل ردیف بالا می‌برد؛
+  -- CHECK سقف را ساختاری می‌کند و قید deferred برابری با جمع سطرهای برگشتی را می‌سنجد.
+  returned_qty         core.qty NOT NULL DEFAULT 0 CHECK (returned_qty >= 0),
+  returned_net         core.amount NOT NULL DEFAULT 0 CHECK (returned_net >= 0),
+  returned_tax         core.amount NOT NULL DEFAULT 0 CHECK (returned_tax >= 0),
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, ticket_id, line_no),
@@ -3743,13 +4315,16 @@ CREATE TABLE IF NOT EXISTS pos.ticket_line (
   CONSTRAINT ticket_line_net CHECK (line_net = line_gross - line_discount),
   CONSTRAINT ticket_line_parent CHECK (parent_line_no IS NULL OR parent_line_no < line_no),
   CONSTRAINT ticket_line_original CHECK (original_line_id IS NULL OR direction = 'return'),
-  CONSTRAINT ticket_line_price_source CHECK (price_source <> 'zero' OR unit_price = 0)
+  CONSTRAINT ticket_line_price_source CHECK (price_source <> 'zero' OR unit_price = 0),
+  CONSTRAINT ticket_line_returned CHECK (returned_qty <= qty AND returned_net <= line_net AND returned_tax <= tax_amount
+                                         AND (direction = 'sale' OR (returned_qty = 0 AND returned_net = 0 AND returned_tax = 0)))
 );
 SELECT core.enable_tenant_rls('pos.ticket_line');
 
 CREATE TABLE IF NOT EXISTS pos.ticket_payment (
   tenant_id          uuid NOT NULL REFERENCES core.tenant(id),
   id                 uuid NOT NULL DEFAULT uuidv7(),
+  company_id         uuid NOT NULL,                    -- از رسید (تریگر)؛ کارتخوان و بانک «همان شرکت» (RV-TP-07)
   ticket_id          uuid NOT NULL,
   line_no            smallint NOT NULL CHECK (line_no BETWEEN 1 AND 50),
   method             text NOT NULL CHECK (method IN ('cash','card_pos','card_to_card','bank_transfer','on_account')),
@@ -3768,11 +4343,11 @@ CREATE TABLE IF NOT EXISTS pos.ticket_payment (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, ticket_id, line_no),
-  FOREIGN KEY (tenant_id, ticket_id) REFERENCES pos.ticket(tenant_id, id),
-  FOREIGN KEY (tenant_id, card_terminal_id) REFERENCES treasury.card_terminal(tenant_id, id),
-  FOREIGN KEY (tenant_id, bank_account_id) REFERENCES treasury.bank_account(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, ticket_id) REFERENCES pos.ticket(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, card_terminal_id) REFERENCES treasury.card_terminal(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, bank_account_id) REFERENCES treasury.bank_account(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, party_id) REFERENCES parties.party(tenant_id, id),
-  FOREIGN KEY (tenant_id, card_txn_id) REFERENCES treasury.card_txn(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, card_txn_id) REFERENCES treasury.card_txn(tenant_id, company_id, id),
   CONSTRAINT payment_cash CHECK (method <> 'cash' OR amount < 0 OR (tendered IS NOT NULL AND amount = tendered - change_given)),
   CONSTRAINT payment_change CHECK (change_given = 0 OR method = 'cash'),
   CONSTRAINT payment_card CHECK ((method = 'card_pos') = (card_terminal_id IS NOT NULL AND card_result IS NOT NULL)),
@@ -3784,9 +4359,62 @@ CREATE TABLE IF NOT EXISTS pos.ticket_payment (
 );
 SELECT core.enable_tenant_rls('pos.ticket_payment');
 
+-- سریال و دستهٔ کالای فروخته/برگشتی در صندوق (RV-TP-09): کالای برقی گارانتی‌دار و کالای دسته‌ای. فقط با رسید نوشته می‌شود؛
+-- post_from_pos از آن inventory.tracking_bundle می‌سازد و سریال تکراری یا ناموجود را به review می‌برد (serial_conflict، بخش ۰۵).
+CREATE TABLE IF NOT EXISTS pos.ticket_line_tracking (
+  tenant_id       uuid NOT NULL REFERENCES core.tenant(id),
+  id              uuid NOT NULL DEFAULT uuidv7(),
+  ticket_line_id  uuid NOT NULL,
+  seq             smallint NOT NULL CHECK (seq BETWEEN 1 AND 2000),
+  serial_no       text CHECK (serial_no ~ '^[0-9A-Za-z][0-9A-Za-z/._-]{0,63}$'),
+  batch_no        text CHECK (batch_no ~ '^[0-9A-Za-z][0-9A-Za-z/._-]{0,63}$'),
+  expiry_date     date,
+  qty             core.qty NOT NULL CHECK (qty > 0),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, ticket_line_id, seq),
+  FOREIGN KEY (tenant_id, ticket_line_id) REFERENCES pos.ticket_line(tenant_id, id),
+  CONSTRAINT tracking_kind CHECK (num_nonnulls(serial_no, batch_no) >= 1),
+  CONSTRAINT tracking_serial_unit CHECK (serial_no IS NULL OR qty = 1)
+);
+SELECT core.enable_tenant_rls('pos.ticket_line_tracking');
+CREATE UNIQUE INDEX IF NOT EXISTS ticket_line_tracking_serial_uq ON pos.ticket_line_tracking (tenant_id, ticket_line_id, serial_no)
+  WHERE serial_no IS NOT NULL;
+-- جست‌وجوی مرجوعی‌های یک سطر فروش و فروش‌های یک سطر سفارش باز (ticket_check؛ RV-TP-19)
+CREATE INDEX IF NOT EXISTS ticket_line_original_idx ON pos.ticket_line (tenant_id, original_line_id) WHERE original_line_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ticket_line_open_order_line_idx ON pos.ticket_line (tenant_id, open_order_line_id) WHERE open_order_line_id IS NOT NULL;
+
 -- =====================================================================
 -- ۱۸. تریگرهای pos
 -- =====================================================================
+-- واحد خرد ارز مبالغ صندوق (RV-TP-20؛ همان treasury.minor_unit_guard)
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT * FROM (VALUES
+      ('ticket','col:currency','{subtotal,order_discount,service_charge,tax_total,rounding_adjustment,tip_amount,total}'),
+      ('ticket_line','ticket','{line_gross,line_discount,line_net,tax_amount}'),
+      ('ticket_payment','ticket','{amount,tendered,change_given}'),
+      ('shift','shift','{opening_float,expected_cash,counted_cash,over_short}'),
+      ('cash_movement','shift','{amount}')) AS v(tbl, src, cols) LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS trg_minor ON pos.%I', r.tbl);
+    EXECUTE format('CREATE TRIGGER trg_minor BEFORE INSERT OR UPDATE ON pos.%I FOR EACH ROW EXECUTE FUNCTION treasury.minor_unit_guard(%s)',
+                   r.tbl, (SELECT string_agg(quote_literal(x), ', ') FROM unnest(r.src || r.cols::text[]) x));
+  END LOOP;
+END $$;
+
+-- هیچ شمارهٔ کامل کارت در متن آزاد صندوق (RV-TP-08). بدنهٔ امضاشدهٔ فرمان دست نمی‌خورد؛ دستگاه فقط masked_pan می‌فرستد.
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT * FROM (VALUES ('ticket','note'), ('ticket_line','note'), ('ticket_payment','reference_no'), ('cash_movement','reason'),
+                                 ('open_order','note'), ('open_order_line','note'), ('command_outcome','resolution_note')) AS v(tbl, col) LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = format('pos.%I', r.tbl)::regclass AND conname = r.col || '_no_pan') THEN
+      EXECUTE format('ALTER TABLE pos.%I ADD CONSTRAINT %I CHECK (NOT treasury.contains_pan(%I))', r.tbl, r.col || '_no_pan', r.col);
+    END IF;
+  END LOOP;
+END $$;
+
 DO $$
 DECLARE t text;
 BEGIN
@@ -3799,7 +4427,7 @@ BEGIN
     EXECUTE format('DROP TRIGGER IF EXISTS trg_append_only ON pos.%I', t);
     EXECUTE format('CREATE TRIGGER trg_append_only BEFORE UPDATE OR DELETE ON pos.%I FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation()', t);
   END LOOP;
-  FOREACH t IN ARRAY ARRAY['terminal','business_day','shift','ticket','ticket_line','ticket_payment','open_order',
+  FOREACH t IN ARRAY ARRAY['terminal','business_day','shift','ticket','ticket_line','ticket_payment','ticket_line_tracking','open_order',
                            'command_outcome','device_sync_state','cash_movement','offline_session','sync_stream_version'] LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS trg_no_delete ON pos.%I', t);
     EXECUTE format('CREATE TRIGGER trg_no_delete BEFORE DELETE ON pos.%I FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation()', t);
@@ -3864,6 +4492,8 @@ BEGIN
   IF (NEW.company_id, NEW.branch_id, NEW.business_date) IS DISTINCT FROM (OLD.company_id, OLD.branch_id, OLD.business_date) THEN
     PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', 'business day identity cannot change');
   END IF;
+  -- RV-TP-03: تریگر BEFORE UPDATE پس از قفل ردیف اجرا می‌شود (GetTupleForTrigger)، پس اگر شیفتی هم‌زمان با FOR SHARE همین
+  -- روز (shift_guard) باز شود، بستن روز منتظر commit آن می‌ماند و این EXISTS با snapshot تازه آن را می‌بیند (آزمون T34)
   IF NEW.status = 'closed' AND EXISTS (SELECT 1 FROM pos.shift s WHERE s.tenant_id = NEW.tenant_id AND s.business_day_id = NEW.id
                                                                     AND s.status = 'open') THEN
     PERFORM core.raise_hk('HK_POS_DAY_OPEN_SHIFTS', 'close all shifts of the business day first');
@@ -3879,7 +4509,8 @@ DECLARE t pos.terminal; b pos.business_day;
 BEGIN
   IF TG_OP = 'INSERT' THEN
     SELECT * INTO t FROM pos.terminal WHERE tenant_id = NEW.tenant_id AND id = NEW.terminal_id;
-    SELECT * INTO b FROM pos.business_day WHERE tenant_id = NEW.tenant_id AND id = NEW.business_day_id;
+    -- RV-TP-03: FOR SHARE با UPDATE بستن روز تعارض دارد؛ پس از commit بستن، وضعیت تازه دیده می‌شود (بدون write-skew)
+    SELECT * INTO b FROM pos.business_day WHERE tenant_id = NEW.tenant_id AND id = NEW.business_day_id FOR SHARE;
     IF t.status <> 'active' OR t.cash_box_id <> NEW.cash_box_id OR t.branch_id <> NEW.branch_id
        OR b.branch_id <> NEW.branch_id OR b.company_id <> NEW.company_id OR b.status <> 'open' OR NEW.status <> 'open' THEN
       PERFORM core.raise_hk('HK_POS_SHIFT_CONTEXT', 'a shift opens on an active terminal, its cash box, in an open business day of its branch');
@@ -3908,7 +4539,7 @@ LANGUAGE plpgsql AS $$
 DECLARE v_status text;
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    SELECT status INTO v_status FROM pos.shift WHERE tenant_id = NEW.tenant_id AND id = NEW.shift_id;
+    SELECT status, company_id INTO v_status, NEW.company_id FROM pos.shift WHERE tenant_id = NEW.tenant_id AND id = NEW.shift_id;
     IF v_status <> 'open' THEN PERFORM core.raise_hk('HK_POS_SHIFT_CLOSED', 'cash movements need an open shift'); END IF;
     RETURN NEW;
   END IF;
@@ -3945,6 +4576,13 @@ LANGUAGE plpgsql AS $$
 DECLARE r record; v_status text;
 BEGIN
   IF TG_OP = 'DELETE' THEN r := OLD; ELSE r := NEW; END IF;
+  -- شمارندهٔ صورتحساب (فقط ticket_line_apply؛ یکنواخت؛ برابری با رسیدها در ticket_check) حتی پس از بسته شدن سفارش
+  IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'billed_qty') = (to_jsonb(OLD) - 'billed_qty') THEN
+    IF NEW.billed_qty < OLD.billed_qty THEN
+      PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', 'billed quantity of an order line only grows with its tickets');
+    END IF;
+    RETURN NEW;
+  END IF;
   SELECT status INTO v_status FROM pos.open_order WHERE tenant_id = r.tenant_id AND id = r.order_id;
   IF v_status <> 'open' THEN
     PERFORM core.raise_hk('HK_POS_ORDER_CLOSED', 'lines of a closed order are immutable');
@@ -4002,6 +4640,10 @@ BEGIN
        OR s.terminal_id IS DISTINCT FROM NEW.terminal_id OR s.business_day_id IS DISTINCT FROM NEW.business_day_id THEN
       PERFORM core.raise_hk('HK_POS_TICKET_CONTEXT', 'ticket terminal, device, shift and business day must agree');
     END IF;
+    -- رسید = همان شواهد امضاشده (RV-TP-21): شناسه و زمان از بدنهٔ فرمان؛ جمع‌ها در ticket_check
+    IF (c.payload ->> 'ticket_id') IS DISTINCT FROM NEW.id::text OR c.occurred_at IS DISTINCT FROM NEW.occurred_at THEN
+      PERFORM core.raise_hk('HK_POS_TICKET_PAYLOAD', 'ticket id and occurred_at must equal the signed command payload');
+    END IF;
     IF NEW.posting_status <> 'pending' OR num_nonnulls(NEW.sales_doc_id, NEW.money_document_id, NEW.tax_doc_id, NEW.posted_at) > 0 THEN
       PERFORM core.raise_hk('HK_POS_TICKET_POSTING', 'a ticket is stored first and posted afterwards');
     END IF;
@@ -4011,9 +4653,10 @@ BEGIN
     PERFORM core.raise_hk('HK_POS_TICKET_IMMUTABLE', 'a ticket is immutable (corrections are return tickets)');
   END IF;
   IF (OLD.sales_doc_id IS NOT NULL AND NEW.sales_doc_id IS DISTINCT FROM OLD.sales_doc_id)
-     OR (OLD.money_document_id IS NOT NULL AND NEW.money_document_id IS DISTINCT FROM OLD.money_document_id)
+     OR (OLD.money_document_id IS NOT NULL AND NEW.money_document_id IS DISTINCT FROM OLD.money_document_id
+         AND (SELECT status FROM treasury.money_document WHERE tenant_id = OLD.tenant_id AND id = OLD.money_document_id) <> 'cancelled')
      OR (OLD.tax_doc_id IS NOT NULL AND NEW.tax_doc_id IS DISTINCT FROM OLD.tax_doc_id) THEN
-    PERFORM core.raise_hk('HK_POS_TICKET_IMMUTABLE', 'posting links are set once');
+    PERFORM core.raise_hk('HK_POS_TICKET_IMMUTABLE', 'posting links are set once (the receipt link is replaced only after that receipt is cancelled)');
   END IF;
   IF NEW.posting_status IS DISTINCT FROM OLD.posting_status AND NOT (
        (OLD.posting_status = 'pending' AND NEW.posting_status IN ('posted','review','not_applicable'))
@@ -4028,14 +4671,30 @@ CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON pos.ticket FOR EACH ROW EXEC
 -- سطر و پرداخت رسید فقط در همان تراکنشِ درج رسید نوشته می‌شوند؛ پس از آن فقط پیوند تراکنش کارت (یک‌بار)
 CREATE OR REPLACE FUNCTION pos.ticket_child_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_xact xid8;
+DECLARE v_xact xid8; v_ticket uuid;
+  k_ctr CONSTANT text[] := ARRAY['returned_qty','returned_net','returned_tax'];
 BEGIN
-  SELECT created_xact INTO v_xact FROM pos.ticket WHERE tenant_id = NEW.tenant_id AND id = NEW.ticket_id;
-  IF v_xact = pg_current_xact_id() THEN RETURN NEW; END IF;
+  IF TG_TABLE_NAME = 'ticket_line_tracking' THEN
+    SELECT l.ticket_id INTO v_ticket FROM pos.ticket_line l WHERE l.tenant_id = NEW.tenant_id AND l.id = NEW.ticket_line_id;
+  ELSE
+    v_ticket := (to_jsonb(NEW) ->> 'ticket_id')::uuid;
+  END IF;
+  SELECT created_xact INTO v_xact FROM pos.ticket WHERE tenant_id = NEW.tenant_id AND id = v_ticket;
+  IF v_xact = pg_current_xact_id() AND (TG_OP = 'INSERT' OR TG_TABLE_NAME <> 'ticket_line'
+                                         OR (to_jsonb(NEW) - k_ctr) = (to_jsonb(OLD) - k_ctr)) THEN
+    RETURN NEW;
+  END IF;
   IF TG_OP = 'UPDATE' AND TG_TABLE_NAME = 'ticket_payment' THEN
     IF (to_jsonb(NEW) - 'card_txn_id') = (to_jsonb(OLD) - 'card_txn_id') AND (to_jsonb(OLD) ->> 'card_txn_id') IS NULL THEN
       RETURN NEW;
     END IF;
+  END IF;
+  -- شمارنده‌های مرجوعی سطر فروش: فقط افزایش (ticket_line_apply)؛ برابری با سطرهای برگشتی در ticket_check
+  IF TG_OP = 'UPDATE' AND TG_TABLE_NAME = 'ticket_line' AND (to_jsonb(NEW) - k_ctr) = (to_jsonb(OLD) - k_ctr) THEN
+    IF NEW.returned_qty < OLD.returned_qty OR NEW.returned_net < OLD.returned_net OR NEW.returned_tax < OLD.returned_tax THEN
+      PERFORM core.raise_hk('HK_POS_TICKET_IMMUTABLE', 'returned counters of a sale line only grow');
+    END IF;
+    RETURN NEW;
   END IF;
   PERFORM core.raise_hk('HK_POS_TICKET_IMMUTABLE', format('%s rows are written only with their ticket', TG_TABLE_NAME));
   RETURN NULL;
@@ -4044,11 +4703,51 @@ DROP TRIGGER IF EXISTS trg_guard ON pos.ticket_line;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON pos.ticket_line FOR EACH ROW EXECUTE FUNCTION pos.ticket_child_guard();
 DROP TRIGGER IF EXISTS trg_guard ON pos.ticket_payment;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON pos.ticket_payment FOR EACH ROW EXECUTE FUNCTION pos.ticket_child_guard();
+CREATE OR REPLACE FUNCTION pos.ticket_payment_company() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  SELECT company_id INTO NEW.company_id FROM pos.ticket WHERE tenant_id = NEW.tenant_id AND id = NEW.ticket_id;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_company ON pos.ticket_payment;
+CREATE TRIGGER trg_company BEFORE INSERT ON pos.ticket_payment FOR EACH ROW EXECUTE FUNCTION pos.ticket_payment_company();
+DROP TRIGGER IF EXISTS trg_guard ON pos.ticket_line_tracking;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON pos.ticket_line_tracking FOR EACH ROW EXECUTE FUNCTION pos.ticket_child_guard();
+
+-- سقف مرجوعی و سقف تقسیم صورتحساب زیر قفل ردیف (RV-TP-02): هر سطر برگشتی شمارندهٔ سطر فروش اصلی و هر سطر فروشِ
+-- سفارش باز شمارندهٔ سطر سفارش را با UPDATE شرطی بالا می‌برد. دو صندوق هم‌زمان روی یک سطر به ترتیب پیش می‌روند و
+-- دومی پس از commit اولی شرط را روی ردیف تازه می‌سنجد (EvalPlanQual)؛ در REPEATABLE READ خطای سریال‌سازی می‌گیرد.
+CREATE OR REPLACE FUNCTION pos.ticket_line_apply() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.original_line_id IS NOT NULL THEN
+    UPDATE pos.ticket_line o
+       SET returned_qty = o.returned_qty + NEW.qty, returned_net = o.returned_net + NEW.line_net,
+           returned_tax = o.returned_tax + NEW.tax_amount
+     WHERE o.tenant_id = NEW.tenant_id AND o.id = NEW.original_line_id AND o.direction = 'sale'
+       AND o.returned_qty + NEW.qty <= o.qty AND o.returned_net + NEW.line_net <= o.line_net
+       AND o.returned_tax + NEW.tax_amount <= o.tax_amount;
+    IF NOT FOUND THEN
+      PERFORM core.raise_hk('HK_POS_RETURN_EXCEEDS',
+        format('return of line %s exceeds the sold quantity, net or tax of the original sale line', NEW.original_line_id));
+    END IF;
+  END IF;
+  IF NEW.open_order_line_id IS NOT NULL AND NEW.direction = 'sale' THEN
+    UPDATE pos.open_order_line o SET billed_qty = o.billed_qty + NEW.qty
+     WHERE o.tenant_id = NEW.tenant_id AND o.id = NEW.open_order_line_id AND o.status <> 'voided' AND o.billed_qty + NEW.qty <= o.qty;
+    IF NOT FOUND THEN
+      PERFORM core.raise_hk('HK_POS_SPLIT_EXCEEDS', format('order line %s is billed beyond its quantity (or voided)', NEW.open_order_line_id));
+    END IF;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_apply ON pos.ticket_line;
+CREATE TRIGGER trg_apply AFTER INSERT ON pos.ticket_line FOR EACH ROW EXECUTE FUNCTION pos.ticket_line_apply();
 
 -- در commit: جمع‌ها، علامت‌ها، پرداخت‌ها، سقف مرجوعی و سقف تقسیم صورتحساب
 CREATE OR REPLACE FUNCTION pos.ticket_check() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE t pos.ticket; v_minor smallint; v_n int; v_bad int; v_sub numeric; v_tax numeric; v_pay numeric; r record;
+DECLARE t pos.ticket; v_minor smallint; v_n int; v_bad int; v_sub numeric; v_tax numeric; v_pay numeric; v_npay int; v_pl jsonb; r record;
 BEGIN
   SELECT * INTO t FROM pos.ticket WHERE tenant_id = NEW.tenant_id AND id = NEW.id;
   SELECT minor_unit INTO v_minor FROM ref.currency WHERE code = t.currency;
@@ -4068,30 +4767,71 @@ BEGIN
     PERFORM core.raise_hk('HK_POS_TICKET_TOTALS', format('ticket %s totals do not add up (subtotal %s/%s, tax %s/%s, total %s)',
                                                       t.id, t.subtotal, v_sub, t.tax_total, v_tax, t.total));
   END IF;
-  SELECT coalesce(sum(amount), 0) INTO v_pay FROM pos.ticket_payment WHERE tenant_id = t.tenant_id AND ticket_id = t.id;
+  SELECT coalesce(sum(amount), 0), count(*) INTO v_pay, v_npay FROM pos.ticket_payment WHERE tenant_id = t.tenant_id AND ticket_id = t.id;
   IF v_pay <> t.total + t.tip_amount THEN
     PERFORM core.raise_hk('HK_POS_TICKET_PAYMENTS', format('ticket %s payments %s <> total %s + tip %s', t.id, v_pay, t.total, t.tip_amount));
   END IF;
-  -- مرجوعی: سطر اصلی فروش از رسید اصلی، همان SKU و واحد، و جمع برگشتی‌ها ≤ مقدار فروخته‌شده
-  FOR r IN SELECT l.original_line_id, l.variant_id, l.uom_id FROM pos.ticket_line l
+  -- جمع‌ها، تعداد سطر و پرداخت و جمع پرداخت = همان payload امضاشده (رشتهٔ دهدهی؛ RV-TP-21، D-T21)
+  SELECT payload INTO v_pl FROM pos.device_command WHERE tenant_id = t.tenant_id AND cmd_id = t.cmd_id;
+  IF NOT (jsonb_typeof(v_pl -> 'lines') = 'array' AND jsonb_typeof(v_pl -> 'payments') = 'array'
+          AND (v_pl ->> 'subtotal') ~ '^-?[0-9]{1,20}(\.[0-9]{1,4})?$' AND (v_pl ->> 'subtotal')::numeric = t.subtotal
+          AND (v_pl ->> 'tax_total') ~ '^-?[0-9]{1,20}(\.[0-9]{1,4})?$' AND (v_pl ->> 'tax_total')::numeric = t.tax_total
+          AND (v_pl ->> 'tip_amount') ~ '^[0-9]{1,20}(\.[0-9]{1,4})?$' AND (v_pl ->> 'tip_amount')::numeric = t.tip_amount
+          AND (v_pl ->> 'total') ~ '^-?[0-9]{1,20}(\.[0-9]{1,4})?$' AND (v_pl ->> 'total')::numeric = t.total
+          AND jsonb_array_length(v_pl -> 'lines') = v_n AND jsonb_array_length(v_pl -> 'payments') = v_npay
+          AND (SELECT coalesce(sum((x ->> 'amount')::numeric), 0) FROM jsonb_array_elements(v_pl -> 'payments') x
+                WHERE (x ->> 'amount') ~ '^-?[0-9]{1,20}(\.[0-9]{1,4})?$') = v_pay
+          AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v_pl -> 'payments') x WHERE (x ->> 'amount') !~ '^-?[0-9]{1,20}(\.[0-9]{1,4})?$')) IS TRUE THEN
+    PERFORM core.raise_hk('HK_POS_TICKET_PAYLOAD', format('ticket %s totals, line count or payments differ from its signed payload', t.id));
+  END IF;
+  -- مرجوعی: سطر اصلی فروش از رسید اصلی، همان SKU و واحد؛ مبلغ و مالیات هر سطر برگشتی ≤ سهم نسبی سطر فروش (RV-TP-15)؛
+  -- شمارنده‌های سطر فروش (سقف زیر قفل در ticket_line_apply) = جمع همهٔ سطرهای برگشتی آن (بدون drift)
+  FOR r IN SELECT l.original_line_id, l.variant_id, l.uom_id, l.qty, l.line_net, l.tax_amount FROM pos.ticket_line l
             WHERE l.tenant_id = t.tenant_id AND l.ticket_id = t.id AND l.original_line_id IS NOT NULL LOOP
     IF NOT EXISTS (SELECT 1 FROM pos.ticket_line o
                     WHERE o.tenant_id = t.tenant_id AND o.id = r.original_line_id AND o.direction = 'sale'
                       AND o.variant_id = r.variant_id AND o.uom_id = r.uom_id
-                      AND (t.original_ticket_id IS NULL OR o.ticket_id = t.original_ticket_id))
-       OR (SELECT sum(x.qty) FROM pos.ticket_line x WHERE x.tenant_id = t.tenant_id AND x.original_line_id = r.original_line_id)
-          > (SELECT o.qty FROM pos.ticket_line o WHERE o.tenant_id = t.tenant_id AND o.id = r.original_line_id) THEN
+                      AND (t.original_ticket_id IS NULL OR o.ticket_id = t.original_ticket_id)
+                      AND r.line_net <= ceil(o.line_net * r.qty / o.qty * power(10, v_minor)) / power(10, v_minor)
+                      AND r.tax_amount <= ceil(o.tax_amount * r.qty / o.qty * power(10, v_minor)) / power(10, v_minor))
+       OR EXISTS (SELECT 1 FROM pos.ticket_line o
+                   CROSS JOIN LATERAL (SELECT coalesce(sum(x.qty), 0) AS q, coalesce(sum(x.line_net), 0) AS n, coalesce(sum(x.tax_amount), 0) AS tx
+                                         FROM pos.ticket_line x WHERE x.tenant_id = t.tenant_id AND x.original_line_id = o.id) agg
+                   WHERE o.tenant_id = t.tenant_id AND o.id = r.original_line_id
+                     AND (o.returned_qty, o.returned_net, o.returned_tax) IS DISTINCT FROM (agg.q, agg.n, agg.tx)) THEN
       PERFORM core.raise_hk('HK_POS_RETURN_EXCEEDS', format('return of line %s exceeds or mismatches the original sale', r.original_line_id));
     END IF;
   END LOOP;
-  -- تقسیم صورتحساب: جمع فروش هر سطر سفارش باز در همهٔ رسیدها ≤ مقدار آن سطر و سطر باطل نشده
+  -- تقسیم صورتحساب: شمارندهٔ هر سطر سفارش باز = جمع فروش آن در همهٔ رسیدها، و سطر باطل نشده (سقف در ticket_line_apply)
   FOR r IN SELECT l.open_order_line_id FROM pos.ticket_line l
             WHERE l.tenant_id = t.tenant_id AND l.ticket_id = t.id AND l.open_order_line_id IS NOT NULL LOOP
-    IF (SELECT sum(x.qty) FROM pos.ticket_line x WHERE x.tenant_id = t.tenant_id AND x.open_order_line_id = r.open_order_line_id AND x.direction = 'sale')
-       > (SELECT o.qty FROM pos.open_order_line o WHERE o.tenant_id = t.tenant_id AND o.id = r.open_order_line_id AND o.status <> 'voided') IS NOT FALSE THEN
+    IF NOT EXISTS (SELECT 1 FROM pos.open_order_line o
+                    WHERE o.tenant_id = t.tenant_id AND o.id = r.open_order_line_id AND o.status <> 'voided'
+                      AND o.billed_qty = (SELECT coalesce(sum(x.qty), 0) FROM pos.ticket_line x
+                                           WHERE x.tenant_id = t.tenant_id AND x.open_order_line_id = o.id AND x.direction = 'sale')) THEN
       PERFORM core.raise_hk('HK_POS_SPLIT_EXCEEDS', format('order line %s is billed beyond its quantity (or voided)', r.open_order_line_id));
     END IF;
   END LOOP;
+  -- نسیه فقط به نام همان مشتری رسید و هرگز مشتری عمومی (RV-TP-16)؛ صورتحساب نوع ۲ مؤدیان فقط نقدی (RV-X2-16، INV-SAL-15)
+  IF EXISTS (SELECT 1 FROM pos.ticket_payment p JOIN parties.party pp ON pp.tenant_id = p.tenant_id AND pp.id = p.party_id
+              WHERE p.tenant_id = t.tenant_id AND p.ticket_id = t.id AND p.method = 'on_account'
+                AND (treasury.canonical_party(t.tenant_id, p.party_id) IS DISTINCT FROM treasury.canonical_party(t.tenant_id, t.customer_party_id)
+                     OR pp.is_anonymous)) THEN
+    PERFORM core.raise_hk('HK_POS_ON_ACCOUNT_PARTY', format('ticket %s: on-account payment must name the (non-anonymous) ticket customer', t.id));
+  END IF;
+  IF t.tax_inty = 2 AND EXISTS (SELECT 1 FROM pos.ticket_payment p WHERE p.tenant_id = t.tenant_id AND p.ticket_id = t.id AND p.method = 'on_account') THEN
+    PERFORM core.raise_hk('HK_POS_TYPE2_CASH_ONLY', format('ticket %s: a type-2 Moadian invoice cannot be settled on account', t.id));
+  END IF;
+  IF t.tax_inty = 1 AND (SELECT is_anonymous FROM parties.party WHERE tenant_id = t.tenant_id AND id = t.customer_party_id) THEN
+    PERFORM core.raise_hk('HK_POS_TYPE1_BUYER', format('ticket %s: a type-1 Moadian invoice needs an identified buyer', t.id));
+  END IF;
+  -- سریال و دسته: اگر سطری ردیابی دارد، جمع مقدار ردیابی = مقدار سطر
+  IF EXISTS (SELECT 1 FROM pos.ticket_line l
+              WHERE l.tenant_id = t.tenant_id AND l.ticket_id = t.id
+                AND EXISTS (SELECT 1 FROM pos.ticket_line_tracking k WHERE k.tenant_id = l.tenant_id AND k.ticket_line_id = l.id)
+                AND l.qty <> (SELECT sum(k.qty) FROM pos.ticket_line_tracking k WHERE k.tenant_id = l.tenant_id AND k.ticket_line_id = l.id)) THEN
+    PERFORM core.raise_hk('HK_POS_TRACKING_QTY', format('ticket %s: serial/batch quantities must add up to their line quantity', t.id));
+  END IF;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_check ON pos.ticket;
@@ -4110,6 +4850,15 @@ BEGIN
   END IF;
   IF NEW.device_id <> OLD.device_id THEN
     PERFORM core.raise_hk('HK_TRS_IMMUTABLE_FIELD', 'sync state device cannot change');
+  END IF;
+  -- سقف پذیرش پس از ابطال: یک‌بار، فقط برای دستگاه باطل یا گم‌شده، و نه کمتر از آنچه رسیده است
+  IF (NEW.accept_through_seq, NEW.accept_reason, NEW.accepted_by, NEW.accepted_at)
+     IS DISTINCT FROM (OLD.accept_through_seq, OLD.accept_reason, OLD.accepted_by, OLD.accepted_at) THEN
+    IF OLD.accept_through_seq IS NOT NULL
+       OR NOT EXISTS (SELECT 1 FROM core.device d WHERE d.tenant_id = NEW.tenant_id AND d.id = NEW.device_id AND d.status IN ('revoked','lost'))
+       OR NEW.accept_through_seq < OLD.last_seq THEN
+      PERFORM core.raise_hk('HK_SYNC_ACCEPT_BOUND', 'the post-revocation acceptance bound is set once, only for a revoked/lost device, and not below the stored head');
+    END IF;
   END IF;
   IF (NEW.last_seq, NEW.last_hash) IS DISTINCT FROM (OLD.last_seq, OLD.last_hash)
      AND (NEW.last_seq <> OLD.last_seq + 1
@@ -4153,9 +4902,16 @@ BEGIN
     PERFORM core.raise_hk('HK_SYNC_CHAIN_BROKEN', format('prev_hash of seq %s does not match the stored chain head', NEW.device_seq));
   END IF;
   SELECT * INTO d FROM core.device WHERE tenant_id = NEW.tenant_id AND id = NEW.device_id;
-  IF NOT (d.status = 'active' OR (d.status IN ('revoked','lost') AND NEW.occurred_at < d.revoked_at)) OR d.key_alg <> NEW.sig_alg THEN
-    PERFORM core.raise_hk('HK_SYNC_DEVICE_REVOKED', 'device is not active (or command is dated after revocation) or signature algorithm differs');
+  -- دستگاه باطل/گم‌شده (RV-TP-01): occurred_at را خود دستگاه امضا می‌کند و سد امنیتی نیست. فقط تا سقف دنباله‌ای که مدیر
+  -- پس از ابطال اعلام کرده پذیرفته می‌شود، و هر فرمان پذیرفته‌شده پرچم after_revocation دارد (اعمال فقط با بازبینی).
+  IF d.key_alg <> NEW.sig_alg
+     OR NOT (d.status = 'active'
+             OR (d.status IN ('revoked','lost') AND s.accept_through_seq IS NOT NULL AND NEW.device_seq <= s.accept_through_seq
+                 AND NEW.occurred_at < d.revoked_at)) THEN
+    PERFORM core.raise_hk('HK_SYNC_DEVICE_REVOKED',
+      'device is not active and the command is beyond the manager-declared acceptance bound (or dated after revocation), or signature algorithm differs');
   END IF;
+  NEW.after_revocation := (d.status <> 'active');
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON pos.device_command;
@@ -4200,6 +4956,10 @@ BEGIN
     END IF;
     IF OLD.status = 'review' AND (NEW.resolved_by IS NULL OR NEW.resolved_at IS NULL OR char_length(btrim(coalesce(NEW.resolution_note, ''))) < 5) THEN
       PERFORM core.raise_hk('HK_SYNC_REVIEW_RESOLUTION', 'resolving a review needs resolver, time and a note');
+    END IF;
+    IF NEW.status = 'applied' AND OLD.status <> 'review'
+       AND (SELECT dc.after_revocation FROM pos.device_command dc WHERE dc.tenant_id = NEW.tenant_id AND dc.id = NEW.command_id) THEN
+      PERFORM core.raise_hk('HK_SYNC_REVIEW_REQUIRED', 'a command received after its device was revoked is applied only through a resolved review');
     END IF;
     IF OLD.status = 'pending' AND EXISTS (SELECT 1 FROM pos.command_outcome o
                                            WHERE o.tenant_id = NEW.tenant_id AND o.device_id = NEW.device_id
@@ -4279,6 +5039,35 @@ LANGUAGE sql STABLE AS $$
   ORDER BY 1, 2
 $$;
 
+-- موانع بستن دوره/سال از نگاه صندوق (RV-X2-13): قلاب YearEndHook و PeriodCloseHook ماژول pos همین را برمی‌گرداند.
+-- خالی = مانعی نیست. فرمان حل‌نشده (pending/deferred/review) دستگاه‌های شرکت با occurred_at تا یک روز پس از پایان بازه (روز کاری
+-- از نیمه‌شب می‌گذرد)، رسید ثبت‌نشده، روز یا شیفت باز، و نشست آفلاین بازِ آغازشده پیش از پایان بازه.
+CREATE OR REPLACE FUNCTION pos.close_blockers(p_company_id uuid, p_from date, p_to date)
+RETURNS TABLE (kind text, ref_id uuid, detail text)
+LANGUAGE sql STABLE AS $$
+  SELECT 'command_unresolved', o.command_id, o.status || ' seq ' || o.device_seq || coalesce(' ' || o.error_code, '')
+    FROM pos.command_outcome o
+    JOIN pos.device_command c ON c.tenant_id = o.tenant_id AND c.id = o.command_id
+    JOIN core.device d ON d.tenant_id = c.tenant_id AND d.id = c.device_id
+   WHERE d.company_id = p_company_id AND o.status IN ('pending','deferred','review')
+     AND c.occurred_at < (p_to + 2)::timestamptz AND c.occurred_at >= (p_from - 1)::timestamptz
+  UNION ALL
+  SELECT 'ticket_unposted', t.id, t.ticket_no || ' ' || t.posting_status
+    FROM pos.ticket t JOIN pos.business_day b ON b.tenant_id = t.tenant_id AND b.id = t.business_day_id
+   WHERE t.company_id = p_company_id AND t.posting_status IN ('pending','review') AND b.business_date BETWEEN p_from AND p_to
+  UNION ALL
+  SELECT 'business_day_open', b.id, b.business_date::text
+    FROM pos.business_day b WHERE b.company_id = p_company_id AND b.status = 'open' AND b.business_date BETWEEN p_from AND p_to
+  UNION ALL
+  SELECT 'shift_open', s.id, b.business_date::text
+    FROM pos.shift s JOIN pos.business_day b ON b.tenant_id = s.tenant_id AND b.id = s.business_day_id
+   WHERE s.company_id = p_company_id AND s.status = 'open' AND b.business_date BETWEEN p_from AND p_to
+  UNION ALL
+  SELECT 'offline_session_open', x.id, x.started_at::text
+    FROM pos.offline_session x JOIN pos.terminal tm ON tm.tenant_id = x.tenant_id AND tm.id = x.terminal_id
+   WHERE tm.company_id = p_company_id AND x.ended_at IS NULL AND x.started_at < (p_to + 1)::timestamptz
+$$;
+
 CREATE OR REPLACE VIEW pos.v_device_sync_health WITH (security_invoker = true) AS
   SELECT s.tenant_id, s.device_id, s.terminal_id, s.last_seq, s.last_cmd_received_at, s.max_abs_clock_offset_ms, s.status,
          (SELECT count(*) FROM pos.command_outcome o WHERE o.tenant_id = s.tenant_id AND o.device_id = s.device_id AND o.status = 'pending') AS pending,
@@ -4310,7 +5099,8 @@ INSERT INTO ledger.subledger_source (subledger_kind, owner_module, balance_funct
   ('cheque_receivable',  'treasury', 'treasury.subledger_cheque_receivable',  1, true, '1.0'),
   ('cheque_payable',     'treasury', 'treasury.subledger_cheque_payable',     1, true, '1.0'),
   ('guarantee_received', 'treasury', 'treasury.subledger_guarantee_received', 1, true, '1.0'),
-  ('guarantee_given',    'treasury', 'treasury.subledger_guarantee_given',    1, true, '1.0')
+  ('guarantee_given',    'treasury', 'treasury.subledger_guarantee_given',    1, true, '1.0'),
+  ('party',              'treasury', 'treasury.subledger_party',              1, true, '1.0')
 ON CONFLICT (subledger_kind) DO NOTHING;
 
 INSERT INTO core.permission (code, module, scope_dimensions, risk, allow_service_account, allow_impersonation_write, description_key, introduced_in) VALUES
@@ -4322,6 +5112,9 @@ INSERT INTO core.permission (code, module, scope_dimensions, risk, allow_service
   ('treasury.document.cancel',        'treasury', '{company,branch,cash_box}', 'sensitive', false, false, 'perm.treasury.document.cancel', '1.0'),
   ('treasury.allocation.manage',      'treasury', '{company}',                 'normal',    true,  false, 'perm.treasury.allocation.manage', '1.0'),
   ('treasury.allocation.offset',      'treasury', '{company}',                 'sensitive', false, false, 'perm.treasury.allocation.offset', '1.0'),
+  ('treasury.write_off.post',         'treasury', '{company}',                 'critical',  false, false, 'perm.treasury.write_off.post', '1.0'),
+  -- پیامک یادآوری بدهی (C-AS-09): فقط برای شخصی با رضایت ثبت‌شده؛ ابزار پیشنهادی دستیار به آن وابسته است
+  ('treasury.reminder.send',          'treasury', '{company,branch}',          'sensitive', false, false, 'perm.treasury.reminder.send', '1.0'),
   ('treasury.transfer.create',        'treasury', '{company,branch,cash_box}', 'sensitive', true,  false, 'perm.treasury.transfer.create', '1.0'),
   ('treasury.cash_count.post',        'treasury', '{company,branch,cash_box}', 'sensitive', true,  false, 'perm.treasury.cash_count.post', '1.0'),
   ('treasury.petty_cash.claim',       'treasury', '{company,branch}',          'normal',    false, false, 'perm.treasury.petty_cash.claim', '1.0'),
@@ -4358,6 +5151,7 @@ INSERT INTO core.permission (code, module, scope_dimensions, risk, allow_service
   ('pos.order.void_sent',             'pos',      '{pos_terminal}',            'sensitive', false, false, 'perm.pos.order.void_sent', '1.0'),
   ('pos.cash.movement',               'pos',      '{pos_terminal}',            'sensitive', false, false, 'perm.pos.cash.movement', '1.0'),
   ('pos.sync.review',                 'pos',      '{company,branch}',          'sensitive', false, false, 'perm.pos.sync.review', '1.0'),
+  ('pos.sync.recover',                'pos',      '{company,branch}',          'critical',  false, false, 'perm.pos.sync.recover', '1.0'),
   ('pos.menu.manage',                 'pos',      '{company,branch}',          'normal',    false, false, 'perm.pos.menu.manage', '1.0'),
   ('pos.report.read',                 'pos',      '{company,branch,pos_terminal}', 'normal', true, false, 'perm.pos.report.read', '1.0'),
   ('pos.edge.manage',                 'pos',      '{company,branch}',          'critical',  false, false, 'perm.pos.edge.manage', '1.0'),
@@ -4372,6 +5166,7 @@ SELECT v.t, v.p FROM (VALUES
   ('accountant','treasury.recon.match'), ('accountant','treasury.card.read'), ('accountant','treasury.card.settle'),
   ('accountant','treasury.gateway.read'), ('accountant','treasury.gateway.link.create'), ('accountant','treasury.transfer.create'),
   ('accountant','treasury.cash_count.post'), ('accountant','pos.report.read'), ('accountant','pos.sync.review'),
+  ('accountant','treasury.reminder.send'),
   ('cashier','pos.session.open'), ('cashier','pos.shift.open'), ('cashier','pos.shift.close'), ('cashier','pos.sale.create'),
   ('cashier','pos.terminal.read'), ('cashier','treasury.petty_cash.claim'),
   ('sales_clerk','treasury.document.read'), ('sales_clerk','treasury.gateway.link.create'),
@@ -4402,9 +5197,11 @@ INSERT INTO core.setting_def (key, module, value_type, enum_values, min_value, m
   ('pos.gl_posting_mode',                  'pos', 'enum', '{per_ticket,per_shift}', NULL, NULL, '{tenant,company,branch}', '"per_ticket"', NULL, 'core.setting.manage', 'setting.pos.gl_posting_mode', '1.0'),
   ('pos.service_charge.percent',           'pos', 'decimal', NULL, 0, 100, '{tenant,company,branch}', '"0"', NULL, 'core.setting.manage', 'setting.pos.service_charge.percent', '1.0'),
   ('pos.tips.enabled',                     'pos', 'bool', NULL, NULL, NULL, '{tenant,company,branch}', 'false', NULL, 'core.setting.manage', 'setting.pos.tips.enabled', '1.0'),
-  ('pos.cash_rounding_increment',          'pos', 'decimal', NULL, 0, NULL, '{tenant,company,branch}', '"0"', NULL, 'core.setting.manage', 'setting.pos.cash_rounding_increment', '1.0'),
   ('pos.tax.warn_before_deadline_h',       'pos', 'int',  NULL, 1, 144, '{tenant}', '24', NULL, 'core.setting.manage', 'setting.pos.tax.warn_before_deadline_h', '1.0')
 ON CONFLICT (key) DO NOTHING;
+-- گام گرد کردن نقدی صندوق تنظیم واحد ۰۵ است (sales.cash_rounding.increment؛ D-C30، CR-C19)؛ تنظیم تکراری pos حذف می‌شود
+DELETE FROM core.setting_def d WHERE d.key = 'pos.cash_rounding_increment'
+   AND NOT EXISTS (SELECT 1 FROM core.setting_value v WHERE v.setting_key = d.key);
 
 INSERT INTO core.notification_category (code, module, is_mandatory, default_channels, description_key) VALUES
   ('treasury.cheque',   'treasury', false, '{in_app,sms}', 'ntf.treasury.cheque'),
@@ -4418,9 +5215,13 @@ INSERT INTO core.event_subscriber (subscriber, ordered, max_attempts, requires_w
   ('pos.sync_streams',               true,  25, false, '1.0'),
   ('pos.party_merged',               false, 25, false, '1.0'),
   ('treasury.party_merged',          false, 25, false, '1.0'),
-  ('treasury.payee_bank_changed',    false, 10, false, '1.0'),
-  ('treasury.open_item_on_cancel',   true,  25, false, '1.0')
+  ('treasury.payee_bank_changed',    false, 10, false, '1.0')
 ON CONFLICT DO NOTHING;
+-- RV-X1-24: مشترک بی‌اشتراک treasury.open_item_on_cancel حذف شد؛ ابطال قلم باز هم‌تراکنش است (OpenItemService.cancel، CR-T08).
+DELETE FROM core.event_subscriber s WHERE s.subscriber = 'treasury.open_item_on_cancel'
+   AND NOT EXISTS (SELECT 1 FROM core.event_subscription x WHERE x.subscriber = s.subscriber)
+   AND NOT EXISTS (SELECT 1 FROM core.outbox_delivery x WHERE x.subscriber = s.subscriber)
+   AND NOT EXISTS (SELECT 1 FROM core.outbox_claim_cursor x WHERE x.subscriber = s.subscriber);
 INSERT INTO core.event_subscription (event_type, subscriber) VALUES
   ('catalog.*',                      'pos.sync_streams'),
   ('parties.party.*',                'pos.sync_streams'),
@@ -4442,6 +5243,7 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('treasury','money_document',        'treasury', 'rows', 410, '{}', NULL),
   ('treasury','open_item',             'treasury', 'rows', 412, '{}', NULL),
   ('treasury','allocation',            'treasury', 'rows', 414, '{}', NULL),
+  ('treasury','receivable_write_off',  'treasury', 'rows', 415, '{}', NULL),
   ('treasury','fund_transfer',         'treasury', 'rows', 416, '{}', NULL),
   ('treasury','cash_count',            'treasury', 'rows', 418, '{}', NULL),
   ('treasury','petty_cash_claim',      'treasury', 'rows', 420, '{}', NULL),
@@ -4456,7 +5258,7 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('treasury','card_txn',              'treasury', 'rows', 438, '{}', NULL),
   ('treasury','card_settlement',       'treasury', 'rows', 440, '{}', NULL),
   ('treasury','card_day_close',        'treasury', 'rows', 442, '{}', NULL),
-  ('treasury','gateway_payment',       'treasury', 'rows', 444, '{}', NULL),
+  ('treasury','gateway_payment',       'treasury', 'rows', 444, '{link_token_hash,card_hash}', NULL),
   ('treasury','gateway_event',         'treasury', 'rows', 446, '{}', NULL),
   ('treasury','money_instrument',      'treasury', 'rows', 448, '{}', NULL),
   ('treasury','money_counter_line',    'treasury', 'rows', 450, '{}', NULL),
@@ -4467,7 +5269,7 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('treasury','recon_match',           'treasury', 'rows', 460, '{}', NULL),
   ('treasury','recon_match_item',      'treasury', 'rows', 462, '{}', NULL),
   ('treasury','bank_reconciliation',   'treasury', 'rows', 464, '{}', NULL),
-  ('pos','edge_node',                  'pos', 'rows', 600, '{}', NULL),
+  ('pos','edge_node',                  'pos', 'rows', 600, '{enrollment_code_hash}', NULL),
   ('pos','terminal',                   'pos', 'rows', 602, '{}', NULL),
   ('pos','business_day',               'pos', 'rows', 604, '{}', NULL),
   ('pos','shift',                      'pos', 'rows', 606, '{}', NULL),
@@ -4495,8 +5297,14 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('pos','open_order_line',            'pos', 'rows', 650, '{}', NULL),
   ('pos','ticket',                     'pos', 'rows', 652, '{}', NULL),
   ('pos','ticket_line',                'pos', 'rows', 654, '{}', NULL),
-  ('pos','ticket_payment',             'pos', 'rows', 656, '{}', NULL)
+  ('pos','ticket_payment',             'pos', 'rows', 656, '{}', NULL),
+  ('pos','ticket_line_tracking',       'pos', 'rows', 658, '{}', NULL)
 ON CONFLICT DO NOTHING;
+-- ستون‌های راز (RV-IT2-11): همگرایی برای پایگاهی که ردیف را پیش‌تر بدون آن‌ها گرفته است
+UPDATE core.export_table_registry SET secret_columns = '{link_token_hash,card_hash}'
+ WHERE schema_name = 'treasury' AND table_name = 'gateway_payment' AND secret_columns <> '{link_token_hash,card_hash}';
+UPDATE core.export_table_registry SET secret_columns = '{enrollment_code_hash}'
+ WHERE schema_name = 'pos' AND table_name = 'edge_node' AND secret_columns <> '{enrollment_code_hash}';
 
 -- =====================================================================
 -- ۲۰. دسترسی‌ها (کمینه)
@@ -4516,7 +5324,7 @@ TO hk_app;
 -- تغییرپذیر بدون حذف
 GRANT SELECT, INSERT, UPDATE ON
   treasury.bank_account, treasury.cash_box, treasury.petty_cash_fund, treasury.card_terminal, treasury.gateway_account,
-  treasury.open_item, treasury.allocation, treasury.cheque_book, treasury.cheque_leaf, treasury.cheque, treasury.card_txn,
+  treasury.open_item, treasury.allocation, treasury.receivable_write_off, treasury.cheque_book, treasury.cheque_leaf, treasury.cheque, treasury.card_txn,
   treasury.gateway_payment, treasury.statement_import, treasury.recon_match, treasury.recon_match_item, treasury.bank_reconciliation,
   pos.terminal, pos.business_day, pos.shift, pos.cash_movement, pos.device_sync_state, pos.command_outcome, pos.offline_session,
   pos.sync_stream_version, pos.open_order, pos.ticket, pos.ticket_line, pos.ticket_payment
@@ -4525,20 +5333,31 @@ GRANT DELETE ON pos.stream_change TO hk_app;   -- فقط فشرده‌سازی �
 -- فقط‌افزودنی
 GRANT SELECT, INSERT ON
   treasury.cheque_event, treasury.cheque_sayad_inquiry, treasury.cheque_print_log, treasury.gateway_event, treasury.card_day_close,
-  pos.shift_count, pos.sync_batch, pos.device_command, pos.device_seq_gap, pos.client_id_alias, pos.stream_change, pos.stream_snapshot
+  pos.shift_count, pos.sync_batch, pos.device_command, pos.device_seq_gap, pos.client_id_alias, pos.stream_change, pos.stream_snapshot,
+  pos.ticket_line_tracking
 TO hk_app;
 
--- hk_readonly: همه به‌جز ستون راز اعتبارنامهٔ درگاه
+-- hk_readonly (و hk_reports که عضو آن است): همه به‌جز ستون‌های راز رجیستری صدور (R-GRANT؛ RV-IT2-11):
+-- gateway_account.credentials_sealed، gateway_payment.link_token_hash و card_hash، edge_node.enrollment_code_hash
 DO $$
-DECLARE r record; cols text;
+DECLARE r record; cols text; v_secret text[];
 BEGIN
-  FOR r IN SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname IN ('treasury','pos') AND c.relkind IN ('r','v') AND c.relname <> 'gateway_account' LOOP
-    EXECUTE format('GRANT SELECT ON %I.%I TO hk_readonly', r.nspname, r.relname);
+  FOR r IN SELECT n.nspname, c.relname, c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname IN ('treasury','pos') AND c.relkind IN ('r','v') LOOP
+    SELECT coalesce(x.secret_columns, '{}') INTO v_secret FROM core.export_table_registry x
+     WHERE x.schema_name = r.nspname AND x.table_name = r.relname;
+    IF coalesce(cardinality(v_secret), 0) = 0 THEN
+      EXECUTE format('GRANT SELECT ON %I.%I TO hk_readonly', r.nspname, r.relname);
+    ELSE
+      EXECUTE format('REVOKE SELECT ON %I.%I FROM hk_readonly', r.nspname, r.relname);
+      SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum) INTO cols FROM pg_attribute a
+       WHERE a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped;
+      EXECUTE format('REVOKE SELECT (%s) ON %I.%I FROM hk_readonly', cols, r.nspname, r.relname);
+      SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum) INTO cols FROM pg_attribute a
+       WHERE a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attname <> ALL (v_secret);
+      EXECUTE format('GRANT SELECT (%s) ON %I.%I TO hk_readonly', cols, r.nspname, r.relname);
+    END IF;
   END LOOP;
-  SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO cols FROM pg_attribute
-   WHERE attrelid = 'treasury.gateway_account'::regclass AND attnum > 0 AND NOT attisdropped AND attname <> 'credentials_sealed';
-  EXECUTE format('GRANT SELECT (%s) ON treasury.gateway_account TO hk_readonly', cols);
 END $$;
 GRANT SELECT ON treasury.v_open_item, treasury.v_cheque_due, treasury.v_party_cheque_exposure, treasury.v_card_clearing_aging,
                 pos.v_device_sync_health TO hk_app;

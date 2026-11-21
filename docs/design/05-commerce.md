@@ -87,6 +87,7 @@
   - **LIFO** ارائه نمی‌شود (IAS 2). شناسایی ویژه به تفکیک سریال برای کالای برقی گران v2 است (کلید استخر + `lot_valuated`).
 - **دلیل:** فروش آفلاین و ورود دیرهنگام رسید در کافه و فروشگاه واقعی است؛ موجودی منفی باید بدون ساختن عدد جعلی و با اصلاح شفاف حل شود.
 - **مرجع:** [۰۶ §۴-ج](../research/06-feature-benchmark.md#۴-ج-انبار-و-کالا)، [۰۶ §۷-۴](../research/06-feature-benchmark.md#۷-۴-pos-آفلاینمحور)
+- **وضعیت مؤثر بها (بازبینی یکپارچه، RV-COM-01):** وضعیت هر حرکت (`known`/`estimated`/`unknown`) از **آخرین ارزیابی خود حرکت** می‌آید و در جدول مشتق `inventory.move_cost_state` (فقط موتور) نگه داشته می‌شود، نه از «بدترین لایهٔ تاریخی». پس حرکتی که هنگام همگام‌سازی آفلاین «نامعلوم» ثبت شد و بعد با بازارزیابی معلوم شد، دیگر `last_unit_cost` استخر و وضعیت برگشت/ورود انتقال/خروجی تولیدِ وابسته را خراب نمی‌کند. بازپخش هر تغییر وضعیت را اصلاح می‌شمارد (`verify_pool_replay` ≠ ۰) و وابسته‌ها را کثیف می‌کند؛ `v_move_value.cost_status` همان وضعیت جاری است. آزمون تفاضلی T24 (میانگین و FIFO، با برگشت و انتقال): ترتیب تاریخی در برابر درج تصادفیِ سازگار با وابستگی + بازارزیابی ⇒ ارزش و وضعیت هر حرکت و استخرها برابر.
 
 ### D-C05 — ثبت پس‌تاریخ و بازارزیابی تکرارپذیر
 - **تصمیم:** ترتیب ارزیابی = `(move_date, posting_seq)`. حرکتی که نقطه‌اش پیش از `last_date/last_seq` استخر است، استخر را از آن نقطه کثیف می‌کند. `repost_pool(pool, run, gl_floor)`: قفل استخر ← آخرین نقطهٔ بازیابی پیش از نقطهٔ کثیف ← بازگرداندن وضعیت و صف FIFO ← بازپخش همهٔ حرکت‌های پس از آن با همان `valuate` ← برای هر حرکت «مشتقِ مورد انتظار − Σ مشتق موجود» را اگر ≠ ۰ با لایهٔ `repost` (تاریخ GL = `max(move_date, gl_floor)`) درج می‌کند ← وابسته‌ها در استخرهای دیگر (ورود انتقال، برگشت فروش، خروجی تولید، برگشت حرکت) کثیف می‌شوند ← استخر تمیز. job `inventory.repost` استخرهای کثیف را به ترتیب نقطه پردازش می‌کند؛ اگر تعداد حرکت‌های بعدی ≤ `inventory.repost.inline_limit` (پیش‌فرض ۲۰۰) باشد، همان تراکنش ثبت را اصلاح می‌کند.
@@ -94,17 +95,21 @@
 - **کف GL:** پایتون `gl_floor` را از `FiscalYearQuery` و قفل ماژول `inventory` و `finalized_through` می‌سازد: نخستین تاریخ باز. اصلاح دورهٔ بسته در اولین دورهٔ باز ثبت می‌شود و گزارش می‌شود.
 - **ردشده:** بازمحاسبهٔ کامل و بازنویسی ارزش‌ها (ERPNext Repost Item Valuation با به‌روزرسانی SLE): ممیزی‌پذیر نیست؛ ممنوعیت ثبت پس‌تاریخ: برای مهاجرت و فاکتور خرید دیرآمده غیرعملی است.
 - **مرجع:** [۰۶ §۷-۳](../research/06-feature-benchmark.md#۷-۳-انبار-و-ارزیابی)
+- **مبدأ بها تجمعی (RV-COM-05):** جمع |مقدار| حرکت‌های زنده‌ای که از یک حرکت مبدأ بها می‌گیرند (ورود انتقال، برگشت از فروش، برگشت از خرید) از مقدار مبدأ بیشتر نمی‌شود (`HK_INV_COST_SOURCE_EXHAUSTED`، زیر قفل مشورتی شناسهٔ مبدأ). مبدأ برگشت‌خورده مبدأ نیست و حرکتی که مبدأ وابستهٔ زنده دارد برنمی‌گردد (`HK_INV_REVERSAL_HAS_DEPENDENTS`).
+- **کارایی (RV-COM-19):** بررسی منفی‌نشدن پس‌تاریخ در انبار `block` فقط بازهٔ پس از نقطهٔ حرکت را می‌پیماید (کمینهٔ ماندهٔ جاری = ماندهٔ فعلی − بیشینهٔ «جمع حرکت‌های پس از هر نقطه»)؛ بررسی‌های افتتاحیه از نمایهٔ جزئی `stock_move_opening_idx` استفاده می‌کنند. سنجش: ۲۰۰ هزار حرکت تاریخچه، فروش آفلاین یک‌روز پس‌تاریخ ≈ ۵ میلی‌ثانیه (پیش از رفع ≈ ۱۱۰–۱۲۵).
 
 ### D-C06 — سیاست موجودی منفی برای هر انبار؛ صندوق آفلاین هرگز رد نمی‌شود
 - **تصمیم:** `warehouse.negative_policy ∈ {inherit, allow, allow_warn, block}`؛ `inherit` ← `company_policy.negative_stock_default`. در `block`، ماندهٔ جاری و (برای ثبت پس‌تاریخ) کمینهٔ ماندهٔ جاری از آن نقطه به بعد نباید منفی شود (`HK_INV_NEGATIVE_STOCK`). حرکت با `origin='offline_device'` هرگز رد نمی‌شود (کالا فیزیکی فروخته شده است) و `stock_exception` نوع `negative_stock` می‌سازد. انبار در راه همیشه `block` است و استثنای آفلاین ندارد. سریال ناموجود در فروش آفلاین هم پذیرفته و `serial_conflict` ثبت می‌شود.
 - **دلیل:** پاسخ پیشنهادی پژوهش برای کافه («موجودی منفی با هشدار») و واقعیت قطعی ۱۳۸روزه؛ رد کردن فرمان صندوق پس از همگام‌سازی، داده را از واقعیت جدا می‌کند.
 - **مرجع:** [README §۶ پرسش ۳](../research/README.md#۶-پرسشهای-باز-برای-صاحب-محصول-تصمیمهای-کسبوکاری)، [۰۶ §۷-۴](../research/06-feature-benchmark.md#۷-۴-pos-آفلاینمحور)
+- **پیوند استثنای آفلاین به دستگاه (RV-COM-20):** `stock_move.device_id` (FK `core.device`)؛ CHECK `stock_move_offline_device`: `origin='offline_device'` ⇔ دستگاه دارد و فقط با `source_module ∈ {pos, sales}`؛ دستگاه باید ثبت‌شدهٔ همان شرکت باشد (نه `pending`؛ `HK_INV_OFFLINE_DEVICE`). `sales.invoice_verify` حرکت آفلاین را فقط در فاکتور کانال `pos` همان دستگاه می‌پذیرد (`HK_SALES_OFFLINE_ORIGIN`).
 
 ### D-C07 — حالت دائمی یا ادواری برای هر شرکت، تاریخ‌دار؛ حسابداری ادواری تعریف‌شده
 - **تصمیم:** `company_policy.inventory_mode`؛ ردیف تازه فقط از تاریخی که هیچ حرکتی پس از آن نیست (`HK_INV_POLICY_RETROACTIVE`)، عملاً آغاز سال مالی. در **ادواری**: دفتر موجودی مقدار و ارزش «حافظه‌ای» را نگه می‌دارد (برای گزارش و بستن) ولی هیچ حرکتی GL نمی‌سازد (`asset_account_id = NULL`)؛ خرید به `purchase.purchases` (۸۰۱ هلو) و برگشت از خرید به `purchase.returns` می‌رود؛ فروش بهای تمام‌شده ندارد. **بستن ادواری** (`inventory.periodic_close`): بهای تمام‌شده = موجودی ابتدا + خرید − برگشت از خرید − موجودی پایان (مبنای پایان: ارزیابی موتور، انبارگردانی یا دستی). سند GL بستن در §۵-۵ آمده است.
 - **دلیل:** کدینگ هلو نشان می‌دهد بسیاری از کسب‌وکارهای کوچک ادواری‌اند و مهاجرت از هلو بدون آن ناممکن است.
 - **ردشده:** حالت برای هر دسته (Odoo): v2 همراه روش ارزیابی برای هر دسته.
 - **مرجع:** [۰۶ §۴-ج](../research/06-feature-benchmark.md#۴-ج-انبار-و-کالا)، [README §۲ بند ۱۲](../research/README.md#ب-هستهٔ-حسابداری-و-عملیات)
+- **بستن ادواری (بازبینی، RV-COM-07/08/09/17):** (۱) قالب GL: ماندهٔ ابتدا از **حساب موجودی هر سطر** (`periodic_close_line.asset_account_id`) به بهای تمام‌شده می‌رود (بد `inventory.cogs` / بس موجودی)، نه کلید هزینه‌ای `inventory.opening_stock` (حذف از این بخش)؛ تخفیف خرید ستون `purchase_discounts_value` و در CHECK بهای تمام‌شده است. (۲) حالت ادواری باید در کل دوره برقرار باشد (یک ردیف سیاست از آغاز تا پایان؛ `HK_INV_PERIODIC_MODE`) و دوره درون سال مالی (`HK_INV_PERIODIC_PERIOD`)؛ دو بستن ثبت‌شدهٔ هم‌پوشان ممنوع (EXCLUDE). (۳) سطرهای بستن پس از پیش‌نویس تغییرناپذیرند و در ثبت Σ سطرها = سرسند؛ سند GL باید از همین بستن باشد، حساب موجودی هر سطر را به ماندهٔ پایان ببرد و خالص `inventory.cogs` = `cogs_value` (تریگر deferred). (۴) ثبت آغاز: `basis='opening'` (بی‌سند GL، دورهٔ یک‌روزه، ابتدا = پایان) ماندهٔ افتتاحیهٔ GL را به زیردفتر ادواری می‌دهد تا پیش از نخستین بستن، تطبیق زیردفتر خالی نباشد.
 
 ### D-C08 — سریال و بچ در bundle جدا؛ ماشین حالت سریال؛ FEFO
 - **تصمیم:** سند (فاکتور، رسید، حواله، سند انبار) فقط `bundle_id` نگه می‌دارد. `tracking_bundle` (پیش‌نویس/ثبت‌شده) ورودی‌های سریال/بچ را دارد؛ ثبت آن جمع = مقدار سطر و «bundle خروجی سریال یا بچ تازه نمی‌سازد» را اجبار می‌کند. هنگام ثبت سند، سرویس برای هر بچ یک `stock_move` و برای هر سریال یک `serial_move` می‌سازد. سریال: `registered → in_stock (انبار) → out`؛ ورود فقط از `registered/out`، خروج فقط از `in_stock` در همان انبار. فروش، گارانتی (`warranty_days` کالا) و خریدار را روی سریال می‌نویسد. FEFO با `inventory.fefo_candidates` (بچ فعال، نامنقضی، به ترتیب انقضا) و سیاست فروش بچ منقضی (`inventory.expired_batch_sale`: هشدار یا مسدود).
@@ -130,19 +135,24 @@
 - **مرجع:** [۰۶ §۵-۱](../research/06-feature-benchmark.md#۵-۱-کافه-و-رستوران-مشتری-اول)، بخش ۰۴ D-M16
 
 ### D-C12 — افتتاحیهٔ انبار یک‌بار و نخستین؛ بهای نامعلوم «نامعلوم» است
-- **تصمیم:** یک حرکت `opening` برای هر (شرکت، انبار، SKU، بچ) (ایندکس یکتا)؛ افتتاحیه پیش از همهٔ حرکت‌های کلید است و هیچ حرکتی پیش از آن ثبت نمی‌شود. سند `opening` واحد مبلغ ورودی (`amount_unit`) را اجباری دارد. ورودی بدون بها `input_cost_status='unknown'` با ارزش ۰ و استثنای `unknown_cost` است؛ تعیین بها بعداً با `add_cost_adjustment(reason='cost_resolution')`. GL افتتاحیه از خود inventory با `journal_type='opening_import'` می‌آید و ledger ماندهٔ حساب کنترلی موجودی را در افتتاحیهٔ GL رد می‌کند.
+- **تصمیم:** یک حرکت `opening` **زنده** برای هر (شرکت، انبار، SKU، بچ) (قفل مشورتی کلید در `stock_move_before`؛ افتتاحیهٔ برگشت‌خورده دوباره قابل ورود است)؛ افتتاحیه پیش از همهٔ حرکت‌های کلید است و هیچ حرکتی پیش از آن ثبت نمی‌شود. سند `opening` واحد مبلغ ورودی (`amount_unit`) را اجباری دارد. ورودی بدون بها `input_cost_status='unknown'` با ارزش ۰ و استثنای `unknown_cost` است؛ تعیین بها بعداً با `add_cost_adjustment(reason='cost_resolution')`. افتتاحیهٔ موجودی مهاجرت بی‌GL است (`gl_effect='none'`، CR-MG01) و GL ماندهٔ حساب موجودی فقط از سند `opening_import` مهاجرت (بخش ۰۸، با منبع مجاز `migration` روی حساب کنترلی) می‌آید؛ افتتاحیهٔ دستی کاربر (غیرمهاجرت) سند موجودی خودش را با `gl_effect='post'` می‌زند (بد موجودی / بس `ledger.opening_balance_clearing`).
 - **دلیل:** تلهٔ سپیدار (تکرار ماندهٔ انبار در افتتاحیهٔ سال بعد)، تلهٔ هلو (ریال از ۱۰۶ و مقدار از `First_exist`؛ هر دو به GL نروند) و قاعدهٔ «بهای نامعلوم نامعلوم است، نه صفر».
 - **مرجع:** [۰۱ §۳.۲](../research/01-migration-popular-apps.md#۳۲-سپیدار-sepidar-system-نصبی)، [۰۱ §۳.۱](../research/01-migration-popular-apps.md#۳۱-هلو-holoo-شرکت-مهندسی-نرمافزار-هلو--گروه-طرفهنگار)، [README §۳-۱](../research/README.md#۳-۱-قرارداد-صحت-انتقال-غیرقابل-مذاکره)
+- **بازبینی (CR-MG01، CR-MG15، RV-COM-11، RV-COM-25):** افتتاحیهٔ موجودی مهاجرت **بی‌GL** است (`gl_effect='none'` ← `stock_doc.gl_status='not_required'`، `origin='migration'`)؛ GL ماندهٔ موجودی فقط از سند `opening_import` مهاجرت (بخش ۰۸) می‌آید و inventory خودش سند افتتاحیه نمی‌زند (جملهٔ پیشین «GL افتتاحیه از خود inventory» منسوخ است). کلید idempotency = lineage در `migration.id_map` (نه `run_id`). یکتایی افتتاحیه «یک افتتاحیهٔ **زنده** برای هر کلید» است (زیر قفل مشورتی در `stock_move_before`؛ `HK_INV_OPENING_DUPLICATE`)؛ پس `cancel_opening` (برگشت حرکت) و ورود دوبارهٔ افتتاحیهٔ درست ممکن است (بازگشت و اجرای دوبارهٔ مهاجرت).
 
 ### D-C13 — ادغام GL فقط با `PostingRequest`؛ حساب موجودی روی حرکت ثبت می‌شود
 - **تصمیم:** هر سند در همان تراکنش یک `PostingRequest` با `source_module/source_doc_type/source_doc_id` می‌فرستد. حساب‌ها با کلید نگاشت و ویژگی‌ها (`attr:item_posting_group`، `attr:item_type`، `attr:item_category` از catalog؛ `attr:customer_group`/`attr:supplier_group` از parties؛ `attr:warehouse` و `attr:warehouse_kind` و `attr:reason` از inventory) حل می‌شوند. inventory حساب موجودی حل‌شده را پیش از درج روی `stock_move.asset_account_id` می‌نویسد و سطر GL موجودی را با همان `account_id` می‌فرستد؛ پس زیردفتر (`inventory.ledger_subledger_stock`) بر حسب همان حساب‌ها با GL مقایسه‌پذیر است. تریگرهای deferred بررسی می‌کنند سند GL واقعاً از همان سند آمده است (`HK_COMMERCE_GL_LINK`، از ویوی منتشرشدهٔ `ledger.v_journal_line`).
-- **کلیدهای تازه:** `purchase.grni`، `purchase.price_difference`، `purchase.purchases`، `purchase.returns`، `purchase.discount`، `purchase.landed_cost_clearing`، `inventory.waste`، `inventory.internal_consumption`، `inventory.opening_stock`، `sales.commission_expense`، `sales.commission_payable` (در SQL ثبت شده‌اند).
+- **کلیدهای تازه:** `purchase.grni`، `purchase.price_difference`، `purchase.purchases`، `purchase.returns`، `purchase.discount`، `purchase.landed_cost_clearing`، `inventory.waste`، `inventory.internal_consumption`، `sales.commission_expense`، `sales.commission_payable` (در SQL ثبت شده‌اند؛ `inventory.opening_stock` در بازبینی RV-COM-09 حذف شد).
 - **مرجع:** بخش ۰۳ D-L13/D-L14/D-L15
+- **دو سند در یک تراکنش (بازبینی، RV-IT2-01؛ گزینهٔ الف):** حساب کنترلی موجودی (`1401`، `subledger_only` با `{inventory, migration}`) فقط از ماژول inventory سند می‌پذیرد. پس هر سند تجاری دو `PostingRequest` در همان UoW می‌فرستد: **سند تجاری** (`source_module` = sales/purchase: دریافتنی/پرداختنی، درآمد، تخفیف، مالیات، GRNI) و **سند موجودی** (`source_module='inventory'`، `source_doc_type/id` = همان سند، `source_event='post'`: موجودی در برابر کلید طرف مقابل هر حرکت). شناسهٔ سند موجودی روی `sales.invoice.stock_journal_id`، `purchase.invoice.stock_journal_id` و `sales.gl_batch.stock_journal_id` می‌نشیند؛ رسید، حواله و سند انبار فقط سند موجودی دارند (`gl_journal_id` از inventory). خرید مستقیم: سند موجودی بد موجودی / بس GRNI و سند خرید بد GRNI و مالیات / بس پرداختنی (GRNI واسط دو سند است).
+- **حساب و کلید روی هر حرکت دائمی (RV-COM-17):** در حالت دائمی `asset_account_id` الزامی است (`HK_INV_ASSET_ACCOUNT_REQUIRED`) و `contra_posting_key` اگر خالی باشد از نوع حرکت پر می‌شود (`inventory.default_contra_key`)؛ در حالت ادواری هر دو خالی‌اند (`HK_INV_PERIODIC_NO_GL`). سطرهای GL موجودی همیشه به ارز پایه‌اند (حساب `1401` `base_only` است) و زیردفتر هم ارز پایه گزارش می‌کند.
+- **مبالغ به تفکیک کلید (RV-IT2-09):** تریگر deferred سند تجاری را با `journal_line.posting_key` می‌سنجد: فروش ← `sales.receivable` = `total_base`، `sales.revenue` (یا `sales.returns`) = Σ ناخالص کالا، `sales.service_charge` = Σ ناخالص حق سرویس، `sales.installment_unearned` = Σ خالص اضافه‌بهای اقساط، `sales.discount` = Σ تخفیف، `tax.vat_payable`/`tax.other_tax_payable`/`tax.levy_payable`؛ اصلاحی فقط تفاوت؛ خرید ← `purchase.payable` = کل و `tax.vat_receivable` = مالیات سطرها + هزینه‌ها. سند موجودی برای هر حساب موجودی = Σ ارزش لایه‌های `move`/تسویهٔ حرکت‌های سند (`HK_COMMERCE_GL_AMOUNT`/`HK_COMMERCE_STOCK_GL_MISSING`). سند ریالی دقیق؛ سند ارزی یک واحد خرد پایه رواداری برای هر کلید.
 
 ### D-C14 — مدل سند فروش: سفارش، حواله، فاکتور سه‌نوعه؛ مسیر پیشخوان
 - **تصمیم:** `sales.order` با `kind ∈ {quotation, order}`؛ `sales.delivery` (خروج یا رسید مرجوعی)؛ `sales.invoice` با `doc_kind ∈ {invoice, return, correction}`. `stock_mode`: `immediate` (فروش پیشخوان: ثبت فاکتور کالا را هم خارج می‌کند)، `via_delivery` (کالا با حواله)، `none` (خدمت/اصلاحی). سند ثبت‌شده تغییرناپذیر است؛ ابطال = برگشت همهٔ حرکت‌ها + سند GL ابطال. شمارهٔ بی‌فاصله در لحظهٔ ثبت از core (`doc_type = sales.<doc_kind>`).
 - **دلیل:** هلو و سپیدار فاکتور، برگشت و پیش‌فاکتور را با نوع از هم جدا می‌کنند؛ یک جدول با نوع، زنجیرهٔ مرجع (اصلی ← برگشت/اصلاحی) را ساده و قابل FK می‌کند.
 - **مرجع:** [۰۶ §۴-ب](../research/06-feature-benchmark.md#۴-ب-چرخهٔ-فروش-و-خرید)
+- **بازبینی (RV-COM-02/04/22):** `stock_mode='none'` برای سطر کالای انباری فقط در اصلاحی و تاریخچهٔ مهاجرت (`HK_SALES_STOCK_MODE`/`HK_PUR_STOCK_MODE`). حرکت هر سطر باید همان SKU، انبار، شرکت و نوع را داشته باشد و هیچ حرکت بی‌سطری نباشد (`inventory.assert_doc_moves`). **مسیر حواله:** بهای تمام‌شده هنگام **تحویل** شناسایی می‌شود (سند موجودی حواله: بد `inventory.cogs` / بس موجودی؛ در دائمی الزامی، در ادواری بی‌سند)؛ فاکتورِ از حواله سطر کالایش را به سطر حوالهٔ ثبت‌شدهٔ همان مشتری می‌بندد و هر سطر حواله حداکثر یک بار صورتحساب می‌شود (`HK_SALES_DELIVERY_LINK`)؛ حساب «تحویل‌شدهٔ صورتحساب‌نشده» در v1 نیست. **ابطال** هر سند ثبت‌شده با GL: حرکت‌ها برگردند، سند ابطال از همین سند باشد و اسناد اصل (تجاری و موجودی) برگشت خورده باشند (`HK_COMMERCE_GL_NOT_REVERSED`)؛ CHECK «ابطال سند GL‌دار ⇒ `cancel_journal_id`» روی رسید، حواله، سند انبار و فاکتورها.
 
 ### D-C15 — حساب سطر = فرمول مؤدیان در CHECK؛ نرخ از ماژول مالیات؛ بدون نرخ در بازرگانی
 - **تصمیم:** ستون‌های سطر عین فیلدهای `body` مؤدیان‌اند (`qty=am`، `unit_price=fee`، `gross=prdis`، `discount=dis`، `net=adis`، `vat_rate=vra`، `vat=vam`، `other_tax=odam`، `other_levy=olam`، `line_total=tsstam`). CHECKها: `gross = trunc(qty × unit_price, minor)`، `net = gross − dis`، `vam = sales.tax_part(net, vra, tax_rounding, minor)`، `tsstam = adis + vam + odam + olam`. `tax_rounding` (پیش‌فرض `truncate`) و نسخهٔ قاعده‌ها (`tax_snapshot`) از `TaxCalculator` snapshot می‌شوند؛ اگر قاعده عوض شود، CHECK با مقدار snapshot همان سطر می‌خواند. فیلدهای ویژهٔ الگو (طلا، ارز، پیمانکاری) در `moadian_extra` و اعتبارسنجی‌شان با ماژول مالیات و نسخهٔ دستورالعمل است.
@@ -155,10 +165,14 @@
   - **برگشت (`ins=4`):** همان SKU و واحد؛ قیمت واحد و نرخ = نسخهٔ جاری سطر (پس از آخرین اصلاحی)؛ Σ برگشت ≤ مقدار فروش (قفل ردیف سطر اصلی)؛ همان مشتری و ارز؛ تاریخ ≥ فاکتور. بها در انبار = بهای خروج اصلی (`sale_return` با `source`). اگر همهٔ اقلام برگشت بخورند، ماژول مالیات به‌جای `ins=4` ابطالی (`ins=3`) می‌فرستد.
   - **اصلاحی (`ins=2`):** `supersedes_invoice_id` = آخرین نسخهٔ ثبت‌شده (ایندکس یکتای «یک اصلاحی ثبت‌شده برای هر نسخه»)؛ خریدار، نوع، الگو، SKU و نرخ ثابت؛ مقدار کالای انباری فقط با برگشت تغییر می‌کند؛ اصلاحی کالا جابه‌جا نمی‌کند (`stock_mode='none'`). GL اصلاحی = تفاوت با نسخهٔ قبل.
 - **مرجع:** [۰۳ §۲-۵](../research/03-iran-tax-and-legal.md#۲-۵-ساختار-صورتحساب-الگوها-موضوعات-و-قواعد-کلیدی-s2)، [۰۳ §۳-۳](../research/03-iran-tax-and-legal.md#۳-۳-جریانهای-کاربری-کلیدی)
+- **تخفیف برگشت (RV-X2-03):** تخفیف سطر برگشت = سهم نسبی تخفیف سطر جاری فروش: با Q = مقدار فروش، D = تخفیف سطری (و جداگانه سهم تخفیف فاکتوری)، و Qp = برگشت‌های ثبت‌شدهٔ پیشین، تخفیف این برگشت = f(Qp + q) − f(Qp) که f(x) = D اگر x = Q وگرنه `trunc(D × x / Q, minor)` (باقیمانده با آخرین برگشت). پس Σ خالص برگشت‌ها هرگز از خالص فروش و Σ مالیات برگشت از مالیات فروش بیشتر نمی‌شود (`HK_SALES_RETURN_DISCOUNT`). برگشت به بهای خروج اصلی: حرکت `sale_return` با `valuation_rule='source'` و مبدأ = حرکت خروج زندهٔ همان سطر (یا `input` فقط اگر فروش اصلی حرکتی نداشت؛ `HK_SALES_RETURN_COST`)؛ `pool_in` برای برگشت از فروش مجاز نیست. برگشت از خرید هم فقط به بهای رسید (`HK_PUR_RETURN_COST`).
+- **هویت خریدار و شناسهٔ کالا (RV-COM-14):** اصلاحی تصویر هویتی ارسالی خریدار (`buyer_person_type`، کد اقتصادی، شناسهٔ ملی، کد پستی، کد شعبه، گذرنامه) و `sstid`/واحد مؤدیان هر سطر را مثل نسخهٔ قبل نگه می‌دارد؛ برگشت هم `sstid` و واحد سطر فروش را. شخص ادغام‌شده: برگشت/اصلاحی سند شخص بازنده با جانشین او ثبت می‌شود (همان شخص حقوقی).
 
 ### D-C17 — موتور قیمت و تخفیف قطعی، قابل اجرا آفلاین
 - **تصمیم:** قیمت پایه: فهرست‌های قابل اعمال از `PriceQuery.applicable_lists` (شخص > گروه > شعبه > شرکت؛ کانال) و `catalog.resolve_price`. قاعده‌ها (`sales.pricing_rule`): هر نوع با شکل CHECK‌شده؛ فیلترها (کالا، variant، دسته، برند، گروه ثبت، شخص، گروه شخص، شعبه، کانال، فهرست، بازه، روز هفته، ساعت، کمینهٔ مقدار/مبلغ). **تقدم:** (۱) `priority` کوچک‌تر، (۲) امتیاز اختصاص (variant=6، کالا=5، دسته=4، برند/گروه ثبت=3، شخص=+3، گروه شخص=+2، شعبه/کانال=+1)، (۳) `id` (UUIDv7 = ترتیب ساخت). در هر `stack_group` فقط برنده؛ `exclusive` بقیهٔ همان سطح را می‌بندد؛ سطری‌ها جمعی روی ناخالص سطر و محدود به ناخالص؛ فاکتوری‌ها روی خالص پس از سطری. قاعدهٔ استفاده‌شده تغییرناپذیر است (نسخهٔ تازه). تسهیم تخفیف فاکتور به سطرها: نسبتی با «بیشترین باقیمانده» و شکست تساوی با `line_no`؛ سطر بدون اجازهٔ تخفیف وزن صفر دارد. همان موتور در `frontend/packages/pricing` با بردار مشترک `testdata/pricing` (INV-FE-05 بخش ۰۱).
 - **مرجع:** [۰۶ §۴-ب](../research/06-feature-benchmark.md#۴-ب-چرخهٔ-فروش-و-خرید)، [۰۶ §۵-۵](../research/06-feature-benchmark.md#۵-۵-سوپرمارکت)، بخش ۰۴ D-M17
+- **جدول یکتای specificity (RV-COM-27؛ هنجاری برای پایتون و TypeScript و `testdata/pricing`):** variant = ۶، کالا = ۵، دسته = ۴، برند = ۳، گروه ثبت = ۳؛ و افزوده‌ها: شخص +۳، گروه شخص +۲، شعبه +۱، کانال +۱، فهرست قیمت +۱. §۵-۸ به همین جدول ارجاع می‌دهد.
+- **دامنهٔ کد قاعده (RV-COM-21):** کد و نسخه برای هر (شرکت یا سطح مستأجر) یکتاست و «یک نسخهٔ فعال در هر بازه» هم برای هر شرکت؛ بستهٔ صنفی در هر شرکت جدا نصب می‌شود.
 
 ### D-C18 — کنترل اعتبار با ثبت فقط‌افزودنی و استثنای تأییدشده
 - **تصمیم:** مواجهه = ماندهٔ دریافتنی شخص (ledger، بُعد party روی حساب‌های دریافتنی) + سفارش‌های تأییدشدهٔ فاکتورنشده + چک‌های وصول‌نشده (`treasury.v_party_cheque_exposure`، اگر `credit_includes_uncleared_cheques`) + مبلغ همین سند. سیاست از `party_role` (none/warn/block). نتیجه در `sales.credit_check` با CHECKهای سازگاری؛ `block` فقط با مجوز `sales.credit.override` و درخواست تأیید core به `overridden` می‌رسد.
@@ -170,6 +184,7 @@
 
 ### D-C20 — دستهٔ GL برای صندوق
 - **تصمیم:** فاکتور صندوق می‌تواند `gl_mode='batched'` با `gl_batch_id` باشد: فاکتور قانونی (شماره، مؤدیان، حرکت انبار) فوراً ثبت می‌شود ولی GL یک سند تجمیعی برای هر شیفت است (`sales.gl_batch`). پیوستن فاکتور فقط به دستهٔ باز. پاسخ به C-L16 (رقابت روی شمارندهٔ عطف).
+- **همروندی (RV-COM-15):** راستی‌آزمایی فاکتور دسته‌ای دسته را `FOR SHARE` می‌خواند (با UPDATE ثبت دسته تعارض دارد و وضعیت متعهدشده را دوباره می‌خواند)؛ `GlBatchService.post` دسته را `FOR UPDATE` قفل و سپس جمع می‌کند؛ تریگر deferred ثبت دسته سند فروش دسته را با Σ مبالغ فاکتورهای عضو ثبت‌شده و سند موجودی را با ارزش حرکت‌هایشان می‌سنجد. فاکتورِ دستهٔ هنوز باز با ابطال فقط از دسته بیرون می‌ماند؛ ابطال فاکتورِ دستهٔ ثبت‌شده سند برگشت فروش خودش (`cancel_journal_id` = قرینهٔ مبالغ) و سند موجودی برگشت‌ها (`cancel_stock_journal_id`) را می‌خواهد (`HK_SALES_BATCH_CANCEL_GL`). آزمون T94 با دو نشست واقعی (dblink).
 
 ### D-C21 — خرید: GRNI، تفاوت قیمت، هزینهٔ جانبی، تکرار فاکتور
 - **تصمیم:**
@@ -179,6 +194,8 @@
   - هزینهٔ جانبی سرمایه‌ای کاملاً و فقط روی سطرهای همان فاکتور یا رسیدهایش تسهیم می‌شود (ارزش، مقدار، وزن، حجم، دستی). سند هزینهٔ جانبی مستقل (فاکتور دیگری روی رسیدهای قبلی) v2 است و مدلش آماده است.
   - یک فاکتور فعال برای هر (شرکت، تأمین‌کننده، شمارهٔ فاکتور او) و هر taxid.
 - **مرجع:** [۰۶ §۴-ب](../research/06-feature-benchmark.md#۴-ب-چرخهٔ-فروش-و-خرید)، [README §۵](../research/README.md#۵-دامنهٔ-پیشنهادی-نسخهها)
+- **پیوند فاکتور به رسید (RV-COM-06):** سطر فاکتور با `receipt_line_id` فقط رسید **ثبت‌شدهٔ** همان شرکت، تأمین‌کننده (یا جانشین ادغام)، ارز و SKU را صورتحساب می‌کند؛ قفل سطر رسید و Σ صورتحساب‌شده منهای برگشت‌ها ≤ دریافت‌شده (`HK_PUR_RECEIPT_OVERBILLED`)؛ فاکتور `via_receipt` هر سطر انباری را به رسید می‌بندد. خرید مستقیم: ارزش حرکت ورود = خالص سطر به ارز پایه + هزینه‌های سرمایه‌ای تسهیم‌شده به همان سطر (`HK_PUR_STOCK_VALUE`). رسید: ارزش حرکت = `value_base` سطر.
+- **ثبت مالیات خرید (CR-CMP-04، RV-COM-13):** `PurchaseInvoiceService.post/cancel` در همان UoW `tax.TaxRegisterService.record_purchase` را صدا می‌زند و `MoadianInboxService.match/ignore` تابع `update_moadian_match` را؛ ماژول مالیات جدول‌های خرید را نمی‌خواند.
 
 ### D-C22 — صندوق ورودی صورتحساب‌های خرید کارپوشه
 - **تصمیم:** فایل Excel کارپوشه (API خرید وجود ندارد) در `purchase.moadian_inbox_batch` (پیوست core، sha256 یکتا، `amount_unit` صریح، نسخهٔ قالب) پردازش و هر صورتحساب یک ردیف یکتا بر اساس taxid در `moadian_inbox_invoice` است؛ بارگذاری دوباره فقط وضعیت پورتال و واکنش خریدار را به‌روز می‌کند. تطبیق با فاکتور خرید (همان تأمین‌کننده و taxid سازگار؛ یک ردیف برای هر فاکتور) مبنای اعتبار مالیاتی خرید در ماژول مالیات است.
@@ -194,9 +211,25 @@
 ### D-C25 — پیوند سند با شماره، GL و انبار در تریگرهای deferred
 - **تصمیم:** هنگام ثبت (در commit): شماره برای همین سند و نوع صادر شده باشد (`core.number_issued`)، سند GL از همین سند آمده باشد (`ledger.v_journal_line`)، و هر سطر کالای انباری با تحویل فوری دقیقاً به اندازهٔ مقدار حرکت داشته باشد. ابطال: هر حرکت برگشت خورده باشد و سند GL ابطال به سند اشاره کند.
 - **دلیل:** «درستی ساختاری»: باگ سرویس نمی‌تواند فاکتوری بدون حرکت انبار، با سند GL دیگران یا با شمارهٔ سند دیگر commit کند.
+- **بازبینی:** سند انبار هم راستی‌آزمایی deferred دارد (`inventory.stock_doc_verify`، RV-COM-03): شمارهٔ `inventory.<doc_type>` همین سند، سند(های) GL موجودی همین سند با مبلغ حرکت‌ها، و برای هر سطر حرکت‌های زندهٔ همان SKU/انبار/نوع به اندازهٔ مقدار (انتقال دومرحله‌ای: ارسال = خروج مبدأ + ورود در راه؛ دریافت = خروج در راه + ورود مقصد به اندازهٔ دریافت‌شده؛ ورود انتقال فقط از خروج همان سطر). رویداد کهنهٔ همان سند در یک تراکنش نادیده گرفته می‌شود و رویداد پایانی وضعیت نهایی را می‌سنجد. انبارگردانی هم هنگام ثبت شمارهٔ `inventory.count` همین جلسه را می‌خواهد.
 
 ### D-C26 — مشتق‌ها قابل راستی‌آزمایی و بازسازی‌اند
 - **تصمیم:** `inventory.verify_derived` (استخر = Σ حرکت؛ ارزش استخر تمیز = Σ لایه؛ موجودی = Σ حرکت؛ وضعیت سریال = آخرین حرکت) شبانه در `inventory.integrity.run`. `inventory.rebuild_derived` قلاب درون‌ریزی `.hkx` است: موجودی را بازمی‌سازد، هر استخر را از ابتدا بازپخش می‌کند و اگر بازپخش با لایه‌های واردشده نخواند (`HK_INV_REBUILD_MISMATCH`) درون‌ریزی رد می‌شود.
+- **صدور با بازارزیابی در صف (RV-COM-18):** `rebuild_derived` استخری را که هنگام صدور کثیف بوده (`dirty_from_*` واردشده) کامل بازپخش می‌کند ولی فقط اصلاح‌های **پیش از نقطهٔ کثیف** (لایه یا تغییر وضعیت) را ناسازگاری می‌شمارد؛ اصلاح‌های پس از آن همان کار معوق job‌اند که در run «integrity» انجام می‌شوند و سرویس قلاب، GL لایه‌های آن run را مثل `ValuationService.repost` ثبت می‌کند. `move_cost_state` هم صادر و در بازپخش بازتولید می‌شود.
+
+### D-C27 — فاکتور صندوق: شمارهٔ رسید دستگاه، برگشت و تعویض (RV-IT2-06، RV-X2-04)
+- **تصمیم:** فاکتور `channel='pos'` با `number_source='device'` همان شمارهٔ رسید صندوق را دارد: `number_issued` با `doc_type='pos.ticket'`، `doc_id` = `sales.invoice.pos_ticket_id` (ارجاع نرم به `pos.ticket`؛ جهت DAG) و `device_id` = دستگاه فاکتور (CHECK `invoice_device_number`؛ `HK_COMMERCE_NUMBER_LINK`). یکتایی `number_issued_id` در هر دو جدول مانع دو فاکتور برای یک رسید است؛ `pos` (L6) سازگاری `pos.ticket.sales_doc_id`/`number_issued_id` را از سمت خود می‌سنجد. `PosTicketIn` شماره (`number_issued_id`، `ticket_no`) و شناسهٔ هر سطر رسید را دارد؛ هر سطر فاکتور `pos_ticket_line_id` (یکتا) را نگه می‌دارد.
+- **برگشت صندوق:** `post_from_pos(kind='return')` سطر فروش اصلی را با `sales.invoice_line.pos_ticket_line_id` = `pos.ticket_line.original_line_id` می‌یابد و فاکتور برگشت (`ins=4`) به فاکتور اصلی همان رسید می‌سازد. هر سطر رسید حداکثر یک سطر فاکتور دارد (نمایهٔ یکتای `invoice_line_pos_line_uq`) و `pos_ticket_line_id` فقط در فاکتور `channel='pos'` مجاز است (`HK_SALES_POS_LINE`؛ T46).
+- **تعویض:** دستگاه تعویض را **دو رسید پیوسته** (برگشت + فروش، با `exchange_ref` مشترک) صادر می‌کند؛ هر رسید یک شماره، یک فاکتور و یک سند مؤدیان (`ins=4` و `ins=1`) دارد و treasury خالص دو طرف را تسویه می‌کند. سند واحدِ مختلط برگشت و فروش در `sales.invoice` ممکن نیست (درخواست به ۰۶ و ۰۷ در §۱۳).
+
+### D-C28 — حق سرویس رستوران (CR-T07، RV-COM-23)
+- **تصمیم:** حق سرویس سطر فاکتور با `line_kind='service_charge'` روی کالای غیرانباری خدمت (کالای «حق سرویس» بستهٔ کافه) است؛ همان فرمول مؤدیان (شناسهٔ خدمت، مالیات طبق ماشین‌حساب مالیات) و درآمدش در کلید `sales.service_charge` (درآمد؛ ir.general ← `6105`). `pos.ticket.service_charge` در `post_from_pos` به همین سطر نگاشت می‌شود.
+
+### D-C29 — جدول اقساط و فروش اقساطی پایه (RV-X3-03، RV-X3-04)
+- **تصمیم:** `sales.invoice_installment` (شمارهٔ قسط، سررسید، مبلغ، سهم اضافه‌بها، چک اختیاری). سرویس آن را از `parties.payment_term_line` (درصد، مبنای سررسید `document_date`/پایان ماه جلالی/میلادی، روز؛ مبالغ `trunc` به رقم ارز و باقیمانده در قسط آخر) یا از طرح اقساط دستی (تعداد، فاصله، پیش‌پرداخت به‌عنوان قسط ۱) می‌سازد. در ثبت: Σ اقساط = کل فاکتور، سررسیدها از تاریخ فاکتور و غیرنزولی، تسویه نقدی نیست و Σ سهم اضافه‌بها = Σ خالص سطرهای `line_kind='installment_markup'` (`HK_SALES_INSTALLMENTS`). treasury برای هر قسط یک قلم باز با `source_line_key='inst:<seq>'` و سررسید همان قسط ثبت می‌کند (سالمندی و پیگیری قسط معوق از همان اقلام). اضافه‌بهای اقساط (نرخ یا مبلغ از تنظیم مستأجر، نه پارامتر قانونی) در ثبت به `sales.installment_unearned` (بدهی) می‌رود و job سررسید هر قسط سهم آن را به `sales.installment_income` منتقل می‌کند (`source_doc_type='sales.installment'`، `source_event='recognize:<seq>'`). مبنای مالیات اضافه‌بها پارامتر قواعد مالیات است (درخواست به ۰۷). برگشت/اصلاحی اقساط را از آخر کاهش می‌دهد. تخفیف نقدی زودهنگام شرایط پرداخت در تخصیص treasury با کلید `sales.discount` اعمال می‌شود.
+
+### D-C30 — قیمت شامل مالیات و گرد کردن نقدی (RV-X1-11، RV-COM-16)
+- **تصمیم (قرارداد یکتای sales برای pos و مالیات):** بدنهٔ مؤدیان همیشه بدون مالیات و ریالی است. برای قیمت شامل مالیات P (به ازای واحد، نرخ r): `fee = floor(P × 100 / (100 + r))` (ریال صحیح)؛ سپس `prdis = am × fee`، `vam = trunc(adis × r / 100)` طبق CHECK؛ اگر `tsstam` سطرها با مبلغ پرداختی مشتری فرق کند، تفاوت **تخفیف فاکتوری `rounding`** (ردپای `source='rounding'`، تسهیم مثل تخفیف فاکتور) است اگر مبلغ پرداختی کمتر باشد، و اگر بیشتر باشد در دریافت صندوق به کلید `treasury.cash_over_short` می‌رود؛ هیچ حساب «گرد کردن» دیگری نیست. `pos.ticket.rounding_adjustment` به همین تخفیف نگاشت می‌شود و یک تنظیم واحد `sales.cash_rounding.increment` جای `pos.cash_rounding_increment` را می‌گیرد (درخواست به ۰۶). بردارهای ناممکن (قیمت گرد که هیچ fee صحیحی tsstam برابر آن نمی‌سازد، مثل ۱٬۲۰۰٬۰۰۰ با ۱۰٪) در `testdata/pricing` و `pos_totals` مشترک‌اند. فاکتور مؤدیان v1 فقط ریالی است (`HK_SALES_MOADIAN_CURRENCY`)؛ `currency_minor` snapshot برابر `ref.currency.minor_unit` (`HK_COMMERCE_CURRENCY_MINOR`) و `unit_price` با دقت ارز (`HK_SALES_UNIT_PRICE_MINOR`). بدنهٔ ریالی فاکتور ارزی در v2.
 
 ## ۴. مدل داده
 
@@ -298,6 +331,8 @@ erDiagram
 | `stock_balance` | موجودی جاری برای (شرکت، انبار، SKU، بچ)؛ مشتق، فقط موتور |
 | `repost_run` | اجرای بازارزیابی: `trigger_reason ∈ {backdated, cost_adjustment, cascade, manual, integrity}`، `status ∈ {running, completed, failed}`، `gl_floor_date`، شمارنده‌ها (`pools_processed`، `moves_scanned`، `layers_added`، `total_delta`، `journal_count`) |
 | `stock_exception` | `kind ∈ {negative_stock, serial_conflict, expired_batch, unknown_cost}`؛ `status: open → acknowledged → resolved` (فقط رو به جلو؛ حل با یادداشت و زمان) |
+| `move_cost_state` | وضعیت بهای **جاری** هر حرکت (`known`/`estimated`/`unknown`)؛ مشتق، فقط موتور (اولیه درج، بازپخش بازنویسی)؛ مبنای وضعیت مبدأ در ارزیابی وابسته‌ها و `v_move_value` (RV-COM-01) |
+| (ستون‌های تازهٔ `stock_move`) | `device_id` (فروش آفلاین؛ CHECK `stock_move_offline_device`)؛ `asset_account_id` الزامی در حالت دائمی؛ بدون یکتایی ایستای افتتاحیه (قفل مشورتی) |
 
 ### ۴-۴. انبار: شمارش و بستن ادواری
 
@@ -308,6 +343,7 @@ erDiagram
 | `count_entry` | فقط‌افزودنی: `round_no`، `qty`/`qty_base`، `counted_by`، `device_id`. دور ۲ با شخص دیگر؛ فقط در `counting` |
 | `periodic_close` | `basis ∈ {valuation, count, manual}`، `status ∈ {draft, posted, reversed}`، `opening_value`، `purchases_value`، `purchase_returns_value`، `closing_value`، `cogs_value`؛ CHECK: `cogs = opening + purchases − returns − closing`؛ فقط در حالت ادواری |
 | `periodic_close_line` | تفکیک ابتدا و پایان بر حسب حساب موجودی و گروه ثبت (برای سطرهای GL) |
+| (بازبینی بستن ادواری) | `purchase_discounts_value` در CHECK بهای تمام‌شده؛ `basis='opening'` (ثبت آغاز، بی‌سند)؛ EXCLUDE هم‌پوشانی بستن‌های ثبت‌شده؛ سطرها پس از پیش‌نویس تغییرناپذیر؛ تریگر deferred `periodic_close_verify` |
 
 ### ۴-۵. فروش (`sales`)
 
@@ -322,6 +358,8 @@ erDiagram
 | **`invoice_line`** | ستون‌های مؤدیان: `qty`، `unit_price`، `gross_amount`، `line_discount_amount`، `invoice_discount_alloc`، `discount_amount`، `net_amount`، `tax_rounding` (snapshot)، `vat_rate`، `vat_amount`، `other_tax_code/rate/amount`، `other_levy_code/rate/amount`، `line_total`؛ `tax_category_code`، `sstid`، `moadian_unit_code`، `item_title`؛ `price_source ∈ {price_list, manual, rule, contract, migration}`، `price_list_id`، `price_entry_id`؛ `original_line_id`، `order_line_id`، `delivery_line_id`؛ `warehouse_id`، `bundle_id`، `bom_id`؛ ابعاد مرکز هزینه و پروژه؛ فروشنده؛ `moadian_extra`. CHECKهای فرمول در §D-C15 |
 | `invoice_line_discount` | ردپای تخفیف: `seq`، `source ∈ {manual, rule, invoice, rounding, coupon}`، `pricing_rule_id`، `basis ∈ {percent, amount, price_override, free_item}`، `percent`، `amount`. Σ سطری = `line_discount_amount`، Σ فاکتوری = `invoice_discount_alloc` |
 | `invoice_salesperson` | سهم فروشندگان (Σ = ۱۰۰) |
+| `invoice_installment` | جدول اقساط فاکتور: `seq`، `due_date`، `amount`، `markup_amount`، `cheque_ref` (نرم)؛ فقط در پیش‌نویس؛ Σ = کل فاکتور (D-C29) |
+| (ستون‌های تازهٔ `invoice`/`invoice_line`/`gl_batch`) | `invoice.stock_journal_id`، `cancel_stock_journal_id`، `pos_ticket_id`؛ `invoice_line.line_kind ∈ {goods, service_charge, installment_markup}`، `pos_ticket_line_id` (یکتا)؛ `gl_batch.stock_journal_id` |
 | `credit_check` | فقط‌افزودنی: `doc_type ∈ {sales.order, sales.invoice}`، `policy`، `credit_limit`، اجزای مواجهه، `total_exposure`، `result ∈ {ok, warn, blocked, overridden}`، تأییدکننده |
 | `commission_plan` / `commission_rule` / `commission_assignment` / `commission_entry` | طرح (`basis ∈ {net_revenue, gross_profit, collected}`)، قاعده (دسته/کالا، کمینه، درصد یا مبلغ)، انتساب بی‌هم‌پوشان (EXCLUDE)، ثبت فقط‌افزودنی با برگشت قرینه (`reversal_of_id`) و `settled_ref` |
 
@@ -338,6 +376,7 @@ erDiagram
 | `landed_cost_voucher` / `landed_cost_line` | سند هزینهٔ جانبی مستقل روی رسیدهای قبلی (مدل؛ v2) |
 | `moadian_inbox_batch` | فایل Excel کارپوشه: `attachment_id`، `file_sha256` یکتا، `format_version`، `amount_unit`، بازه، شمارنده‌ها، خطاها |
 | `moadian_inbox_invoice` | یک ردیف برای هر taxid (یکتا در شرکت): `reference_taxid` (برای اصلاحی/برگشتی اجباری)، فروشنده (`seller_tin`، نام)، نوع/الگو/موضوع، مبلغ‌ها، `portal_status`، `buyer_reaction ∈ {none, accepted, rejected, auto_accepted}`، `raw_row`؛ `match_status ∈ {unmatched, candidate, matched, ignored}` با `matched_invoice_id` (یکتا در `matched`) |
+| (ستون‌های تازهٔ خرید) | `"order".origin ∈ {manual, api, assistant, migration, reorder}` (C-AS-12؛ پیش‌نویس دستیار `assistant`)؛ `invoice.stock_journal_id`؛ CHECK `pinv_gl_not_required` (بی‌GL فقط تاریخچهٔ مهاجرت یا صفر)؛ CHECK ابطال رسید با سند GL |
 
 ### ۴-۷. ویوها و توابع منتشرشده
 
@@ -360,12 +399,12 @@ erDiagram
 
 ### ۴-۸. ثبت در کاتالوگ‌های سراسری
 
-- **`ledger.posting_key`:** ۱۱ کلید تازه (§D-C13).
+- **`ledger.posting_key`:** کلیدهای §D-C13 به‌اضافهٔ `sales.service_charge` (CR-T07) و `sales.installment_unearned`/`sales.installment_income` (فروش اقساطی؛ نگاشت موقت ir.general تا ledger حساب اختصاصی بدهد، §۱۳)؛ `inventory.opening_stock` دیگر استفاده نمی‌شود (RV-COM-09).
 - **`ledger.subledger_source`:** `('inventory', 'inventory', 'inventory.ledger_subledger_stock', NULL, false)`.
 - **`core.permission`:** ۴۹ مجوز (`inventory.*` ۱۶، `sales.*` ۲۰، `purchase.*` ۱۳) و `role_template_permission` برای قالب‌های نقش core.
 - **`core.field_guard`:** بها و ارزش در `inventory.stock`، و `cost_amount`/`margin_amount` در `sales.invoice_line` (مجوز `inventory.cost.read`).
 - **`core.setting_def`:** `inventory.expired_batch_sale`، `inventory.fefo.enforce`، `inventory.repost.inline_limit`، `sales.discount.max_manual_percent`، `sales.credit.check_on`، `sales.cash_rounding.increment`، `sales.below_cost`، `sales.invoice.max_backdate_days`، `sales.return.window_days`، `purchase.receipt.over_receipt_percent`، `purchase.invoice.price_tolerance_percent`.
-- **`core.event_subscriber`:** `inventory.party_merge`، `sales.party_merge`، `purchase.party_merge` (مشترک `parties.party.merged`) و `inventory.year_close` (مشترک `ledger.year.closed`).
+- **`core.event_subscriber`:** `inventory.party_merge`، `sales.party_merge`، `purchase.party_merge` (مشترک `parties.party.merged`) ، `inventory.year_close` (مشترک `ledger.fiscal_year.closed` و `ledger.fiscal_year.reopened`؛ نام منتشرشدهٔ ۰۳، RV-LEDGER-10) و `inventory.pos_waste` (مشترک `pos.order.line_wasted` بخش ۰۶؛ RV-TP-14).
 - **`core.custom_field_entity`:** `sales.invoice`، `sales.order`.
 - **`core.export_table_registry`:** همهٔ جدول‌ها به ترتیب FK (inventory ۵۰۰–۵۴۲، sales ۶۰۰–۶۳۲، purchase ۷۰۰–۷۲۴). `fifo_layer`، `pool_checkpoint` و `stock_balance` صادر نمی‌شوند و قلاب درون‌ریزی با `rebuild_derived` بازشان می‌سازد (D-C26).
 
@@ -715,24 +754,30 @@ repost_pool(pool, run, floor):       # SQL، definer
 
 ویژگی‌های مشترک: `branch`، `attr:item_posting_group` (از `CatalogQuery.posting_attributes`)، `attr:item_type`، `attr:item_category`، `attr:warehouse`، `attr:warehouse_kind`، `attr:customer_group` یا `attr:supplier_group`، `attr:reason` (سند انبار)، `attr:channel`. سطرهای موجودی با `account_id` حل‌شده‌ای که روی حرکت نشسته (نه کلید) فرستاده می‌شوند. بُعد `party` روی دریافتنی/پرداختنی. ستون «ادواری» جایی که فرق دارد.
 
-| رویداد | دائمی | ادواری |
-|---|---|---|
-| فاکتور فروش | بد `sales.receivable` (total) · بد `sales.discount` (Σ تخفیف) · بس `sales.revenue` (Σ ناخالص) · بس `tax.vat_payable` (Σ vam) · بس کلیدهای مالیات/عوارض دیگر (مالک tax، CR-C09) · **و** بد `inventory.cogs` / بس موجودی (ارزش خروج‌ها) | بدون سطر بهای تمام‌شده |
-| برگشت از فروش | قرینهٔ بالا با `sales.returns` به‌جای `sales.revenue`؛ موجودی بد / `inventory.cogs` بس به بهای خروج اصلی | بدون سطر موجودی |
-| اصلاحی | فقط تفاوت با نسخهٔ قبل (هر مبلغ با علامت خودش به طرف درست) | همان |
-| ابطال | `reverse_by_source` سند اصل در تاریخ ابطال (`source_event='cancel'`) | همان |
-| رسید کالا | بد موجودی / بس `purchase.grni` (ارزش رسید) | بدون سند (فقط مقدار) |
-| فاکتور خرید بر اساس رسید | بد `purchase.grni` (خالص سطرها) · بد `tax.vat_receivable` · بس `purchase.payable`؛ تفاوت با رسید: `revalue_stock` ← لایهٔ `price_difference` روی حرکت رسید (بد موجودی / بس `purchase.grni`) و بازارزیابی؛ `price_difference_account` ← بد/بس `purchase.price_difference` / `purchase.grni` | بد `purchase.purchases` · بد مالیات · بس پرداختنی |
-| فاکتور خرید مستقیم کالا | بد موجودی (خالص + هزینهٔ سرمایه‌ای) · بد مالیات · بس پرداختنی؛ هزینهٔ غیرسرمایه‌ای ← `expense_posting_key` | بد `purchase.purchases` (کالا و هزینهٔ حمل سرمایه‌ای) |
-| برگشت از خرید | بد پرداختنی / بس موجودی (به بهای رسید) · بس مالیات؛ تفاوت مبلغ برگشت و بها ← `purchase.price_difference` | بس `purchase.returns` |
-| تعدیل انبار | اضافی: بد موجودی / بس `inventory.adjustment`؛ کسری: برعکس. ضایعات ← `inventory.waste`؛ مصرف داخلی ← `inventory.internal_consumption` | بدون سند |
-| انتقال | حساب یکسان (دامنهٔ شرکت): بدون سند؛ وگرنه ارسال: بد `inventory.goods_in_transit` / بس موجودی مبدأ؛ دریافت: بد موجودی مقصد / بس در راه | بدون سند |
-| تولید داخلی | اگر حساب اجزا و محصول یکسان: بدون سند؛ وگرنه بد موجودی محصول / بس موجودی اجزا | بدون سند |
-| افتتاحیهٔ انبار | `journal_type='opening_import'`: بد موجودی / بس حساب تراز افتتاحیهٔ ledger (D-L21)؛ ledger ماندهٔ دستی حساب کنترلی موجودی را در افتتاحیهٔ GL رد می‌کند | ماندهٔ حساب موجودی از افتتاحیهٔ GL |
-| لایهٔ مشتق بعدی (تسویهٔ کسری، repost) | بد/بس موجودی (`asset_account_id` حرکت) در برابر `contra_posting_key` حرکت؛ تسویهٔ کسری همیشه در برابر `inventory.cogs` | — |
-| لایهٔ ثابت (`landed_cost`، `cost_resolution`، `manual_revaluation`) | در سند مبدأ همان لایه: بد موجودی / بس `purchase.landed_cost_clearing` یا `inventory.adjustment` | — |
-| بستن ادواری | — | (۱) بد `inventory.cogs` / بس `inventory.opening_stock` (ابتدا) (۲) بد `inventory.cogs` / بس `purchase.purchases` (۳) بد `purchase.returns` و `purchase.discount` / بس `inventory.cogs` (۴) بد موجودی / بس `inventory.cogs` (پایان، تفکیک با `periodic_close_line`) |
-| پورسانت (v2) | بد `sales.commission_expense` / بس `sales.commission_payable` | همان |
+**قاعدهٔ دو سند (RV-IT2-01):** هر سطر روی حساب کنترلی موجودی فقط در **سند موجودی** (`source_module='inventory'`، `source_doc` = همان سند تجاری) می‌آید؛ سند تجاری (`sales`/`purchase`) هرگز سطر موجودی یا بهای تمام‌شده ندارد. هر دو در یک UoW و تراکنش ثبت می‌شوند و تریگرهای deferred مبالغ هر دو را می‌سنجند (§D-C13).
+
+| رویداد | سند تجاری (sales/purchase) | سند موجودی (inventory؛ فقط دائمی) | ادواری |
+|---|---|---|---|
+| فاکتور فروش | بد `sales.receivable` (کل، بُعد شخص) · بد `sales.discount` (Σ تخفیف) · بس `sales.revenue` (Σ ناخالص کالا) · بس `sales.service_charge` (Σ ناخالص حق سرویس) · بس `sales.installment_unearned` (اضافه‌بهای اقساط) · بس `tax.vat_payable` (Σ vam) · بس `tax.other_tax_payable`/`tax.levy_payable` | بد `inventory.cogs` / بس موجودی (ارزش خروج‌ها؛ کیت و دستور پخت هم) | بدون سند موجودی |
+| برگشت از فروش | قرینهٔ بالا با `sales.returns` به‌جای `sales.revenue` | بد موجودی / بس `inventory.cogs` به بهای خروج اصلی | بدون سند موجودی |
+| اصلاحی | فقط تفاوت با نسخهٔ قبل (هر مبلغ با علامت خودش به طرف درست) | — (اصلاحی کالا جابه‌جا نمی‌کند) | همان |
+| ابطال | `reverse_by_source` هر دو سند در تاریخ ابطال (`source_event='cancel'`)؛ `cancel_journal_id` = برگشت سند تجاری | برگشت سند موجودی | همان |
+| حوالهٔ تحویل (مسیر حواله) | — | بد `inventory.cogs` / بس موجودی هنگام تحویل؛ رسید مرجوعی قرینه به بهای خروج حواله | بدون سند |
+| فاکتور از حواله | مثل فاکتور فروش (بدون بهای تمام‌شده؛ در تحویل شناسایی شده) | — | همان |
+| رسید کالا | — | بد موجودی / بس `purchase.grni` (ارزش رسید) | بدون سند (فقط مقدار) |
+| فاکتور خرید بر اساس رسید | بد `purchase.grni` (خالص سطرها) · بد `tax.vat_receivable` · بس `purchase.payable`؛ تفاوت با رسید: `revalue_stock` ← لایهٔ `price_difference` روی حرکت رسید و بازارزیابی (سند موجودی همان لایه: بد موجودی / بس `purchase.grni`)؛ `price_difference_account` ← بد/بس `purchase.price_difference` / `purchase.grni` | (فقط لایهٔ تفاوت قیمت) | بد `purchase.purchases` · بد مالیات · بس پرداختنی |
+| فاکتور خرید مستقیم کالا | بد `purchase.grni` (خالص + هزینهٔ سرمایه‌ای؛ واسط دو سند) · بد مالیات · بس پرداختنی؛ هزینهٔ غیرسرمایه‌ای ← `expense_posting_key` | بد موجودی / بس `purchase.grni` (ارزش ورود = خالص + هزینهٔ سرمایه‌ای) | بد `purchase.purchases` (کالا و حمل سرمایه‌ای) |
+| برگشت از خرید | بد پرداختنی / بس `purchase.grni` (به بهای رسید) · بس مالیات؛ تفاوت مبلغ برگشت و بها ← `purchase.price_difference` | بد `purchase.grni` / بس موجودی (به بهای رسید) | بس `purchase.returns` |
+| تعدیل انبار | — | اضافی: بد موجودی / بس `inventory.adjustment`؛ کسری: برعکس؛ ضایعات ← `inventory.waste`؛ مصرف داخلی ← `inventory.internal_consumption` | بدون سند |
+| ضایعات آشپزخانه (صندوق) | — | رویداد `pos.order.line_wasted` ← سند `adjustment` با `reason_code='waste'` و backflush دستور پخت (کلید یکتایی = `order_line_id`)؛ بد `inventory.waste` / بس موجودی | بدون سند |
+| انتقال | — | حساب یکسان (دامنهٔ شرکت): خالص صفر، بدون سند؛ وگرنه ارسال: بد `inventory.goods_in_transit` / بس موجودی مبدأ؛ دریافت: بد موجودی مقصد / بس در راه | بدون سند |
+| تولید داخلی | — | اگر حساب اجزا و محصول یکسان: بدون سند؛ وگرنه بد موجودی محصول / بس موجودی اجزا | بدون سند |
+| افتتاحیهٔ انبار | — | مهاجرت: **بی‌GL** (`gl_effect='none'`؛ GL از `opening_import` بخش ۰۸)؛ دستی: بد موجودی / بس `ledger.opening_balance_clearing` | ثبت آغاز ادواری (`basis='opening'`) |
+| لایهٔ مشتق بعدی (تسویهٔ کسری، repost) | — | بد/بس موجودی (`asset_account_id` حرکت) در برابر `contra_posting_key` حرکت؛ تسویهٔ کسری همیشه در برابر `inventory.cogs` | — |
+| لایهٔ ثابت (`landed_cost`، `cost_resolution`، `manual_revaluation`) | — | در سند مبدأ همان لایه: بد موجودی / بس `purchase.landed_cost_clearing` یا `inventory.adjustment` | — |
+| شناسایی اضافه‌بهای قسط (job سررسید) | بد `sales.installment_unearned` / بس `sales.installment_income` | — | همان |
+| بستن ادواری | — | — | (۱) بد `inventory.cogs` / بس **حساب موجودی هر سطر** (ابتدا) (۲) بد `inventory.cogs` / بس `purchase.purchases` (۳) بد `purchase.returns` و `purchase.discount` / بس `inventory.cogs` (۴) بد موجودی هر سطر / بس `inventory.cogs` (پایان). خالص حساب موجودی = پایان − ابتدا؛ خالص `inventory.cogs` = `cogs_value` (= ابتدا + خرید − برگشت − تخفیف − پایان) |
+| پورسانت (v2) | بد `sales.commission_expense` / بس `sales.commission_payable` | — | همان |
 
 **نقدی پیشخوان:** فاکتور همیشه دریافتنی می‌سازد؛ `post_counter_sale` در همان تراکنش `treasury.ReceiptService` را صدا می‌زند (بد صندوق یا واسط کارتخوان / بس دریافتنی) و دریافت را به قلم باز فاکتور تخصیص می‌دهد. این یعنی ماندهٔ دریافتنی هر شخص (حتی «مشتری نقدی») همیشه از دو سند مستقل تشکیل می‌شود و گزارش «فروش نقدی ولی دریافت‌نشده» ممکن است.
 
@@ -757,16 +802,22 @@ SalesInvoiceService.post(id, row_version):
   specs ← برای هر سطر انباری: یک MoveSpec (یا هر بچ bundle)؛ کیت/دستور پخت ← explode_for_sale
           برگشت: sale_return با valuation_rule='source' و cost_source_move_id = حرکت خروج سطر اصلی
   results ← StockPostingService.post_moves(MoveBatch(source_doc=inv, origin=…))
-  # ۵) GL
-  if gl_mode='per_document': jr ← LedgerPostingService.post(PostingRequest(… §۵-۶ …, attributes))
+  # ۵) GL — دو سند در همین UoW (§۵-۶): سند فروش (source_module='sales') و سند موجودی (source_module='inventory'،
+  #    source_doc = همین فاکتور) از ارزش حرکت‌ها؛ هر دو را تریگر deferred با مبالغ فاکتور/حرکت‌ها می‌سنجد
+  if gl_mode='per_document':
+      jr ← LedgerPostingService.post(PostingRequest(source=('sales', f'sales.{doc_kind}', inv.id), lines=sales_lines(inv)))
+      sj ← LedgerPostingService.post(PostingRequest(source=('inventory', f'sales.{doc_kind}', inv.id), lines=stock_lines(results)))  # اگر ارزشی هست
   else: assert batch open
   # ۶) قلم باز treasury (اگر total > 0)
-  treasury.OpenItemService.register(source=('sales', f'sales.{doc_kind}', inv.id, 'main'), party, direction, amount, due_date)
+  schedule ← InstallmentPlanner.from_terms(payment_term | plan, doc_date, total, minor)   # D-C29؛ بی‌شرط ← یک قسط
+  persist sales.invoice_installment(schedule)  # اگر بیش از یک قسط یا اضافه‌بها
+  for inst in schedule: treasury.OpenItemService.register(source=('sales', f'sales.{doc_kind}', inv.id, f'inst:{inst.seq}'),
+                                                         party, direction, inst.amount, inst.due_date)
   if counter sale: treasury.ReceiptService.record_and_allocate(...)
   # ۷) مالیات
   tax_doc ← tax.TaxDocumentService.create_for_sales(inv, tax) if moadian_required    # پیش‌نویس سند مؤدیان؛ ارسال async
   # ۸) سرسند
-  UPDATE invoice SET status='posted', number_issued_id, doc_no, gl_journal_id, tax_document_id, posted_by, posted_at
+  UPDATE invoice SET status='posted', number_issued_id, doc_no, gl_journal_id, stock_journal_id, tax_document_id, posted_by, posted_at
   outbox: sales.invoice.posted {invoice_id, doc_kind, company_id, total, moadian_required}
   commit → deferred: invoice_verify (جمع‌ها، ردپای تخفیف، سهم‌ها، فیلدهای مؤدیان، شماره، GL، دسته، قواعد برگشت/اصلاحی، پیوند انبار)
 ```
@@ -774,6 +825,10 @@ SalesInvoiceService.post(id, row_version):
 **ابطال:** فقط بدون برگشت/اصلاحی ثبت‌شده؛ `StockPostingService.reverse_source` (هر حرکت `reverse` در همان تاریخ اصل؛ حرکت‌های بعدی بازارزیابی می‌شوند)؛ `LedgerPostingService.reverse_by_source(…, cancel_event='cancel')`؛ `OpenItemService.cancel` (اگر تخصیص دارد ← رد با `treasury.open_item.allocated`)؛ `TaxDocumentService.request_cancel` (ابطالی `ins=3` اگر ارسال شده بود). ابطال پس از ارسال موفق به مؤدیان فقط با مجوز `sales.invoice.cancel` و پیام هشدار.
 
 **فاکتور صندوق (pos):** pos پس از دریافت فرمان آفلاین `post_from_pos` را با `origin='offline_device'`، `number_source='device'` و `device_id` صدا می‌زند. سرویس هرگز به دلیل موجودی منفی یا سریال ناموجود رد نمی‌کند (استثنا می‌سازد). اگر قیمت/تخفیف دستگاه با موتور سرور (همان `rule_set_version`) نخواند، **مقدار دستگاه** ثبت می‌شود (فاکتور قانونی صادر شده) و یک `stock_exception`/هشدار قیمت در گزارش مغایرت صندوق می‌آید؛ قاعدهٔ CHECKهای فرمول برقرار می‌ماند چون دستگاه همان کتابخانه را اجرا می‌کند.
+
+**قرارداد شماره و سطر صندوق (RV-IT2-06، D-C27):** `post_from_pos` شمارهٔ فاکتور را از سری `sales.*` نمی‌گیرد؛ `number_issued_id` همان شمارهٔ رسید (`pos.ticket`) از همان دستگاه است و `pos_ticket_id` = شناسهٔ رسید؛ `doc_no` = `ticket_no`. هر سطر فاکتور `pos_ticket_line_id` سطر رسید را دارد؛ برگشت صندوق سطر اصلی را با آن می‌یابد؛ تعویض = دو رسید (برگشت + فروش). حق سرویس رسید ← سطر `line_kind='service_charge'`؛ `rounding_adjustment` ← تخفیف فاکتوری `rounding` (D-C30).
+
+**ثبت مالیات خرید (CR-CMP-04):** `PurchaseInvoiceService.post`/`cancel` در همان UoW `tax.TaxRegisterService.record_purchase(invoice, calc_snapshot)` را صدا می‌زند و `MoadianInboxService.match`/`ignore` تابع `update_moadian_match` را؛ فروش شناسهٔ `calc_snapshot` ماشین‌حساب مالیات را در `sales.invoice.tax_snapshot` نگه می‌دارد. سطر فروش دارایی ثابت (کالای نوع دارایی) به `assets.disposal_clearing` می‌رود، نه `sales.revenue`.
 
 ### ۵-۸. موتور قیمت و تخفیف
 
@@ -808,7 +863,8 @@ price(ctx, lines, base_prices, rules, invoice_discount, rounding_inc, minor):
 ```
 
 - **قطعیت:** خروجی فقط تابع ورودی‌ها و `rule_set_version` است (بدون ساعت سیستم؛ `pricing_at` ورودی است). پایتون و TypeScript روی `testdata/pricing/*.json` (هر بردار: ورودی، قاعده‌ها، خروجی کامل با ردپا) سبز می‌شوند؛ ناسازگاری = شکست CI (INV-FE-05 بخش ۰۱).
-- **specificity:** variant=6، کالا=5، دسته=4، برند=3، گروه ثبت=3؛ شخص +3، گروه شخص +2، شعبه +1، کانال +1، فهرست قیمت +1.
+- **specificity:** جدول هنجاری D-C17 (variant=6، کالا=5، دسته=4، برند=3، گروه ثبت=3؛ شخص +3، گروه شخص +2، شعبه +1، کانال +1، فهرست قیمت +1)؛ همان جدول در `testdata/pricing/specificity.json` برای پایتون و TypeScript.
+- **قیمت شامل مالیات (D-C30):** `fee = floor(P × 100 / (100 + r))` به ریال صحیح؛ تفاوت باقیمانده با مبلغ پرداختی مشتری = تخفیف `rounding` (اگر کمتر) یا `treasury.cash_over_short` در دریافت (اگر بیشتر)؛ بردارهای «قیمت گرد ناممکن» در مجموعهٔ مشترک.
 - **پیش‌فاکتور و سفارش** همان موتور را با `channel='invoice'` و تاریخ سند صدا می‌زنند؛ فاکتورِ از سفارش به‌طور پیش‌فرض قیمت سفارش را با `price_source='contract'` نگه می‌دارد.
 - **کالای هدیه** سطر جدای فاکتور است (همان SKU یا SKU هدیه) با `discount = gross` ← `adis = 0` ← `vam = 0`؛ مؤدیان سطر را با مبلغ و تخفیف کامل می‌پذیرد.
 
@@ -870,7 +926,7 @@ import_file(company, attachment, amount_unit, format_version):
   "reviewed_by": "<بازبین حسابدار>",
   "sections": {
     "ledger":    {"coa_template": {"code": "ir.cafe", "version": 1, "extends": "ir.general"},
-                  "posting_rules": [{"key": "inventory.cogs", "when": {"attr:item_posting_group": "MENU"}, "account_code": "6102"}]},
+                  "posting_rules": [{"key": "inventory.cogs", "when": {"attr:item_posting_group": "MENU"}, "account_code": "7104"}]},
     "catalog":   {"uoms": [{"code": "CUP", "name_fa": "لیوان", "moadian_unit": "<کد از rules>"}],
                   "categories": [{"code": "HOT", "name_fa": "نوشیدنی گرم", "defaults": {"item_type": "non_stock", "posting_group": "MENU"}}],
                   "posting_groups": ["MENU", "RAW", "SEMI"], "attributes": [{"code": "cup_size", "axis": true}],
@@ -889,6 +945,8 @@ import_file(company, attachment, amount_unit, format_version):
   }
 }
 ```
+
+بخش اختیاری `assistant` (رأی 10:C-AS-19): مثل `{"assistant": {"skills": ["cafe_daily_close"], "prompts_fa": [...]}}`. این بخش Applier ندارد و جدولی نمی‌نویسد؛ `packs` فقط شکل آن را با طرح‌وارهٔ منتشرشدهٔ بخش ۱۰ اعتبارسنجی می‌کند و دستیار آن را با `rules.PackQuery.manifest_section(pack, version, 'assistant')` می‌خواند. کلید ناشناخته در این بخش هم ← رد.
 
 **چرخهٔ عمر:**
 
@@ -924,7 +982,7 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | بسته | ledger | catalog / parties | inventory / sales | pos / core / reports |
 |---|---|---|---|---|
 | `general` (پایه، پیش‌نیاز همه) | قالب `ir.general` و قاعده‌های نگاشت پایهٔ همهٔ کلیدهای §D-C13 | واحدهای عدد، کیلوگرم، متر، لیتر، بسته، کارتن؛ دستهٔ «کالا» و «خدمت»؛ گروه ثبت `GOODS`/`SERVICE`؛ گروه شخص `RETAIL`/`WHOLESALE`؛ شرایط پرداخت نقد، ۳۰ و ۶۰ روزه | سیاست: میانگین، دائمی، دامنهٔ شرکت، `allow_warn`؛ انبار `MAIN`؛ بدون قاعدهٔ قیمت | تنظیمات پیش‌فرض، قالب چاپ A4/A5 فاکتور رسمی و فروشگاهی |
-| `cafe` | `ir.cafe` (extends `ir.general`): بهای تمام‌شدهٔ منو جدا، ضایعات آشپزخانه، مصرف کارکنان | واحدهای لیوان، گرم، میلی‌لیتر؛ دسته‌های نوشیدنی گرم/سرد، کیک، مواد اولیه، نیمه‌آماده؛ گروه ثبت `MENU` (`non_stock` با دستور پخت)، `RAW`، `SEMI`؛ محور `cup_size`؛ ترازوی وزنی پیشوند `21`؛ گروه شخص `STAFF` | انبارهای `STORE`، `BAR`، `KITCHEN` و پیش‌فرض مصرف شعبه؛ منفی `allow_warn`؛ دلایل تعدیل `waste_kitchen`، `staff_meal`، `spill`؛ قاعدهٔ پیش‌نویس «ساعت خوش» | pos: میز، modifier، چاپ آشپزخانه/بار، چیدمان کافه؛ داشبورد فروش ساعتی و «مصرف نظری در برابر واقعی» |
+| `cafe` | `ir.cafe` (extends `ir.general`): بهای تمام‌شدهٔ منو جدا (حساب هزینهٔ `7104` «بهای تمام‌شدهٔ منو» که این قالب می‌افزاید؛ نه `6102` فروش خدمات؛ RV-LEDGER-28)، ضایعات آشپزخانه، مصرف کارکنان | واحدهای لیوان، گرم، میلی‌لیتر؛ دسته‌های نوشیدنی گرم/سرد، کیک، مواد اولیه، نیمه‌آماده؛ گروه ثبت `MENU` (`non_stock` با دستور پخت)، `RAW`، `SEMI`؛ محور `cup_size`؛ ترازوی وزنی پیشوند `21`؛ گروه شخص `STAFF` | انبارهای `STORE`، `BAR`، `KITCHEN` و پیش‌فرض مصرف شعبه؛ منفی `allow_warn`؛ دلایل تعدیل `waste_kitchen`، `staff_meal`، `spill`؛ قاعدهٔ پیش‌نویس «ساعت خوش» | pos: میز، modifier، چاپ آشپزخانه/بار، چیدمان کافه؛ داشبورد فروش ساعتی و «مصرف نظری در برابر واقعی» |
 | `retail_apparel` | `ir.apparel`: درآمد و بهای تمام‌شده به تفکیک گروه کفش/پوشاک | محورهای `size`، `color`؛ ویژگی‌های `material`، `season`؛ قالب ویژگی «کفش» و «پوشاک»؛ واحد «جفت»؛ سری کد داخلی و بارکد داخلی پیشوند `04` | دامنهٔ استخر پیشنهادی `warehouse` برای چندشعبه (فقط پیش از اولین حرکت)؛ انتقال دومرحله‌ای بین شعب؛ قاعدهٔ پیش‌نویس «حراج پایان فصل» (دسته + بازه) | چاپ برچسب بارکد، ماتریس سایز/رنگ موجودی، گزارش فروش به تفکیک سایز/رنگ/فصل |
 | `retail_electrical` | `ir.electrical`: درآمد خرده/عمده، ذخیرهٔ گارانتی (later) | واحدهای حلقه، متر، رول، کارتن، دستگاه؛ ویژگی‌های `voltage`، `power_w`، `brand_model`؛ دستهٔ «لوازم خانگی» با `track_serial` و گارانتی ۱۸ ماه (پیش‌پر)؛ گروه شخص `CONTRACTOR`، `RETAIL` | فهرست قیمت مشتق «همکار» (−۸٪، پیش‌نویس)؛ قاعدهٔ پلکانی پیش‌نویس برای کابل؛ کنترل اعتبار `warn` پیش‌فرض گروه `CONTRACTOR` | پیش‌فرض نوع ۱ صورتحساب برای خریدار حقوقی، چاپ کارت گارانتی، گزارش سریال و گارانتی |
 
@@ -966,41 +1024,58 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | `purchase.inbox.imported` | `batch_id`، `rows`، `unmatched` | core اعلان |
 | `packs.pack.installed` / `.upgraded` / `.uninstalled` | `tenant_pack_id`، `pack`، `version`، شمارش‌ها | platform (telemetry بدون داده) |
 
-مشترک‌ها: `parties.party.merged` ← سه مشترک inventory/sales/purchase ارجاع شخص بازنده را در **اسناد پیش‌نویس** به برنده منتقل می‌کنند (اسناد ثبت‌شده تغییر نمی‌کنند؛ گزارش‌ها از `parties.v_party_identity` می‌خوانند). `ledger.year.closed` ← `inventory.year_close` (حذف چهار صفر: لایهٔ `redenomination`، v2).
+مشترک‌ها: `parties.party.merged` ← سه مشترک inventory/sales/purchase ارجاع شخص بازنده را در **اسناد پیش‌نویس** به برنده منتقل می‌کنند (اسناد ثبت‌شده تغییر نمی‌کنند؛ گزارش‌ها از `parties.v_party_identity` می‌خوانند). `ledger.fiscal_year.closed`/`.reopened` ← `inventory.year_close` (حذف چهار صفر: لایهٔ `redenomination`، v2؛ بند پایین).
+
+**مشترک‌های دیگر (بازبینی یکپارچه؛ RV-LEDGER-10، RV-TP-14، RV-X1-10):**
+- `ledger.fiscal_year.closed` و `ledger.fiscal_year.reopened` (نام منتشرشدهٔ ۰۳؛ fan-out تطبیق دقیق دارد) ← `inventory.year_close`: در سال تبدیل لایهٔ `redenomination` (v2، CR-C13) و با بازگشایی خنثی‌سازی آن. نام قدیمی `ledger.year.closed` هیچ‌گاه منتشر نمی‌شد و حذف شد.
+- `pos.order.line_wasted` ← `inventory.pos_waste`: سطر سفارشِ پس از ارسال به آشپزخانه لغوشده، سند `adjustment` با `reason_code='waste'` و حرکت‌های `waste` مواد دستور پخت همان روز (`bom_id` snapshot) می‌سازد؛ کلید یکتایی `order_line_id`؛ GL بد `inventory.waste` / بس موجودی. بدون این مشترک موجودی و food cost کافه بیش از واقع بود.
+- `treasury.open_item.closed` و `treasury.gateway_payment.*`: **مشترک نمی‌شوند**؛ وضعیت پرداخت فاکتور (و هر قسط) مشتق است و از `treasury.v_open_item` (منبع یکتا) خوانده می‌شود؛ ستون وضعیت پرداخت در `sales.invoice` نیست (درخواست حذف ادعای مصرف‌کننده از ۰۶ §۵ در §۱۳).
+- `catalog.bom.activated`/`archived`، `parties.role.changed`، `parties.hold.*`، `catalog.price_list.changed`: inventory و sales cache ندارند (BOM با `bom_for(date)` و اعتبار/قیمت در لحظهٔ ثبت از سرویس‌های منتشرشده خوانده می‌شوند)؛ مصرف‌کنندهٔ این رویدادها فقط `pos.sync_streams` است (درخواست اصلاح فهرست مصرف‌کننده‌ها از ۰۴ و ۰۶).
 
 ### ۵-۱۴. نگاشت خطای پایگاه داده به API (نمونه؛ کامل در `errors.yaml` هر ماژول)
 
 | کد DB | کد API | HTTP |
 |---|---|---|
-| `HK_INV_NEGATIVE_STOCK` | `inventory.negative_stock` (با کالا، انبار و کمبود) | 409 |
+| `HK_INV_NEGATIVE_STOCK` | `inventory.stock.negative` (با کالا، انبار و کمبود) | 409 |
 | `HK_INV_POLICY_MISSING` / `_RETROACTIVE` / `_LOCKED` / `_METHOD_CHANGE` | `inventory.policy.*` | 422 / 409 |
 | `HK_INV_SERIAL_STATE`، `_COUNT`، `_SKU` | `inventory.serial.*` | 409 / 422 |
 | `HK_INV_BATCH_EXPIRED`، `_BLOCKED`، `_REQUIRED` | `inventory.batch.*` | 409 / 422 |
-| `HK_INV_OPENING_NOT_FIRST`، `HK_INV_BEFORE_OPENING`، unique `stock_move_one_opening` | `inventory.opening.*` | 409 |
+| `HK_INV_OPENING_NOT_FIRST`، `HK_INV_BEFORE_OPENING` | `inventory.opening.*` | 409 |
 | `HK_INV_DOC_TRANSITION`، `HK_COMMERCE_DOC_TRANSITION` | `<module>.doc.invalid_transition` | 409 |
 | `HK_INV_DOC_IMMUTABLE`، `HK_COMMERCE_DOC_IMMUTABLE` | `<module>.doc.immutable` | 409 |
 | `HK_INV_REPOST_RUN`، `HK_INV_POOL_NOT_FOUND` | `inventory.repost.*` | 409 / 404 |
 | `HK_SALES_RETURN_QTY` / `_PRICE` / `_LINE` | `sales.return.*` | 422 |
 | `HK_SALES_CORRECTION_SCOPE` / `_LINE` | `sales.correction.*` | 422 |
 | `HK_SALES_MOADIAN_FIELDS` / `_BUYER` / `_SETTLEMENT` | `sales.moadian.*` (فیلد مشخص) | 422 |
-| `HK_SALES_TOTALS`، `HK_SALES_DISCOUNT_TRACE` | `sales.internal_inconsistency` (باگ سرویس؛ Sentry) | 500 |
-| `HK_COMMERCE_GL_LINK`، `HK_COMMERCE_NUMBER_LINK`، `HK_SALES_STOCK_LINK`، `HK_PUR_STOCK_LINK` | `commerce.internal_link` (باگ سرویس) | 500 |
+| `HK_SALES_TOTALS`، `HK_SALES_DISCOUNT_TRACE` | `sales.internal.inconsistency` (باگ سرویس؛ Sentry) | 500 |
+| `HK_COMMERCE_GL_LINK`، `HK_COMMERCE_NUMBER_LINK`، `HK_SALES_STOCK_LINK`، `HK_PUR_STOCK_LINK` | `<inventory|sales|purchase>.internal.link` (ماژول جدولی که پیام را بالا می‌برد؛ باگ سرویس) | 500 |
 | `HK_SALES_CANCEL_HAS_DEPENDENTS`، `HK_PUR_CANCEL_HAS_DEPENDENTS` | `<module>.cancel.has_dependents` | 409 |
 | `HK_SALES_RULE_USED` | `sales.pricing_rule.used` | 409 |
-| `HK_PUR_INBOX_MATCH`، unique `pinv_supplier_no_uq` / `pinv_taxid_uq` | `purchase.duplicate_supplier_invoice` | 409 |
-| `23503` / `42501` با `app.tenant_id` | `not_found` (هرگز «مال مستأجر دیگر است») | 404 |
+| `HK_PUR_INBOX_MATCH`، unique `pinv_supplier_no_uq` / `pinv_taxid_uq` | `purchase.invoice.duplicate_supplier_invoice` | 409 |
+| `23503` در خواندن/ارجاع با `app.tenant_id` (ردیف دیده‌نشده زیر RLS) | `core.resource.not_found` (هرگز «مال مستأجر دیگر است») | 404 |
+| `42501` / «violates row-level security» در **نوشتن**، `HK_TENANT_CONTEXT_MISSING` | `internal.tenant_isolation` (۰۱ §۵-۵؛ هشدار Sev-1 و `hk_tenant_isolation_violations_total`؛ RV-X1-17) | 500 |
+| `HK_COMMERCE_GL_AMOUNT`، `HK_COMMERCE_STOCK_GL_MISSING`، `HK_COMMERCE_GL_NOT_REVERSED` | `<module>.internal.gl_mismatch` (باگ سرویس) | 500 |
+| `HK_INV_COST_SOURCE_EXHAUSTED`، `HK_SALES_RETURN_DISCOUNT`، `HK_SALES_RETURN_COST`، `HK_PUR_RETURN_COST` | `inventory.cost_source.exhausted`، `sales.return.*`، `purchase.return.*` | 422 |
+| `HK_INV_OPENING_DUPLICATE` | `inventory.opening.duplicate` | 409 |
+| `HK_PUR_RECEIPT_LINK`، `HK_PUR_RECEIPT_OVERBILLED`، `HK_SALES_DELIVERY_LINK` | `purchase.invoice.receipt_link`، `sales.invoice.delivery_link` | 422 |
+| `HK_PARTY_MERGED` | `parties.party.merged` (با شناسهٔ جانشین) | 409 |
+| `HK_SALES_INSTALLMENTS` | `sales.installments.invalid` | 422 |
+| `HK_SALES_POS_LINE` | `sales.invoice.pos_line` (باگ آداپتر صندوق) | 422 |
+| `HK_SALES_BATCH_CLOSED`، `HK_SALES_BATCH_CANCEL_GL` | `sales.gl_batch.closed` | 409 |
 
 ### ۵-۱۵. مهاجرت، درون‌ریزی و صدور
 
-- **ورودی مهاجرت** (Q-G؛ آداپترهای هلو، سپیدار، حسابفا، Excel): `InventoryImportService.opening(company, as_of, rows, amount_unit)` (سند `opening`؛ ریال از حساب موجودی مبدأ، مقدار از جدول موجودی ابتدا؛ کنترل: Σ ارزش = ماندهٔ حساب موجودی مبدأ ± ۰، وگرنه گزارش مغایرت)، `SalesImportService.history(...)` و `PurchaseImportService.history(...)` (فاکتورهای تاریخی با `channel='migration'`، `price_source='migration'`، `origin='migration'`، `gl_mode='none'` اگر GL تاریخی از ledger می‌آید، و `stock_mode='none'` اگر کاردکس تاریخی وارد نمی‌شود). همه idempotent با `(run_id, source_key)` در `migration.id_map`.
+- **ورودی مهاجرت** (Q-G؛ آداپترهای هلو، سپیدار، حسابفا، Excel): `InventoryImportService.opening(company, as_of, rows, amount_unit)` (سند `opening`؛ ریال از حساب موجودی مبدأ، مقدار از جدول موجودی ابتدا؛ کنترل: Σ ارزش = ماندهٔ حساب موجودی مبدأ ± ۰، وگرنه گزارش مغایرت)، `SalesImportService.history(...)` و `PurchaseImportService.history(...)` (فاکتورهای تاریخی با `channel='migration'`، `price_source='migration'`، `origin='migration'`، `gl_mode='none'` اگر GL تاریخی از ledger می‌آید، و `stock_mode='none'` اگر کاردکس تاریخی وارد نمی‌شود). همه idempotent با lineage در `migration.id_map` (اصطلاح `job_id` بخش ۰۸؛ بند پایین).
 - **صدور `.hkx`:** جدول‌ها با ترتیب ثبت‌شده. **درون‌ریزی:** پس از COPY جدول‌ها، `setval(inventory.posting_seq, max+1)` و `inventory.rebuild_derived(company)` برای هر شرکت؛ ناسازگاری ← رد درون‌ریزی (D-C26).
 - **مقادیر کنترلی** (`InventoryControlTotals`، `SalesControlTotals`، `PurchaseControlTotals`): شمار و Σ ارزش حرکت‌ها، Σ لایه‌ها برای هر حساب، شمار و Σ جمع فاکتورها به تفکیک نوع؛ قرارداد صحت انتقال (README §۳-۱).
+- **بازبینی یکپارچه (CR-MG01، CR-MG15، CR-MG16، RV-COM-12، RV-COM-25):** امضای ورود افتتاحیه `InventoryImportService.opening(company, as_of, rows, amount_unit, gl_effect: Literal['none','post'], lineage)` است؛ مهاجرت همیشه `gl_effect='none'` (سند `opening` با `gl_status='not_required'` و `origin='migration'`؛ GL از `opening_import` بخش ۰۸) و کلید idempotency = lineage در `migration.id_map` (اصطلاح `job_id`، نه `run_id`). `cancel_opening(lineage)` حرکت‌های افتتاحیه را برمی‌گرداند و افتتاحیهٔ دوباره ممکن است (یکتایی «زنده»). تاریخچهٔ فاکتور فروش: `SalesImportService.history(..., gl_mode)` — `per_document` در دورهٔ باز گذشته، `none` وقتی GL تاریخچه از ledger می‌آید (فقط `channel='migration'`؛ CHECK `invoice_gl_shape`) و `cancel_history(lineage)` برای بازگشت. معادل خرید: `channel='migration'` با `gl_status='not_required'` (CHECK `pinv_gl_not_required`) و `stock_mode='none'` مجاز.
 
 ### ۵-۱۶. همروندی و کارایی
 
 - **قفل‌ها:** ردیف `cost_pool` (ثبت و بازپخش یک استخر)؛ ردیف سطر فاکتور اصلی `FOR NO KEY UPDATE` هنگام ثبت برگشت (دو برگشت هم‌زمان از یک سطر)؛ ردیف سرسند `FOR UPDATE` در ثبت؛ قفل مشورتی `hk:inventory:repost:<company>` برای job. ترتیب قفل در یک سند: استخرها به ترتیب `pool_id` (سرویس حرکت‌ها را پیش از درج مرتب می‌کند) ← جلوگیری از بن‌بست بین دو فاکتور با کالاهای مشترک.
 - **هدف‌ها (روی سخت‌افزار مرجع بخش ۰۱):** ثبت فاکتور ۲۰ سطری با ۲۰ حرکت p95 < ۸۰ms؛ `resolve` قیمت + موتور برای ۲۰ سطر < ۵ms؛ بازپخش ۱۰۰ هزار حرکت یک استخر < ۲۰s؛ `ledger_subledger_stock` برای ۱ میلیون حرکت < ۲s (ایندکس `valuation_layer_gl_idx`).
 - **حجم:** کافهٔ پرفروش ≈ ۳۰۰ فاکتور × ۸ سطر دستور پخت × ۵ ماده در روز ≈ ۱۲ هزار حرکت در روز ≈ ۴.۴ میلیون در سال. v1 بدون پارتیشن (مانند D-L25)؛ پارتیشن سالانهٔ `stock_move` و `valuation_layer` در v2 اگر سنجه‌ها بخواهند. حالت «تجمیع backflush هر شیفت» (یک حرکت برای هر ماده در شیفت، با ردپای سطرها در جدول جانبی) گزینهٔ v2 است.
+- **بازبینی (RV-COM-05/15/19):** قفل مشورتی روی شناسهٔ حرکت مبدأ بها (مصرف تجمعی) و روی کلید افتتاحیه (یک افتتاحیهٔ زنده)؛ `FOR SHARE` دستهٔ GL در راستی‌آزمایی فاکتور دسته‌ای؛ `FOR NO KEY UPDATE` سطر رسید/سطر حواله هنگام صورتحساب. بررسی منفی‌نشدن پس‌تاریخ فقط بازهٔ پس از نقطه را می‌پیماید (فروش آفلاین یک‌روز پس‌تاریخ روی ۲۰۰ هزار حرکت ≈ ۵ms؛ بدترین حالت، پس‌تاریخ به آغاز تاریخچه، همچنان خطی در حرکت‌های پس از نقطه است) و بررسی افتتاحیه از `stock_move_opening_idx`.
 
 ### ۵-۱۷. سطح دستیار هوشمند (Q-F)
 
@@ -1081,6 +1156,9 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | GET، POST، PATCH | `/commission-plans`، `/commission-plans/{id}/rules`، `/commission-assignments` | پیکربندی پورسانت | `sales.commission.read` / `.manage` | اختیاری |
 | GET | `/commission-entries` | تعهدهای پورسانت | `sales.commission.read` | — |
 | GET | `/reports/margin`، `/reports/sales-by` | حاشیه و فروش به تفکیک | `sales.report.read` (+ `inventory.cost.read`) | — |
+| GET | `/reports/food-cost?branch&from&to` | food cost نظری در برابر واقعی (کافه؛ RV-X3-08): `FoodCostQuery.variance` = مصرف نظری (مقدار فروش × BOM snapshot همان روز از حرکت‌های backflush) در برابر واقعی (مانده آغاز + رسید − انتقال خروجی + انتقال ورودی − ماندهٔ پایان انبارگردانی)، ضایعات (`waste`، شامل ضایعات آشپزخانه) و مصرف کارکنان (`consumption`) جدا | `sales.report.read` + `inventory.cost.read` (field_guard بها) | — |
+| GET | `/reports/size-curve?item|category&axis&from&to` | منحنی سایز/رنگ (پوشاک؛ RV-X3-08): `SizeCurveQuery` برای هر مقدار محور variant: مقدار فروش، موجودی، sell-through ٪ = فروش ÷ (فروش + موجودی پایان) | `sales.report.read` | — |
+| GET | `/invoices/{id}/installments`، `/reports/installments-overdue?as_of` | جدول اقساط و اقساط سررسیدگذشته (از `sales.invoice_installment` + `treasury.v_open_item`؛ یادآوری پیامکی با قالب treasury) | `sales.invoice.read` | — |
 | POST | `/imports/history` | ورود فاکتورهای تاریخی (migration) | `sales.history.import` | اجباری |
 
 ### ۶-۳. خرید (`/api/v1/purchase`)
@@ -1143,7 +1221,7 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | INV-INV-15 | در انبار `block` ماندهٔ جاری و ماندهٔ هر نقطهٔ پس از یک ثبت پس‌تاریخ منفی نمی‌شود | `stock_move_after` (کمینهٔ ماندهٔ جاری) | T07 «block warehouse rejects negative»، «backdated issue that makes a past point negative is rejected» |
 | INV-INV-16 | فروش آفلاین هرگز رد نمی‌شود و استثنا می‌سازد؛ انبار در راه حتی آفلاین منفی نمی‌شود | `stock_move_after` | T07 «offline sale accepted with exception»، «transit never goes negative, even offline» |
 | INV-INV-17 | برگشت حرکت: همان تاریخ، کل مقدار، قرینهٔ دقیق ارزش؛ یکی برای هر حرکت؛ برگشتِ برگشت ممنوع | `stock_move_before` + ایندکس یکتا + قاعدهٔ `reverse` | T08 (پنج مورد) |
-| INV-INV-18 | یک افتتاحیه برای هر (شرکت، انبار، SKU، بچ) و پیش از هر حرکت دیگر | ایندکس یکتا + `stock_move_before` | T09 «opening repeated for the same key (Sepidar trap)»، «no move before opening»، «opening after other moves»، «second opening rejected (committed)» |
+| INV-INV-18 | یک افتتاحیهٔ **زنده** برای هر (شرکت، انبار، SKU، بچ) و پیش از هر حرکت دیگر؛ افتتاحیهٔ برگشت‌خورده دوباره قابل ورود (RV-COM-11) | `stock_move_before` زیر قفل مشورتی کلید (`HK_INV_OPENING_DUPLICATE`، `HK_INV_OPENING_NOT_FIRST`، `HK_INV_BEFORE_OPENING`) | T09، T26 |
 | INV-INV-19 | سریال: ورود فقط از `registered/out`، خروج فقط از `in_stock` همان انبار؛ سریال تازه `registered` است | `serial_move_before` + `serial_move_after` | T10 «received serials in stock»، «cannot issue a serial that is not in stock»، «cannot receive a serial already in stock»، «new serial starts registered» |
 | INV-INV-20 | تعداد سریال‌های حرکت = \|مقدار\|؛ فقط کالای سریالی؛ سریال همان SKU | `stock_move_verify` (deferred) + `serial_guard` | T10 «serial count must equal quantity»، «serial only for serial-tracked items»، «serial of another SKU» |
 | INV-INV-21 | تعارض سریال در فروش آفلاین پذیرفته و ثبت می‌شود | `serial_move_after` | T10 «offline serial conflict recorded» |
@@ -1154,16 +1232,16 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | INV-INV-26 | bundle ثبت‌شده و ورودی‌هایش تغییرناپذیرند و سند مبدأ دارند | `bundle_guard` + CHECK | T12 «posted bundle entries are immutable»، «posted bundle is immutable»، «posted bundle needs its source document» |
 | INV-INV-27 | سند انبار از پیش‌نویس شروع می‌شود (به‌جز مهاجرت، آفلاین و سیستم)؛ گذارهای مجاز §۵-۱۲؛ ابطال دلیل دارد؛ ثبت‌شده حذف نمی‌شود | `stock_doc_guard` + CHECK | T13 «documents start as draft»، «no posted → draft»، «cancel needs a reason»، «posted doc cannot be deleted» |
 | INV-INV-28 | سرسند و سطرهای ثبت‌شده تغییرناپذیرند؛ سطر تازه پس از ثبت نیست؛ در راه فقط مقدار دریافتی تغییر می‌کند و دریافت تاریخ دارد | `stock_doc_guard` + `stock_doc_line_guard` | T13 «posted header immutable»، «posted lines immutable»، «no lines added after posting»، «in-transit lines: only received qty»، «receiving needs a received date» |
-| INV-INV-29 | ثبت سند انبار شماره و سند GL همان سند را دارد (مگر `not_required`/`deferred`)؛ انتقال به همان انبار نیست | `stock_doc_guard` + CHECK | T13 «posting needs a number and GL link»، «transfer to the same warehouse» |
+| INV-INV-29 | سند انبار ثبت‌شده شمارهٔ `inventory.<نوع>` **همین سند**، سند(های) GL موجودی **همین سند** با مبلغ حرکت‌ها (دائمی) و برای هر سطر حرکت‌های زندهٔ همان SKU/انبار/نوع به اندازهٔ مقدار دارد؛ انتقال دومرحله‌ای در ارسال و دریافت؛ ابطال همهٔ حرکت‌ها را برمی‌گرداند و سند GL برگشت می‌خورد (RV-COM-02/03) | تریگر deferred `stock_doc_verify` + CHECK `stock_doc_cancel_gl` | T13 |
 | INV-INV-30 | شمارش فقط در `counting`؛ گذار پرشی نیست؛ یک انبارگردانی باز در هر انبار | `count_entry_guard` + `count_session_guard` + ایندکس یکتای جزئی | T14 «entries only while counting»، «draft cannot jump to reviewing»، «one open count per warehouse» |
 | INV-INV-31 | دور دوم توسط شخص دیگر و فقط اگر دو دوره‌ای است؛ شمارش‌ها فقط‌افزودنی | `count_entry_guard` + grant | T14 «second round by another counter»، «count entries are append-only»؛ T23 «single-round count has no round 2» |
 | INV-INV-32 | تصویر سیستم فقط در بازبینی؛ هر سطر پیش از ثبت شمارش پذیرفته دارد؛ ثبت‌شده تغییرناپذیر | `count_line_guard` + `count_session_guard` | T14 «system snapshot only in review»، «every line needs an accepted count»، «posted count immutable»، «posted count lines immutable» |
 | INV-INV-33 | بهای تمام‌شدهٔ ادواری = ابتدا + خرید − برگشت − پایان | CHECK | T15 «COGS = opening + purchases − returns − closing» |
-| INV-INV-34 | بستن ادواری از پیش‌نویس، فقط در حالت ادواری، و ثبت‌شده تغییرناپذیر | `periodic_close_guard` | T15 «close starts as draft»، «posted close immutable»، «periodic close only in periodic mode» |
-| INV-INV-35 | زیردفتر موجودی بر حسب حساب و تاریخ = Σ لایه‌ها و در ledger ثبت است؛ با GL برابر است (حالت دائمی) | `ledger_subledger_stock` + `ledger.subledger_source` + `IntegrityService` | T18 (سه مورد)؛ `integration/test_inventory_gl.py::test_subledger_equals_gl_after_scenarios` |
-| INV-INV-36 | انتقال: در راه ارزش مبدأ را می‌گیرد و پس از دریافت خالی می‌شود؛ `transfer_in` از `transfer_out` تغذیه می‌شود و پیش از آن نیست | `stock_move_before` + `source` | T19 (پنج مورد) |
+| INV-INV-34 | بستن ادواری از پیش‌نویس، فقط وقتی کل دوره ادواری است و درون سال مالی؛ بستن‌های ثبت‌شده هم‌پوشان نیستند؛ سرسند و **سطرها** پس از ثبت تغییرناپذیر؛ Σ سطرها = سرسند؛ سند GL همین بستن حساب موجودی را به ماندهٔ پایان می‌برد و خالص COGS = `cogs_value` (RV-COM-07/08/09) | `periodic_close_guard`، `periodic_close_line_guard`، EXCLUDE `periodic_close_no_overlap`، `periodic_close_verify` | T15 |
+| INV-INV-35 | زیردفتر موجودی بر حسب حساب و تاریخ (ارز پایه) = Σ لایه‌ها؛ هر حرکت دائمی حساب موجودی دارد (ادواری ندارد) و ادواری از ثبت آغاز (`basis='opening'`) و آخرین بستن می‌آید (RV-COM-17) | `ledger_subledger_stock` + `stock_move_before` (`HK_INV_ASSET_ACCOUNT_REQUIRED`، `HK_INV_PERIODIC_NO_GL`) | T18، T27، T15 |
+| INV-INV-36 | انتقال: در راه ارزش مبدأ را می‌گیرد و پس از دریافت خالی می‌شود؛ `transfer_in` از `transfer_out` همان سطر؛ **Σ ورودها ≤ خروج** (هیچ کالایی از هیچ) | `stock_move_before` (`HK_INV_COST_SOURCE`، `HK_INV_COST_SOURCE_EXHAUSTED`) + `stock_doc_verify` | T19، T25، T13 |
 | INV-INV-37 | ارزش خروجی تولید = Σ ارزش اجزا؛ حرکت تولید گروه بها دارد | `components` + CHECK | T20 (دو مورد) |
-| INV-INV-38 | برگشت از فروش به بهای خروج اصلی، از خروج فروش، نه پیش از آن و نه بیش از آن | `stock_move_before` + `source` | T21 (پنج مورد) |
+| INV-INV-38 | برگشت از فروش به بهای خروج اصلی، از خروج فروش، نه پیش از آن و نه بیش از آن (**تجمعی**؛ خروجِ دارای برگشت زنده برنمی‌گردد) | `stock_move_before` (`HK_INV_COST_SOURCE_EXHAUSTED`، `HK_INV_REVERSAL_HAS_DEPENDENTS`) + `invoice_verify` (`HK_SALES_RETURN_COST`) | T21، T25، T35 |
 | INV-INV-39 | بازسازی مشتق‌ها همان موجودی و لایه‌ها را می‌سازد و دست‌کاری لایهٔ مشتق کشف می‌شود | `rebuild_derived` (`HK_INV_REBUILD_MISMATCH`) | T22 «rebuild reproduces balances and layers»، «consistent after rebuild»؛ T93 «tampered derived layer not detected» (منفی) |
 | INV-INV-40 | نقطهٔ بازیابی صف را کامل نگه می‌دارد؛ نقطه‌های پیش از کثیفی می‌مانند؛ بازپخش از نقطه = بازپخش کامل | `create_checkpoint` + `repost_pool` | T23 «checkpoint captures the FIFO queue»، «checkpoint before the dirty point survives»، «replay from checkpoint = full replay» |
 
@@ -1182,11 +1260,11 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | INV-SAL-09 | کالای بدون اجازهٔ تخفیف یا قیمت دستی آن را نمی‌گیرد؛ فاکتور عادی سطر اصلی ندارد | `invoice_line_guard` | T32 «item without discounts»، «item without manual price»، «plain invoice has no original line» |
 | INV-SAL-10 | فاکتور ثبت‌شده سطر دارد و جمع سرسند = Σ سطرها | `invoice_verify` (deferred) | T33 «empty invoice»، «header totals must match lines»، «posted invoice totals»، «current total of an uncorrected invoice» |
 | INV-SAL-11 | ردپای تخفیف هر سطر تخفیف آن را دقیقاً توضیح می‌دهد | `invoice_verify` | T33 «discount trace must explain the discount» |
-| INV-SAL-12 | هر سطر کالای انباری با تحویل فوری دقیقاً به اندازهٔ مقدار حرکت دارد؛ خدمت حرکت ندارد؛ تحویل فوری انبار دارد | `invoice_verify` + CHECK | T33 «stock line issued once; service has no move»، «stock line needs its stock move»، «immediate stock needs a warehouse»، «margin from stock moves» |
+| INV-SAL-12 | هر سطر کالای انباری با تحویل فوری حرکت‌های **همان SKU، انبار، شرکت و نوع** به اندازهٔ مقدار دارد و هیچ حرکت بی‌سطری نیست؛ `stock_mode='none'` برای کالای انباری فقط در اصلاحی و تاریخچهٔ مهاجرت؛ فروش آفلاین فقط در فاکتور صندوق همان دستگاه (RV-COM-04/20) | `invoice_verify` (`inventory.assert_doc_moves`، `HK_SALES_STOCK_MODE`، `HK_SALES_OFFLINE_ORIGIN`) | T33، T45، T46 |
 | INV-SAL-13 | سند GL فاکتور از همین فاکتور آمده است؛ حالت تک‌سند سند GL دارد | `assert_gl_link` + CHECK `invoice_gl_shape` | T33 «GL journal must originate from the invoice»، «per-document GL is mandatory» |
 | INV-SAL-14 | شمارهٔ فاکتور برای همین فاکتور و نوع صادر شده است | `assert_number_link` | T33 «number must be issued to this invoice» |
 | INV-SAL-15 | فیلدهای مؤدیان: خریدار نوع ۱ شناسه دارد؛ هر سطر `sstid` دارد؛ نوع ۲ (و ۳) فقط نقدی | `invoice_verify` + CHECK `invoice_moadian_shape` | T33 «type-1 natural buyer needs economic code or national id + postal code»، «every line needs sstid»، «type-2 is cash only» |
-| INV-SAL-16 | تقسیم تسویهٔ مختلط (نقد + نسیه = جمع) حتی در پیش‌نویس | CHECK `invoice_settlement_split` | T33 «mixed settlement split checked on drafts too» |
+| INV-SAL-16 | تقسیم تسویهٔ مختلط مؤدیان: نقد + نسیه = جمع − مالیات بر ارزش افزوده − سایر مالیات‌ها (`cap + insp = tbill − tvam − todam`؛ پژوهش ۰۳) حتی در پیش‌نویس | CHECK `invoice_settlement_split` | T33 «mixed settlement split checked on drafts too» |
 | INV-SAL-17 | سهم فروشندگان = ۱۰۰ | `invoice_verify` | T33 «salesperson shares sum to 100» |
 | INV-SAL-18 | فاکتور ثبت‌شده، سطرها، ردپای تخفیف و سهم‌ها تغییرناپذیر؛ بازگشت به پیش‌نویس و حذف ممنوع | `posted_doc_guard` + `invoice_line_child_guard` | T34 (شش مورد) |
 | INV-SAL-19 | Σ مقدار برگشتی هر سطر ≤ مقدار فروخته‌شده (قفل سطر اصلی) | `invoice_verify` (`FOR NO KEY UPDATE`) | T35 «returned qty tracked»، «cannot return more than remaining» |
@@ -1200,12 +1278,19 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | INV-SAL-27 | ابطال هر حرکت انبار فاکتور را برمی‌گرداند | `invoice_verify` (`HK_SALES_CANCEL_STOCK`) | T38 «every stock move is reversed»، «cancelled with reversal» |
 | INV-SAL-28 | ابطال سند GL ابطال دارد که به فاکتور اشاره می‌کند؛ ابطال پایانی است | CHECK `invoice_cancel_gl` + `assert_gl_link` + `posted_doc_guard` | T38 «cancel needs its GL journal»، «cancel journal must reference the invoice»، «cancelled is final» |
 | INV-SAL-29 | نتیجهٔ بررسی اعتبار با سیاست، سقف و مواجهه سازگار است؛ مواجهه = Σ اجزا؛ استثنا تأییدکننده دارد؛ بررسی‌ها فقط‌افزودنی | CHECK + `forbid_mutation` | T39 (چهار مورد) |
-| INV-SAL-30 | سند دستهٔ GL از همان دسته است؛ فاکتور فقط به دستهٔ باز می‌پیوندد؛ دستهٔ ثبت‌شده تغییرناپذیر و دستهٔ دارای فاکتور لغونشدنی | `gl_batch_guard` + `invoice_verify` | T40 «batch journal must originate from the batch»، «no invoice joins a posted batch»، «posted batch immutable»، «batch with invoices cannot be cancelled» |
+| INV-SAL-30 | سند دستهٔ GL از همان دسته و برابر Σ فاکتورهای عضو ثبت‌شده (هر کلید) و سند موجودی برابر حرکت‌هایشان؛ فاکتور فقط به دستهٔ باز می‌پیوندد (`FOR SHARE`؛ هم‌زمانی)؛ ابطال فاکتورِ دستهٔ ثبت‌شده سند برگشت خودش را دارد (RV-COM-15، RV-COM-02) | `gl_batch_verify`، `invoice_verify`، `gl_batch_guard` | T40، T94 (dblink) |
 | INV-SAL-31 | یک طرح فعال برای هر بازاریاب در هر تاریخ؛ برگشت پورسانت قرینه است؛ ثبت‌ها فقط‌افزودنی | EXCLUDE + `commission_entry_guard` + grant | T41 (سه مورد) |
 | INV-SAL-32 | حوالهٔ ثبت‌شده حرکت برابر دارد؛ رسید مرجوعی به حوالهٔ اصلی اشاره می‌کند؛ سطرهای ثبت‌شده تغییرناپذیر | `delivery_verify` + CHECK + guard | T42 (سه مورد) |
 | INV-SAL-33 | موتور قیمت قطعی است: ورودی و `rule_set_version` یکسان ← خروجی و ردپای یکسان در پایتون و TypeScript | بردار مشترک `testdata/pricing` | `sales/test_pricing_vectors.py::test_all_vectors`، `frontend/packages/pricing/test/vectors.test.ts`، `property/test_pricing.py::test_permutation_invariance` |
 | INV-SAL-34 | تسهیم تخفیف فاکتور: Σ سهم‌ها = D دقیقاً، سهم ≥ ۰، سطر بدون اجازهٔ تخفیف صفر، تساوی با `line_no` | `PricingEngine.allocate` | `property/test_pricing.py::test_allocation_exact_and_stable` |
 | INV-SAL-35 | ماندهٔ دریافتنی مواجهه فقط از ledger (بُعد party) می‌آید، نه از جمع فاکتورها | `CreditControlService` | `sales/test_credit.py::test_exposure_uses_ledger_balance` |
+| INV-SAL-36 | سند فروش هر فاکتور (و اصلاحی به‌صورت تفاوت) به تفکیک کلید با مبالغ فاکتور برابر است و سطر موجودی ندارد؛ سند موجودی جدا (`source_module='inventory'`) برابر ارزش حرکت‌ها (RV-IT2-01/09) | `invoice_verify` (`inventory.assert_gl_amounts`، `inventory.assert_stock_journal`) | T33، T46، T47 |
+| INV-SAL-37 | تخفیف برگشت = سهم نسبی تخفیف سطر جاری فروش (قطع؛ باقیمانده با آخرین برگشت)؛ برگشت `sstid`/واحد مؤدیان را نگه می‌دارد (RV-X2-03) | `invoice_verify` (`HK_SALES_RETURN_DISCOUNT`، `HK_SALES_RETURN_LINE`) | T35 |
+| INV-SAL-38 | اصلاحی تصویر هویتی خریدار و `sstid`/واحد هر سطر نسخهٔ قبل را عوض نمی‌کند (RV-COM-14) | `invoice_verify` (`HK_SALES_CORRECTION_SCOPE`/`_LINE`) | T36 |
+| INV-SAL-39 | فاکتور صندوق با شمارهٔ دستگاه، شمارهٔ رسید `pos.ticket` همان دستگاه و همان رسید را دارد (RV-IT2-06)؛ هر سطر رسید حداکثر یک سطر فاکتور و فقط در فاکتور صندوق (RV-X2-04) | CHECK `invoice_device_number` + `invoice_verify` + `invoice_line_pos_line_uq` + `invoice_line_guard` (`HK_SALES_POS_LINE`) | T46 |
+| INV-SAL-40 | اقساط: Σ = کل فاکتور، سررسید از تاریخ فاکتور و غیرنزولی، Σ اضافه‌بها = سطرهای اضافه‌بها؛ اضافه‌بها در درآمد تحقق‌نیافته (RV-X3-03/04) | `invoice_verify` (`HK_SALES_INSTALLMENTS`) | T47 |
+| INV-SAL-41 | سند یا پیش‌نویس تازه به شخص ادغام‌شده اشاره نمی‌کند؛ سند ثبت‌شدهٔ بازنده قابل ابطال و برگشت با جانشین است (CR-06) | `parties.child_party_guard` روی سرسندها، سطرها، قواعد و حرکت‌ها | T44 |
+| INV-SAL-42 | ابطال حواله و فاکتور: حرکت‌ها برگشته و اسناد GL اصل برگشت خورده‌اند؛ حوالهٔ دائمی بهای تمام‌شده را ثبت می‌کند؛ رسید مرجوعی ≤ حوالهٔ اصلی (تجمعی) (RV-COM-02/05/22) | `delivery_verify` + CHECK `delivery_cancel_gl` | T42، T38 |
 
 ### ۷-۳. خرید
 
@@ -1217,9 +1302,9 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | INV-PUR-04 | سطر کالای انباری فاکتور مستقیم حرکت ورود دارد | `invoice_verify` (`HK_PUR_STOCK_LINK`) | T50 «stock lines need receipt moves» |
 | INV-PUR-05 | فاکتور ثبت‌شده تغییرناپذیر است؛ فاکتور مهاجرت واحد مبلغ دارد | `posted_doc_guard` + CHECK | T50 «posted purchase invoice immutable»، «migrated purchase declares its amount unit» |
 | INV-PUR-06 | هر سطر رسید حرکت `receipt` برابر دارد؛ رسید صورتحساب‌شده ابطال نمی‌شود | `receipt_verify` | T51 «receipt lines need receipt moves»، «invoiced receipt cannot be cancelled» |
-| INV-PUR-07 | GRNI = رسیدهای صورتحساب‌نشده و با فاکتور تسویه می‌شود | `v_receipt_line_unbilled` + قالب GL | T51 «GRNI before invoice»، «GRNI cleared by the invoice» |
+| INV-PUR-07 | GRNI = رسیدهای صورتحساب‌نشده و با فاکتور تسویه می‌شود؛ سطر فاکتور فقط رسید **ثبت‌شدهٔ** همان شرکت/تأمین‌کننده/ارز/SKU را صورتحساب می‌کند و Σ صورتحساب‌شده − برگشت‌ها ≤ دریافت‌شده (RV-COM-06) | `purchase.invoice_verify` (`HK_PUR_RECEIPT_LINK`، `HK_PUR_RECEIPT_OVERBILLED`) + `v_receipt_line_unbilled` | T51 |
 | INV-PUR-08 | برگشت از خرید ≤ خریداری‌شده، به بهای رسید، از سطر همان فاکتور و همان تأمین‌کننده | `invoice_verify` + `source` | T52 (چهار مورد) |
-| INV-PUR-09 | فاکتور دارای برگشت ابطال نمی‌شود؛ ابطال سند GL دارد | `invoice_verify` + CHECK | T53 (دو مورد) |
+| INV-PUR-09 | فاکتور دارای برگشت ابطال نمی‌شود؛ ابطال حرکت‌ها را برمی‌گرداند و سند ابطال برگشت اسناد خرید و موجودی **همین فاکتور** است (RV-COM-02) | `invoice_verify` + CHECK | T53 |
 | INV-PUR-10 | هر فایل کارپوشه یک‌بار؛ یک ردیف برای هر taxid (بارگذاری دوباره به‌روز می‌کند)؛ taxid تغییرناپذیر | یکتای `file_sha256` و `(company, taxid)` + `inbox_guard` | T54 «same file imported twice»، «one row per taxid (re-import updates it)»، «taxid immutable» |
 | INV-PUR-11 | تطبیق فقط با فاکتور همان تأمین‌کننده و یک ردیف برای هر فاکتور؛ ردیف تطبیق‌شده فاکتور را نام می‌برد | CHECK + یکتای `inbox_one_match` + `inbox_guard` | T54 «match only the same supplier»، «one inbox row per purchase invoice»، «matched row names the purchase invoice» |
 | INV-PUR-12 | صورتحساب اصلاحی/برگشتی کارپوشه taxid مرجع دارد | CHECK | T54 «corrective/return invoices reference their original taxid» |
@@ -1231,12 +1316,12 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 
 | شناسه | گزاره | اجرا | آزمون |
 |---|---|---|---|
-| INV-PCK-01 | مانیفست قالب `hkpack/1` دارد و `pack`/`version` آن با کلید ردیف یکسان است | CHECK | `rules_pack_test.sql` «manifest pack mismatch accepted» (منفی) |
-| INV-PCK-02 | نسخهٔ منتشرشده بازبین، زمان انتشار و hash بستهٔ امضاشده دارد | CHECK | «unreviewed publish accepted» (منفی) |
-| INV-PCK-03 | یک نصب برای هر (مستأجر، شرکت، بسته)، از جمله سطح مستأجر (`NULLS NOT DISTINCT`) | UNIQUE | «same pack twice» |
-| INV-PCK-04 | هر شیء حداکثر یک مالک مدیریت‌شده دارد | ایندکس یکتای جزئی `pack_artifact_one_owner` | «two managed owners of one entity» |
-| INV-PCK-05 | تاریخچهٔ نصب فقط‌افزودنی است | grant + `forbid_mutation` | «event log mutable» |
-| INV-PCK-06 | نسخهٔ نصب‌شده منتشرشده و موجود است | FK + سرویس | «unknown version» |
+| INV-PCK-01 | مانیفست قالب `hkpack/1` دارد و `pack`/`version` آن با کلید ردیف یکسان است | CHECK | `30_commerce_test.sql` T61 (روی پایگاه دارای `rules`، مثلاً `INTEGRATED_TESTS=1`؛ درخواست میزبانی هم‌ارز در `50_compliance_test.sql`، §۱۳) |
+| INV-PCK-02 | نسخهٔ منتشرشده بازبین، زمان انتشار و hash بستهٔ امضاشده دارد | CHECK | `30_commerce_test.sql` T61 (روی پایگاه دارای `rules`، مثلاً `INTEGRATED_TESTS=1`؛ درخواست میزبانی هم‌ارز در `50_compliance_test.sql`، §۱۳) |
+| INV-PCK-03 | یک نصب برای هر (مستأجر، شرکت، بسته)، از جمله سطح مستأجر (`NULLS NOT DISTINCT`) | UNIQUE | `30_commerce_test.sql` T61 (روی پایگاه دارای `rules`، مثلاً `INTEGRATED_TESTS=1`؛ درخواست میزبانی هم‌ارز در `50_compliance_test.sql`، §۱۳) |
+| INV-PCK-04 | هر شیء حداکثر یک مالک مدیریت‌شده دارد | ایندکس یکتای جزئی `pack_artifact_one_owner` | `30_commerce_test.sql` T61 (روی پایگاه دارای `rules`، مثلاً `INTEGRATED_TESTS=1`؛ درخواست میزبانی هم‌ارز در `50_compliance_test.sql`، §۱۳) |
+| INV-PCK-05 | تاریخچهٔ نصب فقط‌افزودنی است | grant + `forbid_mutation` | `30_commerce_test.sql` T61 (روی پایگاه دارای `rules`، مثلاً `INTEGRATED_TESTS=1`؛ درخواست میزبانی هم‌ارز در `50_compliance_test.sql`، §۱۳) |
+| INV-PCK-06 | نسخهٔ نصب‌شده منتشرشده و موجود است | FK + سرویس | `30_commerce_test.sql` T61 (روی پایگاه دارای `rules`، مثلاً `INTEGRATED_TESTS=1`؛ درخواست میزبانی هم‌ارز در `50_compliance_test.sql`، §۱۳) |
 | INV-PCK-07 | ارتقا مصنوع ویرایش‌شده (hash ≠ نصب) را بازنویسی نمی‌کند | `PackService.upgrade` | `packs/test_lifecycle.py::test_modified_artifact_kept` |
 | INV-PCK-08 | حذف بسته هیچ شیء استفاده‌شده و هیچ دادهٔ حسابداری را پاک نمی‌کند | `PackApplier.is_used` + FK ماژول‌ها (آخرین سد) | `packs/test_lifecycle.py::test_uninstall_detaches_used`، `::test_uninstall_never_deletes_posted_data` |
 
@@ -1249,6 +1334,8 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | INV-COM-03 | کاتالوگ‌ها (کلید نگاشت، مجوز، تنظیم) ثبت‌اند و برای `hk_app` فقط‌خواندنی؛ lint امنیتی core برای این اسکیماها پاک است | migration + `core.security_lint` | T91 (چهار مورد)؛ `tests/security/test_rls_coverage.py` |
 | INV-COM-04 | `hk_readonly` می‌خواند و هیچ چیز نمی‌نویسد (حتی از راه موتور) | grant | T92 (سه مورد) |
 | INV-COM-05 | توابع definer RLS را دور نمی‌زنند (`NOBYPASSRLS`)، `search_path` ثابت دارند و در allowlist بازبینی‌اند | مالک `hk_inventory_definer` + توضیح `HK_DEFINER_REVIEWED` + CI | T90 «definer repost/verify/adjustment/checkpoint/rebuild cannot reach another tenant»؛ `tools/db/check_secdef_allowlist.py` |
+| INV-COM-06 | نخستین حرکت یا ثبت فروش/خرید کالا را قفل می‌کند (`catalog.item.usage_locked_at`؛ D-M18؛ RV-MD-01) | `stock_move_before`، `sales/purchase.invoice_verify` | T29 |
+| INV-COM-07 | وضعیت بهای هر حرکت از آخرین ارزیابی خود اوست؛ ارزش و وضعیت مستقل از ترتیب درج پس از بازارزیابی (RV-COM-01) | `move_cost_state` + `valuate` + `verify_pool_replay` | T24 (تفاضلی) |
 
 ## ۸. سناریوهای مرزی و خطا
 
@@ -1281,12 +1368,22 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | حذف بستهٔ `cafe` پس از سه ماه کار | انبارهای دارای حرکت، کالاهای منو با فروش و قاعدهٔ استفاده‌شده `detached` می‌مانند؛ تنظیمات و نمایه‌های pos خاموش؛ هیچ داده‌ای پاک نمی‌شود |
 | نصب `retail_apparel` پس از `cafe` روی یک شرکت | واحد «عدد» و گروه `RETAIL` موجود ← `conflict_code` (مالک اول می‌ماند)؛ گزارش در طرح |
 | تغییر حالت دائمی به ادواری در میانهٔ سال | رد (`HK_INV_POLICY_RETROACTIVE`) اگر حرکتی پس از تاریخ هست؛ از آغاز سال بعد مجاز |
-| مستأجر بدون context یا با مستأجر دیگر | خواندن صفر ردیف؛ موتور `HK_TENANT_CONTEXT_MISSING`؛ نوشتن ۴۲۵۰۱؛ API ۴۰۴ |
+| مستأجر بدون context یا با مستأجر دیگر | خواندن صفر ردیف؛ موتور `HK_TENANT_CONTEXT_MISSING`؛ نوشتن ۴۲۵۰۱ ← API ۵۰۰ `internal.tenant_isolation` و هشدار Sev-1 (۰۱ §۵-۵)؛ خواندنِ بی‌ردیف ← ۴۰۴ |
+| فروش آفلاین پیش از رسیدِ پس‌تاریخ همگام می‌شود (ترتیب درج عکس تاریخ) | فروش «نامعلوم» ثبت و استخر کثیف می‌شود؛ بازارزیابی ارزش و **وضعیت** فروش را درست و برگشت‌های وابسته را با وضعیت درست بازارزیابی می‌کند؛ نتیجه با درج به ترتیب تاریخ برابر است (T24) |
+| دو انتقال ورودی یا دو برگشت از یک حرکت مبدأ | دومی اگر جمع از مبدأ بیشتر شود `HK_INV_COST_SOURCE_EXHAUSTED`؛ برگشتِ برگشت ظرفیت را آزاد می‌کند (T25) |
+| مهاجرت بازگردانده و دوباره اجرا می‌شود | `cancel_opening` افتتاحیه‌ها را برمی‌گرداند و اجرای دوباره افتتاحیهٔ درست را می‌پذیرد (T26) |
+| صدور `.hkx` وقتی job بازارزیابی در صف است | درون‌ریزی اصلاح‌های پس از نقطهٔ کثیف را انجام و GL آن‌ها را ثبت می‌کند؛ فقط اختلافِ پیش از نقطهٔ کثیف رد می‌شود (T22) |
+| فاکتور هم‌زمان با ثبت دستهٔ GL به آن می‌پیوندد | فاکتور منتظر می‌ماند و با `HK_SALES_BATCH_CLOSED` رد می‌شود؛ دستهٔ ثبت‌شده دقیقاً فاکتورهای سندش را دارد (T94) |
+| مشتری پس از صدور پیش‌نویس با کارت دیگر ادغام می‌شود | ثبت پیش‌نویس `HK_PARTY_MERGED` (مشترک ادغام پیش‌نویس را به برنده منتقل می‌کند)؛ برگشت فاکتور قدیم با جانشین پذیرفته (T44) |
+| سریال برگشت‌خورده دوباره فروخته می‌شود | برگشت گارانتی و خریدار را پاک می‌کند؛ ابطال برگشت آن‌ها را از فروش اصلی بازمی‌گرداند؛ تعارض آفلاین خریدار قانونی را بازنویسی نمی‌کند (T10، T10b) |
+| تعویض کفش در صندوق | دو رسید (برگشت + فروش) و دو فاکتور/دو سند مؤدیان؛ تسویهٔ خالص در treasury (D-C27) |
+| قیمت گرد شامل مالیات که با هیچ fee صحیح برابر نمی‌شود | تخفیف `rounding` یا `treasury.cash_over_short`؛ بدنهٔ مؤدیان سازگار (D-C30) |
 
 ## ۹. برنامهٔ آزمون
 
 - **پایگاه داده (موجود، سبز):** [`tests/30_commerce_test.sql`](sql/tests/30_commerce_test.sql) روی پایگاه تازه پس از `00 → 10 → 20 → 25 → 30`: fixture با نقش postgres (دو مستأجر، چهار شرکت با میانگین/FIFO/ادواری، هفت انبار، هفت کالا با سریال، بچ، دستور پخت و تولید، کدینگ `ir.general` و سال ۱۴۰۵، سری شماره‌ها)، سپس همهٔ ادعاها با `SET ROLE hk_app` در بلوک‌های DO: T01–T23 انبار، T30–T43 فروش، T50–T56 خرید، T90 جداسازی، T91 کاتالوگ و lint، T92 فقط‌خواندنی، T93 کشف دست‌کاری (با ROLLBACK). روی پایگاه یکپارچه با `40_treasury_pos.sql` و FKهای §۱۲ هم سبز است. در CI: `tests/db/test_sql_suites.py::test_30_commerce_suite`.
-- **آزمون جهش (برنامه):** مانند ledger، هر `core.raise_hk(...)` در `30_commerce.sql` یکی‌یکی بی‌اثر می‌شود؛ هر جهش بازمانده یا آزمون تازه می‌خواهد یا حذف کد مرده. هدف: ۱۰۰٪ کشته‌شدن کدهای `HK_INV_*`، `HK_SALES_*`، `HK_PUR_*`.
+- **بازبینی یکپارچه (آزمون‌های رگرسیون این دور):** fixture اکنون اسناد GL **واقعی** از کلیدهای ثبت می‌سازد (`c_jr`، `c_sales_jr`، `c_stock_jr`، `c_rev_jr`؛ سند فروش و سند موجودی جدا) نه سند ۱ ریالی؛ بُعد شخص، دستگاه صندوق و سری شمارهٔ رسید دستگاه دارد. آزمون‌های تازه: T10b (گارانتی سریال)، T24 (تفاضلی ترتیب درج: سناریوی بازبین + ۸ بذر × میانگین/FIFO با برگشت و انتقال؛ بدون رفع شکست می‌خورد)، T25 (مبدأ بهای تجمعی)، T26 (افتتاحیهٔ دوباره)، T27 (حساب GL روی حرکت)، T28 (فروش آفلاین)، T29 (قفل کالا)، T44 (شخص ادغام‌شده)، T45 (تاریخچهٔ مهاجرت)، T46 (شمارهٔ صندوق، حق سرویس، آفلاین/SKU)، T47 (اقساط)، T60 (کدهای بی‌آزمون پیشین)، T61 (INV-PCK روی `rules`)، T94 (همروندی دستهٔ GL با دو نشست dblink؛ بدون `FOR SHARE` شکست می‌خورد). ادعاهای منفی هر کدام **فقط یک کد** را می‌پذیرند و ورودی طوری ساخته شده که فقط نگهبان هدف بتواند رد کند (RV-COM-10).
+- **آزمون جهش (برنامه):** مانند ledger، هر `core.raise_hk(...)` در `30_commerce.sql` یکی‌یکی بی‌اثر می‌شود؛ هر جهش بازمانده یا آزمون تازه می‌خواهد یا حذف کد مرده. هدف (دروازهٔ CI؛ RV-COM-10): ۱۰۰٪ کشته‌شدن کدهای `HK_INV_*`، `HK_SALES_*`، `HK_PUR_*`.
 - **تفاضلی موتور (Hypothesis):** `property/test_costing.py` دنباله‌های تصادفی (ورود، خروج، برگشت، پس‌تاریخ، تعدیل ثابت، انتقال بین دو استخر، تولید) را روی پایگاه و `domain/costing_ref.py` اجرا و مقایسه می‌کند: ارزش هر حرکت، وضعیت استخر و صف؛ و پس از هر دنباله `verify_pool_replay = 0` و `verify_derived = ∅`. حالت‌ها: میانگین/FIFO × دامنهٔ شرکت/انبار × دقت ریال/ارز دودهی.
 - **قیمت و تخفیف:** بردارهای `testdata/pricing` (دست‌کم ۲۰۰ بردار: تقدم، انباشت، انحصار، پلکان، هدیه، زمان‌دار، تسهیم با تساوی، گرد کردن نقدی، ارز) در پایتون و TypeScript؛ property: جایگشت سطرها خروجی را عوض نمی‌کند (جز `line_no`)، Σ تسهیم دقیق است.
 - **ریاضی مؤدیان:** بردارهای طلایی RC_TICS (T32) و مجموعهٔ مشترک با ماژول مالیات (`testdata/moadian/*.json`)؛ هر فاکتور ثبت‌شده در آزمون‌های یکپارچه از `TaxDocumentService` بدون خطای 0204501 عبور می‌کند.
@@ -1325,7 +1422,12 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | تجمیع backflush هر شیفت، پارتیشن سالانهٔ دفتر موجودی | v2 (بر اساس سنجه) |
 | پیشنهاد خودکار سفارش خرید از حداقل موجودی و پیش‌بینی تقاضا | v2 |
 | بسته‌های داروخانه، سوپرمارکت، پخش، پیمانکاری، تولیدی، طلا (قیمت فرمولی)؛ تولید چندسطحی در ماژول `manufacturing` | later (Q-A) |
-| فروش امانی، drop-ship، فروش اقساطی | later |
+| فروش اقساطی پایه: جدول اقساط از شرایط پرداخت یا طرح دستی، قلم باز هر قسط، اضافه‌بهای اقساط با درآمد تحقق‌نیافته و شناسایی در سررسید، چک هر قسط، گزارش و یادآوری قسط معوق (D-C29؛ نیاز صنف برق، تصمیم Q-A) | v1 |
+| حق سرویس رستوران (D-C28)، شمارهٔ رسید دستگاه برای فاکتور صندوق و تعویض دو-رسیدی (D-C27)، قیمت شامل مالیات و تخفیف `rounding` (D-C30) | v1 |
+| گزارش food cost نظری در برابر واقعی (کافه) و منحنی سایز/sell-through (پوشاک) | v1 |
+| کالای امانی ورودی و خروجی (پوشاک؛ RV-X3-11: ماتریس صنف پژوهش ۰۶ آن را برای پوشاک مهم می‌داند، ولی همان پژوهش آن را در نقشهٔ راه V2-03 و ستون فاز «v2» گذاشته است؛ تا پاسخ Q-C10 در v2 می‌ماند و طراحی زیر بی‌مهاجرت شکننده افزودنی است): انبارهای «امانی» با `ownership` و `owner_party_id`، استخرهای بیرون از ارزش شرکت و زیردفتر، سند تسویهٔ امانی که مصرف‌شده را به فاکتور خرید تبدیل می‌کند؛ قلاب: حرکت‌ها و استخرها کلید انبار دارند، پس افزودن ستون مالکیت به `inventory.warehouse` مهاجرت داده نمی‌خواهد | v2 |
+| بدنهٔ ریالی فاکتور مؤدیان ارزی (صادرات، الگوی ۷) | v2 |
+| drop-ship | later |
 
 ## ۱۱. وابستگی‌ها و تصمیم‌های باز
 
@@ -1342,29 +1444,36 @@ uninstall:  feature flags و تنظیمات بسته خاموش؛ هر مصنو�
 | `treasury` (L4) | `OpenItemService.register/cancel`، `ReceiptService.record_and_allocate` (پیشخوان)، `ChequeQuery.party_exposure` / `v_party_cheque_exposure` |
 | `tax` (L4) | `TaxCalculator.compute`، `TaxDocumentService.create_for_sales/request_cancel`، اعتبار مالیاتی خرید از تطبیق صندوق ورودی |
 | مصرف‌کننده‌ها | `pos` (`SalesInvoiceService.post_from_pos`، `StockQuery.availability`، `pricing/snapshot`)، `reports`، `migration`، `packs` |
+| (بازبینی یکپارچه) | ledger: `journal_line.posting_key` (سنجش مبالغ؛ درخواست افزودن به `v_journal_line` در §۱۳)، `is_reversed` در `v_journal_line`، قالب `ir.general` برای `sales.service_charge` و کلیدهای اقساط؛ parties: `child_party_guard`، `merged_into_id` (جانشین)؛ catalog: `usage_locked_at` (قفل در نخستین حرکت/ثبت)؛ treasury: قلم باز هر قسط (`source_line_key='inst:<n>'`) و `v_open_item` برای وضعیت پرداخت؛ tax: `TaxRegisterService.record_purchase`/`update_moadian_match` (CR-CMP-04) و `calc_snapshot`؛ pos: `PosTicketIn` با شمارهٔ رسید و شناسهٔ سطرها، تعویض دو-رسیدی، رویداد `pos.order.line_wasted`؛ core: `number_issued.device_id`، `forbid_actor_via` |
 
-### ۱۱-۲. تصمیم‌های صاحب محصول که این بخش بر آن‌ها تکیه دارد
+### ۱۱-۲. تصمیم‌های صاحب محصول که این بخش بر آن‌ها تکیه دارد (`docs/00-decisions.md`، دور دوم؛ همه پاسخ گرفته‌اند)
 
-| پرسش | پاسخ | اثر در این بخش |
+| پرسش | پاسخ صاحب محصول | اثر در این بخش |
 |---|---|---|
-| Q-A دامنهٔ صنفی v1 | کافه، پوشاک/کفش، برق، SME عمومی؛ بقیه بعداً به‌شکل بسته | چهار بستهٔ v1 (§۵-۱۱)؛ هسته برای داروخانه (بچ/انقضا/FEFO)، سوپرمارکت (ترازو، قاعدهٔ زمان‌دار)، پخش (فهرست کانال، گروه، اعتبار)، تولیدی (BOM تولید، `components`) آماده است |
-| Q-F دستیار هوشمند | فقط پیش‌نویس؛ خواندن از سرویس‌های مجوزدار | §۵-۱۷ |
-| Q-G آداپترهای مهاجرت | هلو، سپیدار، حسابفا، Excel در v1؛ نمونه از صاحب محصول | سرویس‌های import idempotent (§۵-۱۵)؛ تله‌های افتتاحیه در D-C12؛ آزمون طلایی منتظر نمونه‌ها |
-| Q-H قیمت‌گذاری قابل تنظیم | پیکربندی‌پذیر | بسته‌ها با `entitlement` در مانیفست؛ هیچ قابلیت هسته‌ای این بخش پشت حق اشتراک قفل نمی‌شود مگر با پرچم core |
-| Q-B، Q-C، Q-D، Q-E | — | اثر مستقیم ندارند |
+| Q-A صنف‌های کامل v1 | کافه و رستوران، کفش و پوشاک، کالای برق، کسب‌وکار عمومی کوچک و متوسط؛ صنف‌های دیگر بعداً به‌شکل «بستهٔ صنفی» | چهار بستهٔ v1 (§۵-۱۱)؛ نیازهای صنفی v1: ضایعات آشپزخانه و food cost (کافه)، منحنی سایز (پوشاک)، سریال/گارانتی و **فروش اقساطی پایه** (برق؛ D-C29)؛ امانی در v2 |
+| Q-B سرور نسخهٔ نصبی | فقط لینوکس (Docker) در v1 | اثر مستقیم ندارد |
+| Q-C کلید امضای مؤدیان | انتخاب مشتری (پیش‌فرض روی سرور ما) | اثر مستقیم ندارد (ماژول مالیات) |
+| Q-D حقوق و دستمزد v1 | قانون کار + ساعتی/پاره‌وقت | پورسانت فروشنده: مدل داده v1، پرداخت v2 (D-C23) |
+| Q-E شبکهٔ نمایندگی | مدل داده v1، پرتال در اولین به‌روزرسانی | اثر مستقیم ندارد |
+| Q-F دستیار هوشمند | در محصول؛ ارائه‌دهندهٔ مدل قابل تنظیم (API سازگار با OpenAI یا مدل داخلی)؛ فقط پیشنهاد، تأیید با کاربر | §۵-۱۷؛ پیش‌نویس سفارش خرید با `origin='assistant'` (C-AS-12)؛ ثبت قطعی در تراکنش دستیار رد می‌شود (`0_actor_via_guard`) |
+| Q-G نرم‌افزار مبدأ و دادهٔ نمونه | هلو، سپیدار، حسابفا، Excel و دفتر دستی؛ ابزار چهار مورد اول در v1؛ نمونه با رضایت مشتری از صاحب محصول | سرویس‌های ورود idempotent با lineage (§۵-۱۵)؛ تله‌های افتتاحیه (D-C12)؛ آزمون طلایی پس از دریافت نمونه‌ها |
+| Q-H مبنای قیمت‌گذاری اشتراک | در جدول تصمیم‌ها نیامده ⇒ **قابل تنظیم می‌ماند** | بسته‌ها `entitlement` در مانیفست دارند؛ هیچ قابلیت هسته‌ای این بخش پشت حق اشتراک قفل نمی‌شود مگر با پرچم core |
 
-### ۱۱-۳. تصمیم‌های باز
+### ۱۱-۳. تصمیم‌های باز (پرسش‌ها به زبان ساده)
 
-| شناسه | پرسش | پیشنهاد این بخش | چه کسی |
+| شناسه | پرسش ساده | پیشنهاد این بخش | چه کسی |
 |---|---|---|---|
-| Q-C01 | روش ارزیابی پیش‌فرض شرکت تازه | میانگین موزون متحرک با دامنهٔ شرکت (رایج‌ترین در هلو/سپیدار) | حسابدار رسمی مشاور |
-| Q-C02 | سیاست پیش‌فرض تفاوت قیمت خرید | `revalue_stock` (بهای واقعی)؛ `price_difference_account` برای شرکت‌های بزرگ | حسابدار |
-| Q-C03 | ثبت تخفیف فروش: حساب جدا یا خالص درآمد | حساب جدا `sales.discount` (رویهٔ رایج ایرانی، گزارش‌پذیر)؛ قاعدهٔ نگاشت می‌تواند آن را به همان حساب فروش ببرد | حسابدار |
-| Q-C04 | گرد کردن نقدی صندوق: تخفیف فاکتور یا حساب گرد کردن صندوق | تخفیف `rounding` در فاکتور (مؤدیان سازگار)؛ باقیمانده در treasury | صاحب محصول + حسابدار |
-| Q-C05 | فروش آفلاین در انبار `block` | پذیرش با استثنا (واقعیت فیزیکی)؛ دستگاه هنگام آنلاین بودن جلوی فروش را می‌گیرد | صاحب محصول |
-| Q-C06 | حد inline بازارزیابی | ۲۰۰ حرکت (تنظیم مستأجر) | فنی، پس از سنجش |
-| Q-C07 | ذخیرهٔ گارانتی و هزینهٔ خدمات پس از فروش در کالای برق | v2؛ فعلاً فقط ردیابی | صاحب محصول |
-| Q-C08 | اولویت مبنای پورسانت (درآمد، سود ناخالص، وصول) | v2؛ مدل هر سه را دارد | صاحب محصول |
+| Q-C01 | شرکت تازه به‌طور پیش‌فرض بهای کالا را «میانگین» حساب کند یا «اولین ورود، اولین خروج»؟ | میانگین موزون متحرک در سطح شرکت (رایج در هلو و سپیدار) | حسابدار رسمی مشاور |
+| Q-C02 | اگر قیمت فاکتور خرید با قیمت رسید فرق کرد، فرق به بهای کالا برود یا به یک حساب جدا؟ | به بهای کالا (`revalue_stock`)؛ حساب جدا برای شرکت‌های بزرگ | حسابدار |
+| Q-C03 | تخفیف فروش در حساب جدا ثبت شود یا از خود فروش کم شود؟ | حساب جدای `sales.discount` (گزارش‌پذیر)؛ نگاشت می‌تواند آن را به همان حساب فروش ببرد | حسابدار |
+| Q-C05 | صندوقی که اینترنت ندارد اگر کالایی را بفروشد که در سیستم موجودی‌اش صفر است، فروش پذیرفته شود؟ | بله، با ثبت «استثنا» برای بررسی (واقعیت فیزیکی است)؛ وقتی صندوق آنلاین است جلوی فروش را می‌گیرد | صاحب محصول |
+| Q-C06 | ثبت با تاریخ گذشته تا چند حرکت را فوراً دوباره قیمت کند و بیشتر را به کار پس‌زمینه بسپارد؟ | ۲۰۰ حرکت (قابل تنظیم برای هر مستأجر) | فنی، پس از سنجش |
+| Q-C07 | برای کالای برق، هزینهٔ گارانتی از الان ذخیره شود؟ | در v2؛ فعلاً فقط ردیابی سریال و گارانتی | صاحب محصول |
+| Q-C08 | پورسانت فروشنده بر چه پایه‌ای حساب شود: فروش، سود، یا پول وصول‌شده؟ | v2؛ مدل داده هر سه را دارد | صاحب محصول |
+| Q-C09 | اضافه‌بهای فروش اقساطی پیش‌فرض چند درصد باشد و مالیات بر ارزش افزوده بگیرد یا نه؟ | درصد قابل تنظیم برای هر شرکت (پیش‌فرض ۰)؛ مالیات طبق پارامتر قواعد مالیات (۰۷) | صاحب محصول + حسابدار |
+| Q-C10 | فروشگاه کفش و پوشاک کالایی را که مال تولیدکننده است و فقط بعد از فروش پولش را می‌دهد (کالای امانی)، از روز اول نیاز دارد یا می‌تواند تا نسخهٔ ۲ صبر کند؟ | نسخهٔ ۲ (طبق نقشهٔ راه پژوهش ۰۶). تا آن زمان فروشنده کالای امانیِ فروخته‌شده را با یک فاکتور خرید عادی از تولیدکننده ثبت می‌کند | صاحب محصول |
+
+**پاسخ‌داده‌شده در این دور:** Q-C04 (گرد کردن نقدی صندوق) ← تخفیف `rounding` در فاکتور و مازاد در `treasury.cash_over_short` (D-C30).
 
 ## ۱۲. کلیدهای خارجی بین‌ماژولی (برای `99_cross_fk.sql`)
 
@@ -1393,8 +1502,50 @@ ALTER TABLE pos.ticket
 - `sales.commission_entry.settled_ref` ← سند پرداخت treasury/payroll (v2).
 - `inventory.stock_move.(source_module, source_doc_type, source_doc_id, source_line_id)` ← سند مبدأ (چندریختی؛ تریگرهای deferred اسناد پیوند را بررسی می‌کنند).
 - شناسه‌های نسخهٔ قاعدهٔ مالیاتی در `sales.invoice.tax_snapshot` (jsonb؛ مالک tax/rules).
+- `sales.invoice.pos_ticket_id` و `sales.invoice_line.pos_ticket_line_id` ← `pos.ticket`/`pos.ticket_line` (pos در L6؛ FK معکوس `pos.ticket.sales_doc_id` موجود است و pos پیوند را می‌سنجد؛ D-C27).
+- `sales.invoice_installment.cheque_ref` ← چک treasury (اختیاری؛ v1 ارجاع نرم).
+- `sales.invoice.stock_journal_id`/`cancel_stock_journal_id`، `purchase.invoice.stock_journal_id`، `sales.gl_batch.stock_journal_id` ← `ledger.journal` (FK درون فایل؛ ledger وابستگی این بخش است).
 
 ## ۱۳. تعارض‌ها و درخواست تغییر
+
+
+### ۱۳-۰. وضعیت پس از رأی یکپارچه‌سازی (`docs/design/change-requests.md`) و بازبینی این دور
+
+**درخواست‌های این بخش (CR-C۰۱…۱۴):**
+
+| شناسه | رأی | وضعیت |
+|---|---|---|
+| CR-C01 | پذیرفته | انجام‌شده (۰۷ جدول‌های بسته را در `rules` ساخت؛ ناوردایی‌های INV-PCK در T61 آزموده می‌شوند) |
+| CR-C02 | پذیرفته | باز (ماژول کدی `packs` و مجوزهای `packs.pack.*` در ۰۱/core) |
+| CR-C03 | پذیرفته | انجام‌شده (`hk_inventory_definer` در پایه) |
+| CR-C04 | پذیرفته با بازبینی | باز (فهرست مجاز ۰۱)؛ این دور هیچ تابع definer تازه‌ای نیفزود |
+| CR-C05 | پذیرفته (CR-T04) | انجام‌شده |
+| CR-C06 | پذیرفته | باز (متن §۲ بخش ۰۳) |
+| CR-C07 | پذیرفته | FK در 99 انجام‌شده؛ قرارداد خواندن `number_issued` (با `device_id`) باز در متن ۰۲ |
+| CR-C08 | پذیرفته | باز (۰۴: `warranty_days` در `v_sku`) |
+| CR-C09 | پذیرفته (CR-CMP-04) | انجام‌شده |
+| CR-C10 | پذیرفته | باز (۰۴) |
+| CR-C11 | پذیرفته | باز (۰۳)؛ بند (۲) با رأی CR-MG01 جایگزین شد: افتتاحیهٔ موجودی مهاجرت بی‌GL است |
+| CR-C12 | پذیرفته (R-IMPORT) | باز (۰۲)؛ `rebuild_derived` استخر کثیفِ هنگام صدور را می‌پذیرد (RV-COM-18) |
+| CR-C13 | پذیرفته (v2) | به تعویق (v2)؛ نام رویداد به `ledger.fiscal_year.closed` اصلاح شد |
+| CR-C14 | پذیرفته | باز (۰۴؛ RV-IT-01) |
+
+**رأی‌هایی که مالکشان این بخش است (اجراشده در این دور):** 04:CR-06 (`child_party_guard` روی سرسندها، سطرها، قواعد، حرکت‌ها؛ T44) — انجام‌شده؛ 06:CR-T07 (`sales.service_charge` و سطر `service_charge`؛ D-C28) — انجام‌شده؛ 06:CR-T08 — انجام‌شده؛ 06:CR-T06 (`post_shift_batch`) — به تعویق v1.1؛ 07:CR-CMP-04 (`record_purchase`/`update_moadian_match`، `calc_snapshot`، سطر دارایی ← `assets.disposal_clearing`) — انجام‌شده در متن §۵-۷/§۵-۱۰؛ 07:CR-CMP-14 — انجام‌شده؛ 08:CR-MG01 و 08:CR-MG15 و 08:CR-MG16 (اصطلاح `job_id`) — انجام‌شده (§۵-۱۵، D-C12)؛ 10:C-AS-12 (`purchase."order".origin`) — انجام‌شده (T55)؛ 10:C-AS-02/C-AS-11 (تریگر `"0_actor_via_guard"` روی جدول‌های ثبت این بخش) — انجام‌شده (T55)؛ 10:C-AS-19 (بخش اختیاری `assistant` در `hkpack/1`، فقط اعتبارسنج بی‌Applier) — پذیرفته در §۵-۱۱؛ R-ERR (RV-X1-16) نام کدهای API این بخش اصلاح شد (§۵-۱۴).
+
+**درخواست‌های تازهٔ این دور (به مالکان دیگر):**
+
+| شناسه | به | موضوع | درخواست |
+|---|---|---|---|
+| CR-C15 | ledger (۰۳) | قرارداد دو سند (RV-IT2-01) | D-L15 بنویسد: سطر حساب کنترلی موجودی فقط از سند `source_module='inventory'` (همان `source_doc` سند تجاری) می‌آید؛ سند فاکتور فروش/خرید سطر موجودی و COGS ندارد؛ حساب `1401` همان `{inventory, migration}` بماند |
+| CR-C16 | ledger (۰۳) | `posting_key` در ویوی منتشرشده | ستون `posting_key` به `ledger.v_journal_line` افزوده شود (راستی‌آزمایی مبالغ این بخش اکنون `ledger.journal_line` را مستقیم می‌خواند) |
+| CR-C17 | ledger (۰۳) | قالب ir.general | (۱) حساب‌های اختصاصی «درآمد تحقق‌نیافتهٔ اقساط» (بدهی) و «درآمد فروش اقساطی» افزوده و نگاشت `sales.installment_unearned`/`sales.installment_income` را مالک شود (این بخش موقتاً `3301`/`6101` را نگاشت کرده)؛ (۲) `inventory.opening_stock` و نگاشت `7103` حذف شوند (بستن ادواری از حساب موجودی سطرها؛ RV-COM-09)؛ (۳) قالب `ir.cafe` حساب هزینهٔ `7104` «بهای تمام‌شدهٔ منو» داشته باشد |
+| CR-C18 | treasury/pos (۰۶) | قرارداد شمارهٔ صندوق و تعویض (RV-IT2-06، RV-X2-04) | `PosTicketIn` شمارهٔ رسید (`number_issued_id`، `ticket_no`) و شناسهٔ هر سطر را دارد؛ `pos` پیوند `ticket.sales_doc_id`/`number_issued_id` را بسنجد؛ تعویض = دو رسید (برگشت + فروش) با `exchange_ref` و تسویهٔ خالص؛ `post_from_pos(kind='return')` سطر اصلی را با `sales.invoice_line.pos_ticket_line_id` می‌یابد |
+| CR-C19 | treasury/pos (۰۶) | گرد کردن و حق سرویس (RV-X1-11، CR-T07) | `rounding_adjustment` ← تخفیف `rounding`؛ مازاد ← `treasury.cash_over_short`؛ تنظیم `pos.cash_rounding_increment` حذف و `sales.cash_rounding.increment` تنها تنظیم؛ «رسید بی‌تغییر به فاکتور» با الگوریتم D-C30 جایگزین شود؛ `service_charge` ← سطر `line_kind='service_charge'` |
+| CR-C20 | treasury/pos (۰۶) | اقلام باز اقساط و رویدادها (RV-X3-03، RV-X1-10) | یک قلم باز برای هر ردیف `sales.invoice_installment` (`source_line_key='inst:<seq>'`)؛ چک هر قسط به `cheque_ref`؛ ادعای مصرف `treasury.open_item.closed`/`gateway_payment.*` توسط sales/purchase از §۵ بخش ۰۶ حذف شود (وضعیت پرداخت از `v_open_item`)؛ `pos.order.line_wasted` محمولهٔ `order_line_id`، `bom_id` و تاریخ را داشته باشد |
+| CR-C21 | compliance (۰۷) | مالیات (RV-X2-04، RV-X3-04، RV-COM-26) | (۱) تعویض صندوق یک صدور `ins=4` و یک `ins=1` است؛ (۲) پارامتر قواعد `tax.installment_markup.vat_basis` برای مالیات اضافه‌بهای اقساط؛ (۳) آزمون‌های منفی INV-PCK-01…06 هم‌ارز T61 در `50_compliance_test.sql` (جدول‌ها مال `rules` است) |
+| CR-C22 | masterdata (۰۴) | رویدادها و قفل کالا (RV-X1-10، RV-MD-01) | فهرست مصرف‌کنندهٔ `catalog.bom.*`، `parties.role.changed`، `parties.hold.*`، `catalog.price_list.changed` فقط `pos.sync_streams` باشد؛ D-M18 بنویسد که قفل کاربرد در DB هنگام نخستین حرکت و ثبت فاکتور فروش/خرید زده می‌شود |
+| CR-C23 | integrator (`99_integration_test.sql`) | جریان‌های C0/C1/C2/C4/C5 با قرارداد تازه | C0: دو بررسی «سند فروش/خرید با سطر موجودی» با «سند موجودی جدا با `source_module='inventory'`» جایگزین و راه گریز «باز کردن 1401 به sales/purchase» حذف شود؛ C1/C2/C5: سند موجودی جدا (`stock_journal_id`) و برگشت آن در ابطال؛ C4: فاکتور صندوق با `pos_ticket_id`، شمارهٔ رسید همان دستگاه و `stock_move.device_id` برای حرکت آفلاین؛ بررسی سراسری «هر `event_subscription.event_type` منتشرشده است» |
+| CR-C24 | architecture (۰۱) | نگاشت خطای جداسازی (RV-X1-17) | نگاشت یکتای `42501`/`*_TENANT_CONTEXT*` ← `internal.tenant_isolation` (۵۰۰ + Sev-1) در ۰۳ و ۰۴ هم به‌کار رود |
 
 | شناسه | به | موضوع | پیشنهاد |
 |---|---|---|---|
@@ -1410,7 +1561,7 @@ ALTER TABLE pos.ticket
 | CR-C10 | catalog (بخش ۰۴، D-M22) | تشخیص «ردیف ویرایش‌شده توسط کاربر» در اعمال بسته با `row_version` | یکسان‌سازی با `rules.pack_artifact.content_sha256` (hash فیلدهای مدیریت‌شده)؛ `row_version` با هر touch بالا می‌رود و مثبت کاذب می‌دهد. `IndustryPackService` کاتالوگ به `CatalogPackApplier` (§۵-۳) تبدیل شود |
 | CR-C11 | ledger (بخش ۰۳) | قراردادهای خواندن و افتتاحیه | (۱) `ledger.v_journal_line` که تریگرهای deferred برای پیوند GL می‌خوانند، ویوی منتشرشده بماند. (۲) inventory منبع مجاز `journal_type='opening_import'` برای حساب کنترلی موجودی باشد. (۳) `MappingService.coverage` برای کلید `inventory.asset` با شرط `attr:warehouse` در دامنهٔ استخر شرکت هشدار دهد (D-C03). (۴) متد `BalanceQuery.party_balance(company, party, account_role, as_of)` (ماندهٔ بُعد party روی حساب‌های با نقش دریافتنی/پرداختنی) برای کنترل اعتبار منتشر شود |
 | CR-C12 | core (صدور/درون‌ریزی `.hkx`) | مشتق‌های موجودی صادر نمی‌شوند | درون‌ریز `.hkx` پس از COPY قلاب `import_hook` هر ماژول را صدا بزند: `setval(inventory.posting_seq)` و `inventory.rebuild_derived(company)`؛ ناسازگاری ← رد درون‌ریزی |
-| CR-C13 | ledger (D-L18) | حذف چهار صفر در سال تبدیل | مشترک `inventory.year_close` روی `ledger.year.closed` لایه‌های `redenomination` می‌سازد (v2)؛ ledger ترتیب «بستن سال ← تبدیل زیردفترها ← افتتاحیه» را تضمین کند |
+| CR-C13 | ledger (D-L18) | حذف چهار صفر در سال تبدیل | مشترک `inventory.year_close` روی `ledger.fiscal_year.closed` (نام منتشرشدهٔ ۰۳؛ و `.reopened` برای خنثی‌سازی) لایه‌های `redenomination` می‌سازد (v2)؛ ledger ترتیب «بستن سال ← تبدیل زیردفترها ← افتتاحیه» را تضمین کند |
 | CR-C14 | masterdata (بخش ۰۴) | lint امنیتی core روی `25_masterdata.sql` | روی پایگاه تازه پس از `25_masterdata.sql` هنوز ۳۹ یافتهٔ `tenant_table_not_in_export_registry` هست (catalog ۲۴، parties ۱۵)؛ ثبت آن‌ها در `core.export_table_registry` لازم است. برای inventory، sales و purchase صفر است |
 
 **DDL پیشنهادی CR-C01 (اسکیمای `rules`):**

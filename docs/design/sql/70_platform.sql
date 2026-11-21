@@ -33,23 +33,29 @@ BEGIN
   END IF;
 END $$;
 
--- ---------- نقش‌ها (سطح کلاستر، idempotent؛ رمزهای این‌جا فقط برای توسعه/آزمون — C-01 بخش ۰۱) ----------
+-- ---------- نقش‌ها (سطح کلاستر، idempotent؛ R-ROLE و RV-IT-14) ----------
+-- همهٔ نقش‌ها NOLOGIN و بدون رمز ساخته می‌شوند. ابزار استقرار (hkctl) با «ALTER ROLE … LOGIN PASSWORD» و رمز SecretStore
+-- ورود را فعال می‌کند؛ توسعه و آزمون محلی: psql -v hk_dev_ok=1 -f docs/design/sql/dev_roles.sql. این فایل هرگز رمز نمی‌نویسد.
 DO $$
+DECLARE
+  r text;
 BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hk_platform_app') THEN
-    CREATE ROLE hk_platform_app LOGIN PASSWORD 'hk_platform_app' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
-  END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hk_platform_ingest') THEN
-    CREATE ROLE hk_platform_ingest LOGIN PASSWORD 'hk_platform_ingest' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
-  END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hk_partner_app') THEN
-    CREATE ROLE hk_partner_app LOGIN PASSWORD 'hk_partner_app' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
-  END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hk_platform_readonly') THEN
-    CREATE ROLE hk_platform_readonly LOGIN PASSWORD 'hk_platform_readonly' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
-  END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hk_platform_audit_writer') THEN
-    CREATE ROLE hk_platform_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+  FOREACH r IN ARRAY ARRAY['hk_platform_app','hk_platform_ingest','hk_partner_app','hk_platform_readonly','hk_platform_audit_writer'] LOOP
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r) THEN
+      BEGIN
+        EXECUTE format('CREATE ROLE %I NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION', r);
+      EXCEPTION WHEN duplicate_object THEN NULL;   -- اجرای هم‌زمان روی همان کلاستر
+      END;
+    END IF;
+    -- سخت‌سازی ویژگی‌های امنیتی (LOGIN و رمز مال ابزار استقرار است و دست نمی‌خورد)
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = r
+                AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)) THEN
+      EXECUTE format('ALTER ROLE %I NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION', r);
+    END IF;
+  END LOOP;
+  -- مالک تنها تابع definer هرگز ورود ندارد
+  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'hk_platform_audit_writer' AND rolcanlogin) THEN
+    ALTER ROLE hk_platform_audit_writer NOLOGIN;
   END IF;
 END $$;
 ALTER ROLE hk_platform_app      SET statement_timeout = '30s';
@@ -105,6 +111,47 @@ END $$;
 -- نسخهٔ CalVer (YYYY.M.P) برای مقایسه
 CREATE OR REPLACE FUNCTION platform.calver_key(p text) RETURNS int[]
 LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT string_to_array(p, '.')::int[] $$;
+
+-- تقویم جلالی (RV-PLT-14): روز «۱ فروردین» سال jy در ماه مارس سال میلادی jy+621، با الگوریتم چرخه‌های ۳۳ساله و جدول
+-- سال‌های شکست (Borkowski؛ همان مرجع jalaali). سال جلالی یک تاریخ = سال صدور صورتحساب برای سری شماره‌گذاری بی‌فاصلهٔ هر سال.
+-- همتای پایتون (kernel.calendar.jalali) با آزمون برابری روی بازهٔ ۱۳۵۰ تا ۱۵۰۰ هم‌خوان نگه داشته می‌شود (CR-PLT-16).
+CREATE OR REPLACE FUNCTION platform.jalali_march_day(p_jy int) RETURNS int
+LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$
+DECLARE
+  breaks int[] := ARRAY[-61, 9, 38, 199, 426, 686, 756, 818, 1111, 1181, 1210, 1635, 2060, 2097, 2192, 2262, 2324, 2394, 2456, 3178];
+  gy int := p_jy + 621;
+  leap_j int := -14;
+  jp int := breaks[1];
+  jm int; jump int := 0; n int; leap_g int; i int;
+BEGIN
+  IF p_jy < jp OR p_jy >= breaks[array_length(breaks, 1)] THEN
+    RAISE EXCEPTION 'HK_PLT_JALALI_RANGE: Jalali year % out of range', p_jy USING ERRCODE = 'P0001';
+  END IF;
+  FOR i IN 2 .. array_length(breaks, 1) LOOP
+    jm := breaks[i];
+    jump := jm - jp;
+    EXIT WHEN p_jy < jm;
+    leap_j := leap_j + (jump / 33) * 8 + ((jump % 33) / 4);
+    jp := jm;
+  END LOOP;
+  n := p_jy - jp;
+  leap_j := leap_j + (n / 33) * 8 + (((n % 33) + 3) / 4);
+  IF jump % 33 = 4 AND jump - n = 4 THEN
+    leap_j := leap_j + 1;
+  END IF;
+  leap_g := (gy / 4) - (((gy / 100) + 1) * 3 / 4) - 150;
+  RETURN 20 + leap_j - leap_g;
+END $$;
+
+CREATE OR REPLACE FUNCTION platform.jalali_year(p_date date) RETURNS int
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT CASE WHEN p_date >= make_date(extract(year FROM p_date)::int, 3, platform.jalali_march_day(extract(year FROM p_date)::int - 621))
+              THEN extract(year FROM p_date)::int - 621 ELSE extract(year FROM p_date)::int - 622 END
+$$;
+
+-- «امروز» در منطقهٔ زمانی تهران (تاریخ صدور صورتحساب؛ مستقل از TimeZone نشست)
+CREATE OR REPLACE FUNCTION platform.tehran_today() RETURNS date
+LANGUAGE sql STABLE AS $$ SELECT (now() AT TIME ZONE 'Asia/Tehran')::date $$;
 
 -- sha256 متن UTF-8
 CREATE OR REPLACE FUNCTION platform.sha256_text(p text) RETURNS bytea
@@ -353,6 +400,10 @@ BEGIN
     IF NEW.subject_type <> v_act.subject_type THEN
       PERFORM platform.fail('HK_PLT_APPROVAL_MISMATCH', format('action %s expects subject %s', NEW.action, v_act.subject_type));
     END IF;
+    IF NEW.action = 'price.publish' AND NOT EXISTS (SELECT 1 FROM platform.product_version pv
+                                                    WHERE pv.id = NEW.subject_id AND pv.status = 'in_review') THEN
+      PERFORM platform.fail('HK_PLT_APPROVAL_MISMATCH', 'price approvals are requested only for a version in review (frozen content)');
+    END IF;
     NEW.payload_sha256 := platform.sha256_text(NEW.payload::text);
     NEW.expires_at := now() + v_act.ttl;
     NEW.decided_by := NULL; NEW.decided_at := NULL; NEW.consumed_at := NULL; NEW.consumed_ref := NULL;
@@ -411,11 +462,40 @@ CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON platform.approval_request FO
 DROP TRIGGER IF EXISTS trg_no_delete ON platform.approval_request;
 CREATE TRIGGER trg_no_delete BEFORE DELETE ON platform.approval_request FOR EACH ROW EXECUTE FUNCTION platform.forbid_mutation();
 
+-- «پیوند» تأیید به عملیات اجراشده (RV-PLT-04): برای کنش‌هایی که موضوعشان ظرف است، نه خود عملیات (کارمند، کیف پول،
+-- نماینده، مستأجر، اشتراک، تسویه، لایسنس، اطلاعیه)، فیلدهای تعیین‌کنندهٔ عملیات از همین تابع ساخته می‌شوند. سرویس هنگام ثبت
+-- درخواست تأیید payload را با همین تابع می‌سازد (به‌اضافهٔ اطلاعات نمایشی) و تریگر کنش محافظت‌شده هنگام مصرف همان را از سطر
+-- اجراشده می‌سازد؛ هر کلید پیوند باید در payload تأییدشده دقیقاً برابر باشد ← وگرنه HK_PLT_APPROVAL_MISMATCH.
+CREATE OR REPLACE FUNCTION platform.approval_binding(p_action text, p_row jsonb) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE p_action
+    WHEN 'staff.grant_privileged_role' THEN jsonb_build_object('role_code', p_row->>'role_code')
+    WHEN 'wallet.manual_adjustment'    THEN jsonb_build_object('amount', p_row->>'amount')
+    WHEN 'commission.adjustment'       THEN jsonb_build_object('amount', p_row->>'amount')
+    WHEN 'reseller.quota_adjustment'   THEN jsonb_build_object('product_code', p_row->>'product_code', 'delta', p_row->>'delta')
+    WHEN 'subscription.comp_term'      THEN jsonb_build_object('period_start', p_row->>'period_start', 'period_end', p_row->>'period_end')
+    WHEN 'payout.approve'              THEN jsonb_build_object('amount', p_row->>'amount', 'sheba', p_row->>'sheba')
+    WHEN 'announcement.sms_broadcast'  THEN jsonb_build_object('sms_pattern_code', p_row->>'sms_pattern_code', 'targeting', p_row->'targeting')
+    WHEN 'license.issue'               THEN jsonb_build_object(
+                                              'license_model', p_row->>'license_model', 'edition', p_row->>'edition',
+                                              'modules', p_row->'modules', 'limits', p_row->'limits',
+                                              'valid_until', p_row->>'valid_until', 'updates_until', p_row->>'updates_until',
+                                              'support_until', p_row->>'support_until')
+    WHEN 'ai.tenant_override'          THEN jsonb_build_object('terms', p_row - ARRAY['id','tenant_id','reason','created_by','approval_id',
+                                                                                       'valid_from','revoked_at','revoked_by'])
+    ELSE '{}'::jsonb
+  END
+$$;
+
 -- مصرف یک‌بارهٔ تأیید؛ فقط از درون تریگر جدول محافظت‌شده (approval_guard مصرف مستقیم را رد می‌کند)
-CREATE OR REPLACE FUNCTION platform.consume_approval(p_id uuid, p_action text, p_subject_type text, p_subject_id uuid, p_ref text)
+DROP FUNCTION IF EXISTS platform.consume_approval(uuid, text, text, uuid, text);
+CREATE OR REPLACE FUNCTION platform.consume_approval(p_id uuid, p_action text, p_subject_type text, p_subject_id uuid, p_ref text,
+                                                     p_executed jsonb DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
   r platform.approval_request%ROWTYPE;
+  v_bind jsonb;
+  k text;
 BEGIN
   IF p_id IS NULL THEN
     PERFORM platform.fail('HK_PLT_APPROVAL_REQUIRED', format('action %s requires an approved four-eyes request', p_action));
@@ -433,8 +513,40 @@ BEGIN
   IF r.expires_at <= now() THEN
     PERFORM platform.fail('HK_PLT_APPROVAL_EXPIRED', 'approval has expired');
   END IF;
+  IF p_executed IS NOT NULL THEN
+    v_bind := platform.approval_binding(p_action, p_executed);
+    FOR k IN SELECT jsonb_object_keys(v_bind) LOOP
+      IF (r.payload -> k) IS DISTINCT FROM (v_bind -> k) THEN
+        PERFORM platform.fail('HK_PLT_APPROVAL_MISMATCH', format('approved %s differs from the executed operation', k));
+      END IF;
+    END LOOP;
+  END IF;
   UPDATE platform.approval_request SET status = 'consumed', consumed_at = now(), consumed_ref = p_ref WHERE id = p_id;
 END $$;
+
+-- نقش ممتاز (اعطایش تأیید دونفره می‌خواهد): پرچم صریح، owner، یا داشتن هر مجوز critical (همهٔ *.approve و انتشارها؛ RV-PLT-18).
+-- این‌گونه کسی با platform.staff.manage نمی‌تواند به حساب دوم خودش نقش تأییدکننده بدهد و «چشم دوم» بسازد.
+CREATE OR REPLACE FUNCTION platform.role_is_privileged(p_role text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT r.is_privileged OR r.grants_all
+         OR EXISTS (SELECT 1 FROM platform.staff_role_permission rp JOIN platform.staff_permission p ON p.code = rp.permission_code
+                     WHERE rp.role_code = r.code AND p.risk = 'critical')
+    FROM platform.staff_role r WHERE r.code = p_role
+$$;
+
+-- قفل سراسری مجموعهٔ مالکان (RV-PLT-08): هر کاهش مالکان زنده (لغو/محدودکردن انتساب owner یا غیرفعال‌کردن کارمند مالک)
+-- پشت همین قفل advisory تراکنشی سریال می‌شود تا دو لغو هم‌زمان هر کدام دیگری را «هنوز زنده» نبیند (write skew).
+CREATE OR REPLACE FUNCTION platform.lock_owner_set() RETURNS void
+LANGUAGE sql AS $$ SELECT pg_advisory_xact_lock(hashtextextended('hk.platform.owner_set', 0)) $$;
+
+-- آیا مالک زندهٔ دیگری جز این کارمند/انتساب هست؟ (پس از قفل؛ هر دستور snapshot تازه دارد)
+CREATE OR REPLACE FUNCTION platform.other_live_owner_exists(p_except_staff uuid, p_except_assignment uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM platform.staff_role_assignment a JOIN platform.staff s ON s.id = a.staff_id
+                  WHERE a.role_code = 'owner' AND a.revoked_at IS NULL AND a.valid_to IS NULL AND a.valid_from <= now()
+                    AND s.status = 'active'
+                    AND a.staff_id IS DISTINCT FROM p_except_staff AND a.id IS DISTINCT FROM p_except_assignment)
+$$;
 
 -- انتساب نقش: بدون خوداعطا؛ نقش ممتاز با تأیید دونفره؛ بوت‌استرپ فقط با نقش مالک پایگاه داده؛ آخرین owner لغوشدنی نیست
 CREATE OR REPLACE FUNCTION platform.role_assignment_guard() RETURNS trigger
@@ -442,7 +554,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
   v_priv boolean;
 BEGIN
-  SELECT is_privileged INTO v_priv FROM platform.staff_role WHERE code = NEW.role_code;
+  v_priv := platform.role_is_privileged(NEW.role_code);
   IF TG_OP = 'INSERT' THEN
     IF NEW.revoked_at IS NOT NULL THEN
       PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', 'assignment cannot be created revoked');
@@ -460,7 +572,7 @@ BEGIN
       END IF;
       IF v_priv THEN
         PERFORM platform.consume_approval(NEW.approval_id, 'staff.grant_privileged_role', 'staff', NEW.staff_id,
-                                          'staff_role_assignment:' || NEW.id::text || ':' || NEW.role_code);
+                                          'staff_role_assignment:' || NEW.id::text || ':' || NEW.role_code, to_jsonb(NEW));
       END IF;
     END IF;
     RETURN NEW;
@@ -480,6 +592,9 @@ BEGIN
      AND current_user IN ('hk_platform_app','hk_platform_ingest','hk_partner_app','hk_platform_readonly') THEN
     PERFORM platform.fail('HK_PLT_ACTOR_MISMATCH', 'revoked_by must be the acting staff member');
   END IF;
+  IF OLD.role_code = 'owner' AND OLD.revoked_at IS NULL AND (NEW.revoked_at IS NOT NULL OR NEW.valid_to IS NOT NULL) THEN
+    PERFORM platform.lock_owner_set();     -- بررسی نهایی در last_owner_guard (AFTER) پس از گرفتن قفل
+  END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON platform.staff_role_assignment;
@@ -491,9 +606,8 @@ CREATE OR REPLACE FUNCTION platform.last_owner_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   IF OLD.role_code = 'owner' AND OLD.revoked_at IS NULL AND (NEW.revoked_at IS NOT NULL OR NEW.valid_to IS NOT NULL) THEN
-    IF NOT EXISTS (SELECT 1 FROM platform.staff_role_assignment a JOIN platform.staff s ON s.id = a.staff_id
-                   WHERE a.role_code = 'owner' AND a.id <> NEW.id AND a.revoked_at IS NULL AND a.valid_to IS NULL
-                     AND s.status = 'active') THEN
+    PERFORM platform.lock_owner_set();
+    IF NOT platform.other_live_owner_exists(NULL, NEW.id) THEN
       PERFORM platform.fail('HK_PLT_LAST_OWNER', 'the last active owner assignment cannot be revoked or time-limited');
     END IF;
   END IF;
@@ -501,6 +615,23 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS trg_last_owner ON platform.staff_role_assignment;
 CREATE TRIGGER trg_last_owner AFTER UPDATE ON platform.staff_role_assignment FOR EACH ROW EXECUTE FUNCTION platform.last_owner_guard();
+
+-- غیرفعال یا معلق کردن آخرین مالک فعال هم ممنوع است (staff_has_permission فقط status='active' را می‌شمارد؛ RV-PLT-08)
+CREATE OR REPLACE FUNCTION platform.staff_status_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.status = 'active' AND NEW.status <> 'active'
+     AND EXISTS (SELECT 1 FROM platform.staff_role_assignment a WHERE a.staff_id = OLD.id AND a.role_code = 'owner'
+                   AND a.revoked_at IS NULL AND a.valid_to IS NULL) THEN
+    PERFORM platform.lock_owner_set();
+    IF NOT platform.other_live_owner_exists(OLD.id, NULL) THEN
+      PERFORM platform.fail('HK_PLT_LAST_OWNER', 'the last active owner cannot be disabled or suspended');
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_last_owner ON platform.staff;
+CREATE TRIGGER trg_last_owner BEFORE UPDATE OF status ON platform.staff FOR EACH ROW EXECUTE FUNCTION platform.staff_status_guard();
 
 -- =====================================================================
 -- ۴. ممیزی پلتفرم: فقط‌افزودنی با زنجیرهٔ hash (قالب hkpaudit1)
@@ -737,6 +868,35 @@ DROP TRIGGER IF EXISTS trg_completed ON platform.idempotency_key;
 CREATE CONSTRAINT TRIGGER trg_completed AFTER INSERT ON platform.idempotency_key
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION platform.idempotency_completed();
 
+-- آغاز درخواست idempotent (R-IDEM؛ RV-PLT-20): نخستین گام تراکنش اثر. قفل advisory تراکنشی روی کلید گرفته می‌شود تا
+-- درخواست هم‌زمانِ دوم پشت کلید اصلی منتظر نماند و فوراً «در جریان» بگیرد (۴۰۹ core.idempotency.in_progress، Retry-After: 2).
+-- outcome: 'new' (اجرا کن و پیش از commit ردیف کامل را درج کن؛ تریگر معوق نبودِ پاسخ را رد می‌کند)، 'replay' (پاسخ ذخیره‌شده)،
+-- 'key_reused' (همان کلید با روش/مسیر/بدنهٔ دیگر ← ۴۲۲ core.idempotency.key_reused)، 'in_progress'، 'key_invalid' (← ۴۰۰).
+-- نبودِ کلید روی مسیر اجباری را برنامه پیش از این تابع با ۴۲۸ core.idempotency.key_required رد می‌کند.
+CREATE OR REPLACE FUNCTION platform.idempotency_begin(p_kind text, p_principal uuid, p_key text, p_method text, p_path text,
+                                                       p_request_sha256 bytea)
+RETURNS TABLE (outcome text, response_status smallint, response_body jsonb, response_headers jsonb)
+LANGUAGE plpgsql AS $$
+DECLARE
+  k platform.idempotency_key%ROWTYPE;
+BEGIN
+  IF p_key IS NULL OR p_key !~ '^[A-Za-z0-9._:-]{16,255}$' THEN
+    RETURN QUERY SELECT 'key_invalid'::text, NULL::smallint, NULL::jsonb, NULL::jsonb; RETURN;
+  END IF;
+  IF NOT pg_try_advisory_xact_lock(hashtextextended('hk.platform.idem:' || p_kind || ':' || p_principal::text || ':' || p_key, 0)) THEN
+    RETURN QUERY SELECT 'in_progress'::text, NULL::smallint, NULL::jsonb, NULL::jsonb; RETURN;
+  END IF;
+  SELECT * INTO k FROM platform.idempotency_key i
+   WHERE i.principal_kind = p_kind AND i.principal_id = p_principal AND i.key = p_key;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT 'new'::text, NULL::smallint, NULL::jsonb, NULL::jsonb; RETURN;
+  END IF;
+  IF k.method <> p_method OR k.path <> p_path OR k.request_sha256 <> p_request_sha256 THEN
+    RETURN QUERY SELECT 'key_reused'::text, NULL::smallint, NULL::jsonb, NULL::jsonb; RETURN;
+  END IF;
+  RETURN QUERY SELECT 'replay'::text, k.response_status, k.response_body, k.response_headers;
+END $$;
+
 CREATE TABLE IF NOT EXISTS platform.job (
   id               uuid PRIMARY KEY DEFAULT uuidv7(),
   kind             text NOT NULL CHECK (kind ~ '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,4}$'),
@@ -766,10 +926,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS job_dedupe ON platform.job (kind, dedupe_key) 
 CREATE UNIQUE INDEX IF NOT EXISTS job_concurrency_running ON platform.job (concurrency_key) WHERE status = 'running' AND concurrency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS job_claim ON platform.job (queue, priority, run_after) WHERE status = 'queued';
 
--- درج کار از درون تریگرها (outbox تراکنشی)
-CREATE OR REPLACE FUNCTION platform.enqueue(p_kind text, p_queue text, p_payload jsonb, p_dedupe text)
+-- درج کار از درون تریگرها (outbox تراکنشی). p_concurrency: کارهای هم‌کلید هرگز هم‌زمان اجرا نمی‌شوند
+-- (مثلاً 'ds:' || tenant_id برای سازندهٔ حالت مطلوب؛ RV-PLT-19)
+DROP FUNCTION IF EXISTS platform.enqueue(text, text, jsonb, text);
+CREATE OR REPLACE FUNCTION platform.enqueue(p_kind text, p_queue text, p_payload jsonb, p_dedupe text, p_concurrency text DEFAULT NULL)
 RETURNS void LANGUAGE sql AS $$
-  INSERT INTO platform.job (kind, queue, payload, dedupe_key) VALUES (p_kind, p_queue, p_payload, p_dedupe)
+  INSERT INTO platform.job (kind, queue, payload, dedupe_key, concurrency_key) VALUES (p_kind, p_queue, p_payload, p_dedupe, p_concurrency)
   ON CONFLICT (kind, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
 $$;
 
@@ -958,6 +1120,12 @@ CREATE TABLE IF NOT EXISTS platform.tenant (
   CHECK ((reseller_id IS NULL) = (reseller_attributed_at IS NULL AND attribution_source IS NULL)),
   CHECK (NOT is_house OR (is_internal AND deployment <> 'onprem'))
 );
+-- برچسب‌های رزرو زیر {APP_DOMAIN} (RV-ARCH-21): میزبان‌های پلتفرم (billing.، activate.، partner.، ...) هرگز slug مستأجر نمی‌شوند.
+-- همین فهرست در core.tenant.slug (00_foundation) و ترتیب مسیرهای Caddy (۰۱ D-03) آینه می‌شود؛ تغییرش فقط با migration.
+ALTER TABLE platform.tenant DROP CONSTRAINT IF EXISTS tenant_slug_not_reserved;
+ALTER TABLE platform.tenant ADD CONSTRAINT tenant_slug_not_reserved CHECK (
+  slug !~ '^(hk|xn)-' AND slug NOT IN ('activate','admin','api','app','assets','auth','billing','cdn','docs','help','internal',
+                                       'login','mail','ops','partner','smtp','sso','static','status','support','www'));
 CREATE UNIQUE INDEX IF NOT EXISTS tenant_one_house ON platform.tenant ((true)) WHERE is_house;
 CREATE INDEX IF NOT EXISTS tenant_reseller ON platform.tenant (reseller_id) WHERE reseller_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS tenant_status ON platform.tenant (status);
@@ -1122,10 +1290,12 @@ BEGIN
   IF NEW.from_status IS NOT NULL THEN
     UPDATE platform.tenant SET status = NEW.to_status, status_changed_at = NEW.occurred_at WHERE id = NEW.tenant_id;
   END IF;
-  -- هر تغییر وضعیت در همان تراکنش بازسازی «حالت مطلوب» را صف می‌کند
-  PERFORM platform.enqueue('control.desired_state.build', 'sync',
-                           jsonb_build_object('tenant_id', NEW.tenant_id, 'cause', 'lifecycle', 'event_seq', NEW.seq),
-                           'lifecycle:' || NEW.tenant_id::text || ':' || NEW.seq::text);
+  -- هر تغییر وضعیت در همان تراکنش بازسازی «حالت مطلوب» را صف می‌کند (جز purged: سندی برایش ساخته نمی‌شود)
+  IF NEW.to_status <> 'purged' THEN
+    PERFORM platform.enqueue('control.desired_state.build', 'sync',
+                             jsonb_build_object('tenant_id', NEW.tenant_id, 'cause', 'lifecycle', 'event_seq', NEW.seq),
+                             'lifecycle:' || NEW.tenant_id::text || ':' || NEW.seq::text, 'ds:' || NEW.tenant_id::text);
+  END IF;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_apply ON platform.tenant_lifecycle_event;
@@ -1300,6 +1470,7 @@ CREATE TRIGGER trg_created AFTER INSERT ON platform.tenant FOR EACH ROW EXECUTE 
 CREATE TABLE IF NOT EXISTS platform.login_directory (
   mobile_hmac  bytea NOT NULL CHECK (octet_length(mobile_hmac) = 32),
   tenant_id    uuid NOT NULL REFERENCES platform.tenant(id),
+  batch_id     uuid NOT NULL,                       -- دستهٔ uplink آخرین گزارش (FK پس از ساخت uplink_batch؛ RV-X4-02)
   updated_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (mobile_hmac, tenant_id)
 );
@@ -1363,8 +1534,12 @@ BEGIN
   IF NEW.version <> coalesce(v_cur, 0) + 1 THEN
     PERFORM platform.fail('HK_PLT_VERSION_SEQUENCE', 'desired state version must be current + 1');
   END IF;
-  IF NEW.document->>'status' NOT IN ('provisioning','active','read_only','suspended','exporting','archived','purge') THEN
+  -- فقط وضعیت‌های core.tenant.status (00_foundation)؛ پاک‌سازی وضعیت نیست، فرمان امضاشدهٔ tenant.purge است (RV-PLT-17)
+  IF NEW.document->>'status' NOT IN ('provisioning','active','read_only','suspended','exporting','archived') THEN
     PERFORM platform.fail('HK_PLT_DOCUMENT_MISMATCH', 'desired status must be a data-plane status');
+  END IF;
+  IF (SELECT status FROM platform.tenant WHERE id = NEW.tenant_id) = 'purged' THEN
+    PERFORM platform.fail('HK_PLT_TENANT_PURGED', 'a purged tenant gets no desired state');
   END IF;
   RETURN NEW;
 END $$;
@@ -1381,7 +1556,9 @@ END $$;
 DROP TRIGGER IF EXISTS trg_apply ON platform.desired_state;
 CREATE TRIGGER trg_apply AFTER INSERT ON platform.desired_state FOR EACH ROW EXECUTE FUNCTION platform.desired_state_apply();
 
--- نگاشت وضعیت چرخهٔ عمر به core.tenant.status صفحهٔ داده (سازندهٔ حالت مطلوب و آزمون‌ها از همین استفاده می‌کنند)
+-- نگاشت وضعیت چرخهٔ عمر به core.tenant.status صفحهٔ داده (سازندهٔ حالت مطلوب و آزمون‌ها از همین استفاده می‌کنند).
+-- تابع کامل است و خروجی همیشه در مجموعهٔ CHECK همان ستون (و tenant_runtime.data_plane_status) است (RV-PLT-17).
+-- purging داده را تا اجرای فرمان tenant.purge فقط‌خواندنیِ بایگانی نگه می‌دارد؛ purged سند حالت مطلوب ندارد.
 CREATE OR REPLACE FUNCTION platform.data_plane_status(p_status text, p_placement_state text) RETURNS text
 LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE
@@ -1390,8 +1567,7 @@ LANGUAGE sql IMMUTABLE AS $$
     WHEN p_status IN ('trial','active','past_due') THEN 'active'
     WHEN p_status IN ('read_only','cancelled') THEN 'read_only'
     WHEN p_status = 'suspended' THEN 'suspended'
-    WHEN p_status = 'archived' THEN 'archived'
-    WHEN p_status IN ('purging','purged') THEN 'purge'
+    WHEN p_status IN ('archived','purging','purged') THEN 'archived'
   END
 $$;
 
@@ -1519,6 +1695,15 @@ BEGIN
     IF EXISTS (SELECT 1 FROM platform.uplink_batch b WHERE b.batch_id = NEW.batch_id AND b.payload_sha256 <> NEW.payload_sha256) THEN
       PERFORM platform.fail('HK_PLT_UPLINK_BATCH_CONFLICT', 'same batch_id with a different payload');
     END IF;
+    -- فرستنده باید سلول بازنشسته‌نشده یا نصب زنده باشد و مستأجر اعلام‌شدهٔ دسته را مالک باشد (RV-X4-02)
+    IF NOT (NEW.source_kind = 'cell' AND EXISTS (SELECT 1 FROM platform.cell c WHERE c.id = NEW.source_id AND c.status <> 'retired')
+         OR NEW.source_kind = 'installation' AND EXISTS (SELECT 1 FROM platform.installation i WHERE i.id::text = NEW.source_id
+                                                          AND i.status IN ('pending_activation','active'))) THEN
+      PERFORM platform.fail('HK_PLT_UPLINK_FOREIGN_SOURCE', format('unknown or retired uplink source %s %s', NEW.source_kind, NEW.source_id));
+    END IF;
+    IF NEW.tenant_id IS NOT NULL AND NOT platform.uplink_source_owns_tenant(NEW.source_kind, NEW.source_id, NEW.tenant_id) THEN
+      PERFORM platform.fail('HK_PLT_UPLINK_FOREIGN_TENANT', format('%s %s does not own tenant %s', NEW.source_kind, NEW.source_id, NEW.tenant_id));
+    END IF;
     RETURN NEW;
   END IF;
   IF TG_OP = 'DELETE' THEN
@@ -1531,6 +1716,20 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON platform.uplink_batch;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON platform.uplink_batch FOR EACH ROW EXECUTE FUNCTION platform.uplink_batch_guard();
+ALTER TABLE platform.login_directory DROP CONSTRAINT IF EXISTS login_directory_batch_fk;
+ALTER TABLE platform.login_directory ADD CONSTRAINT login_directory_batch_fk FOREIGN KEY (batch_id) REFERENCES platform.uplink_batch(batch_id);
+
+-- کاتالوگ رویدادهای uplink (RV-PLT-07، RV-AST-18): نام‌ها دقیقاً نام‌های outbox تولیدکننده (سه‌بخشی، همان CHECK
+-- core.outbox_event.event_type) و اثر هر کدام. رویداد ناشناخته ذخیره و نادیده گرفته می‌شود (ignored_unknown)، نه رد؛
+-- پس افزودن رویداد در سلول هرگز دستهٔ uplink را نمی‌شکند. آزمون قرارداد این جدول را با event_subscription(subscriber='uplink')
+-- همهٔ ماژول‌ها مقایسه می‌کند (contracts/test_uplink_event_catalog.py).
+CREATE TABLE IF NOT EXISTS platform.uplink_event_type (
+  event_type      text PRIMARY KEY CHECK (event_type ~ '^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$'),
+  producer        text NOT NULL CHECK (producer IN ('core','migration','assistant','rules')),
+  handler         text NOT NULL CHECK (handler ~ '^[a-z][a-z0-9_]*$'),
+  target_table    text NOT NULL,
+  description_fa  text NOT NULL
+);
 
 -- =====================================================================
 -- ۹. انتشار نسخه، rollout سلول‌ها، نسخهٔ کلاینت‌ها، پشتیبان و تمرین بازیابی (قرارداد بخش ۰۱ §۴-۸)
@@ -1724,6 +1923,7 @@ CREATE TABLE IF NOT EXISTS platform.product_version (
   created_by            uuid REFERENCES platform.staff(id),
   published_by          uuid REFERENCES platform.staff(id),
   published_at          timestamptz,
+  review_started_at     timestamptz,                      -- آخرین ورود به بازبینی (تأیید قیمت پس از آن معتبر است)
   approval_id           uuid REFERENCES platform.approval_request(id),
   created_at            timestamptz NOT NULL DEFAULT now(),
   updated_at            timestamptz NOT NULL DEFAULT now(),
@@ -1734,6 +1934,7 @@ CREATE TABLE IF NOT EXISTS platform.product_version (
   CHECK ((license_model = 'subscription') = (license_term_months IS NOT NULL))
 );
 SELECT platform.add_touch('platform.product_version');
+ALTER TABLE platform.product_version ADD COLUMN IF NOT EXISTS review_started_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS platform.price (
   id                  uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -1780,7 +1981,7 @@ CREATE OR REPLACE FUNCTION platform.product_version_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
   v_kind text;
-  v_allowed text[] := ARRAY['status','published_by','published_at','approval_id','updated_at','row_version','available_to'];
+  v_allowed text[] := ARRAY['status','published_by','published_at','approval_id','updated_at','row_version','available_to','review_started_at'];
   k text;
 BEGIN
   IF TG_OP = 'DELETE' THEN
@@ -1829,6 +2030,7 @@ BEGIN
     IF v_kind IN ('plan','license') AND NOT EXISTS (SELECT 1 FROM platform.product_entitlement e WHERE e.product_version_id = NEW.id) THEN
       PERFORM platform.fail('HK_PLT_PRODUCT_SHAPE', 'plans and licenses need entitlements');
     END IF;
+    NEW.review_started_at := now();
   ELSIF OLD.status = 'in_review' AND NEW.status = 'draft' THEN
     NULL;
   ELSIF OLD.status = 'in_review' AND NEW.status = 'published' THEN
@@ -1836,6 +2038,10 @@ BEGIN
       PERFORM platform.fail('HK_PLT_ACTOR_MISMATCH', 'published_by must be the acting staff member');
     END IF;
     PERFORM platform.consume_approval(NEW.approval_id, 'price.publish', 'product_version', NEW.id, 'product_version:' || NEW.id::text);
+    -- تأیید باید پس از آخرین ورود به بازبینی ثبت شده باشد (محتوای تأییدشده = محتوای منجمد فعلی؛ RV-PLT-04)
+    IF (SELECT a.created_at FROM platform.approval_request a WHERE a.id = NEW.approval_id) < OLD.review_started_at THEN
+      PERFORM platform.fail('HK_PLT_APPROVAL_MISMATCH', 'price approval predates the current review (content may have changed)');
+    END IF;
     NEW.published_at := now();
   ELSIF OLD.status = 'published' AND NEW.status = 'retired' THEN
     NULL;
@@ -2437,7 +2643,7 @@ BEGIN
             AND NEW.tenant_monthly_cost IS NULL AND NEW.user_monthly_tokens IS NULL AND NEW.max_concurrent_runs IS NULL
             AND NEW.allow_tenant_provider IS NULL) THEN
       PERFORM platform.consume_approval(NEW.approval_id, 'ai.tenant_override', 'tenant', NEW.tenant_id,
-                                        'ai_tenant_override:' || NEW.id::text);
+                                        'ai_tenant_override:' || NEW.id::text, to_jsonb(NEW));
     ELSIF NEW.approval_id IS NOT NULL THEN
       PERFORM platform.fail('HK_PLT_APPROVAL_MISMATCH', 'a pure kill takes no approval');
     END IF;
@@ -2459,7 +2665,8 @@ LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM platform.enqueue('control.desired_state.build', 'sync',
                            jsonb_build_object('tenant_id', NEW.tenant_id, 'cause', 'override', 'ai_override_id', NEW.id),
-                           'ai_override:' || NEW.id::text || ':' || CASE WHEN NEW.revoked_at IS NULL THEN 'set' ELSE 'revoked' END);
+                           'ai_override:' || NEW.id::text || ':' || CASE WHEN NEW.revoked_at IS NULL THEN 'set' ELSE 'revoked' END,
+                           'ds:' || NEW.tenant_id::text);
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_apply ON platform.ai_tenant_override;
@@ -2726,7 +2933,7 @@ CREATE TABLE IF NOT EXISTS platform.invoice (
   tenant_id            uuid REFERENCES platform.tenant(id),
   reseller_id          uuid REFERENCES platform.reseller(id),   -- انتساب نماینده (snapshot هنگام صدور) یا خود نمایندهٔ خریدار
   number               text UNIQUE,
-  period_key           text CHECK (period_key ~ '^jy:[0-9]{4}$'),   -- سال جلالی صدور (محاسبه در پایتون)
+  period_key           text CHECK (period_key ~ '^jy:[0-9]{4}$'),   -- سال جلالی تاریخ صدور (مشتق در تریگر صدور؛ RV-PLT-14)
   status               text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','issued','paid','void')),
   original_invoice_id  uuid REFERENCES platform.invoice(id),
   issue_date           date,
@@ -2737,7 +2944,7 @@ CREATE TABLE IF NOT EXISTS platform.invoice (
   vat_total            numeric(24,0) NOT NULL DEFAULT 0 CHECK (vat_total >= 0),
   total                numeric(24,0) NOT NULL DEFAULT 0 CHECK (total >= 0),
   paid_amount          numeric(24,0) NOT NULL DEFAULT 0,
-  vat_rule_ref         text,                                  -- مثل ir.tax@1405.2#tax.vat.standard_rate (snapshot نسخهٔ قاعده)
+  vat_rule_ref         text,                                  -- مثل ir.tax@1405.2#tax.vat.standard_rate؛ هنگام صدور با vat_rate_for سنجیده می‌شود
   buyer_snapshot       jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(buyer_snapshot) = 'object'),
   moadian_mode         text NOT NULL DEFAULT 'house_tenant' CHECK (moadian_mode IN ('house_tenant','export_only','not_required')),
   issued_by            uuid REFERENCES platform.staff(id),
@@ -2777,7 +2984,8 @@ CREATE TABLE IF NOT EXISTS platform.invoice_line (
   amount                numeric(24,0) NOT NULL,
   discount              numeric(24,0) NOT NULL DEFAULT 0 CHECK (discount >= 0),
   coupon_id             uuid REFERENCES platform.coupon(id),
-  vat_rate_pct          numeric(7,4) NOT NULL CHECK (vat_rate_pct >= 0 AND vat_rate_pct <= 100),   -- snapshot از موتور قواعد
+  vat_rate_pct          numeric(7,4) NOT NULL CHECK (vat_rate_pct >= 0 AND vat_rate_pct <= 100),   -- snapshot از موتور قواعد (vat_rate_for)
+  vat_rule_ref          text,                                  -- ارجاع قاعدهٔ همین سطر (مثلاً معافیت)؛ NULL = ارجاع سرصفحه
   vat_amount            numeric(24,0) NOT NULL,
   total                 numeric(24,0) NOT NULL,
   UNIQUE (invoice_id, line_no),
@@ -2789,6 +2997,7 @@ CREATE TABLE IF NOT EXISTS platform.invoice_line (
   CHECK (period_end IS NULL OR period_start IS NULL OR period_end > period_start),
   CHECK ((coupon_id IS NOT NULL) <= (discount > 0))
 );
+ALTER TABLE platform.invoice_line ADD COLUMN IF NOT EXISTS vat_rule_ref text;
 
 -- سطر صورتحساب فقط در پیش‌نویس؛ سطر یادداشت اعتباری به سطر صورتحساب اصلی ارجاع می‌دهد و از آن بیشتر نمی‌شود
 CREATE OR REPLACE FUNCTION platform.invoice_line_guard() RETURNS trigger
@@ -2818,6 +3027,9 @@ BEGIN
     END IF;
     IF NEW.vat_rate_pct <> ol.vat_rate_pct THEN
       PERFORM platform.fail('HK_PLT_CREDIT_NOTE_LINE', 'credit note line keeps the original VAT rate');
+    END IF;
+    IF NEW.sstid IS DISTINCT FROM ol.sstid OR NEW.vat_rule_ref IS DISTINCT FROM ol.vat_rule_ref THEN
+      PERFORM platform.fail('HK_PLT_CREDIT_NOTE_LINE', 'credit note line keeps the original sstid and VAT rule');
     END IF;
   ELSIF NEW.original_line_id IS NOT NULL THEN
     PERFORM platform.fail('HK_PLT_CREDIT_NOTE_LINE', 'only credit notes reference original lines');
@@ -2966,7 +3178,7 @@ CREATE TABLE IF NOT EXISTS platform.payment (
   api_amount           numeric(24,0) NOT NULL CHECK (api_amount > 0),
   api_amount_unit      text NOT NULL CHECK (api_amount_unit IN ('IRR','IRT')),
   state                text NOT NULL DEFAULT 'created'
-                       CHECK (state IN ('created','redirected','callback_received','verified','failed','expired',
+                       CHECK (state IN ('created','redirected','callback_received','settling','verified','failed','expired',
                                         'reversed','partially_refunded','refunded')),
   provider_ref         text CHECK (char_length(provider_ref) BETWEEN 1 AND 100),
   provider_txn_ref     text CHECK (char_length(provider_txn_ref) BETWEEN 1 AND 64),
@@ -2983,6 +3195,7 @@ CREATE TABLE IF NOT EXISTS platform.payment (
   redirected_at        timestamptz,
   callback_at          timestamptz,
   verified_at          timestamptz,
+  settled_at           timestamptz,                    -- درگاه‌های نیازمند settle (به‌پرداخت ملت: bpSettleRequest موفق یا ۴۵)
   attempts             integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   next_inquiry_at      timestamptz,
   created_by_staff     uuid REFERENCES platform.staff(id),
@@ -3000,7 +3213,10 @@ CREATE TABLE IF NOT EXISTS platform.payment (
   CONSTRAINT payment_verified_fields CHECK (state NOT IN ('verified','partially_refunded','refunded') OR
              (verified_amount = amount AND verified_at IS NOT NULL AND (method = 'bank_transfer' OR provider_txn_ref IS NOT NULL))),
   -- کد ۴۸ ملت = Reverse شده: هرگز «پرداخت‌شده» نیست
-  CONSTRAINT payment_mellat_48 CHECK (NOT (provider = 'mellat' AND last_response_code = '48' AND state IN ('verified','partially_refunded','refunded'))),
+  CONSTRAINT payment_mellat_48 CHECK (NOT (provider = 'mellat' AND last_response_code = '48' AND state IN ('settling','verified','partially_refunded','refunded'))),
+  -- درگاه نیازمند settle (ملت): بدون settle موفق پول به پرداخت‌کننده برمی‌گردد، پس «تأییدشده» فقط پس از settle (RV-PLT-05)
+  CONSTRAINT payment_settled_before_verified CHECK (provider IS DISTINCT FROM 'mellat' OR state NOT IN ('verified','partially_refunded','refunded')
+                                                    OR settled_at IS NOT NULL),
   CONSTRAINT payment_refund_range CHECK (refunded_amount <= coalesce(verified_amount, 0)),
   CHECK (state <> 'refunded' OR refunded_amount = verified_amount),
   CHECK (state <> 'partially_refunded' OR (refunded_amount > 0 AND refunded_amount < verified_amount)),
@@ -3008,6 +3224,7 @@ CREATE TABLE IF NOT EXISTS platform.payment (
 );
 CREATE INDEX IF NOT EXISTS payment_pending ON platform.payment (next_inquiry_at) WHERE state IN ('created','redirected','callback_received');
 SELECT platform.add_touch('platform.payment');
+ALTER TABLE platform.payment ADD COLUMN IF NOT EXISTS settled_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS platform.wallet_entry (
   id                uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -3020,6 +3237,8 @@ CREATE TABLE IF NOT EXISTS platform.wallet_entry (
   payment_id        uuid REFERENCES platform.payment(id),
   invoice_id        uuid REFERENCES platform.invoice(id),
   approval_id       uuid REFERENCES platform.approval_request(id),
+  refund_id         uuid,                               -- FK پس از ساخت refund (refund_out)
+  payout_id         uuid,                               -- FK پس از ساخت payout (payout)
   idempotency_key   text NOT NULL CHECK (char_length(idempotency_key) BETWEEN 8 AND 200),
   memo              text,
   created_by_staff  uuid REFERENCES platform.staff(id),
@@ -3030,31 +3249,91 @@ CREATE TABLE IF NOT EXISTS platform.wallet_entry (
        kind IN ('topup','overpayment','reservation_release','credit_note','commission') AND amount > 0
     OR kind IN ('invoice_payment','credit_reservation','refund_out','commission_reversal','payout') AND amount < 0
     OR kind = 'adjustment'),
+  -- ارجاع اجباری هر نوع (D-P13؛ RV-PLT-02). رزرو و کمیسیون از سوی دیگر به این ردیف ارجاع می‌دهند
+  -- (credit_reservation.wallet_entry_id، commission_entry.wallet_entry_id، هر دو UNIQUE) و فقط از تریگر مالکشان درج می‌شوند.
   CONSTRAINT wallet_entry_refs CHECK (
        (kind IN ('topup','overpayment') AND payment_id IS NOT NULL)
     OR (kind IN ('invoice_payment','credit_note') AND invoice_id IS NOT NULL)
     OR (kind = 'adjustment' AND approval_id IS NOT NULL)
-    OR kind IN ('credit_reservation','reservation_release','refund_out','commission','commission_reversal','payout'))
+    OR (kind = 'refund_out' AND refund_id IS NOT NULL)
+    OR (kind = 'payout' AND payout_id IS NOT NULL)
+    OR kind IN ('credit_reservation','reservation_release','commission','commission_reversal'))
 );
 
+-- مبلغ «در تعهد» کیف پول (RV-PLT-10): بازپرداخت‌های درخواست/تأییدشده و تسویه‌های ارسال/تأییدشدهٔ نماینده که هنوز از دفتر
+-- کسر نشده‌اند. برداشت‌های دیگر نمی‌توانند این مبلغ را خرج کنند؛ تکمیل همان بازپرداخت/تسویه آن را آزاد و کسر می‌کند.
+CREATE OR REPLACE FUNCTION platform.wallet_encumbered(p_wallet uuid, p_except_refund uuid DEFAULT NULL, p_except_payout uuid DEFAULT NULL)
+RETURNS numeric LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  RETURN coalesce((SELECT sum(r.amount) FROM platform.refund r WHERE r.wallet_id = p_wallet AND r.status IN ('requested','approved')
+                      AND r.id IS DISTINCT FROM p_except_refund), 0)
+       + coalesce((SELECT sum(po.amount) FROM platform.payout po WHERE po.wallet_id = p_wallet AND po.status IN ('submitted','approved')
+                      AND po.id IS DISTINCT FROM p_except_payout), 0);
+END $$;
+
+-- هر نوع ردیف کیف پول فقط از جریان مالکش (RV-PLT-02/03): برنامه مستقیم فقط «پرداخت صورتحساب از کیف پول» و «اصلاح دستی
+-- با تأیید دونفره» را درج می‌کند؛ بقیه فقط از تریگر پرداخت، یادداشت اعتباری، بازپرداخت، تسویه، کمیسیون و رزرو.
 CREATE OR REPLACE FUNCTION platform.wallet_entry_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-  w platform.wallet%ROWTYPE;
+  w   platform.wallet%ROWTYPE;
+  inv platform.invoice%ROWTYPE;
+  p   platform.payment%ROWTYPE;
+  v_ok boolean;
 BEGIN
   SELECT * INTO w FROM platform.wallet WHERE id = NEW.wallet_id FOR UPDATE;
   IF w.status = 'closed' OR (w.status = 'frozen' AND NEW.amount < 0) THEN
     PERFORM platform.fail('HK_PLT_WALLET_NOT_ACTIVE', format('wallet is %s', w.status));
   END IF;
-  IF NEW.kind = 'adjustment' THEN
+  IF NEW.kind NOT IN ('invoice_payment','adjustment') AND NOT platform.is_nested() THEN
+    PERFORM platform.fail('HK_PLT_WALLET_ENTRY_SOURCE', format('%s entries are written only by their owning flow', NEW.kind));
+  END IF;
+  IF (NEW.kind IN ('commission','commission_reversal','payout') AND w.owner_kind <> 'reseller')
+     OR (NEW.kind IN ('credit_reservation','reservation_release') AND w.owner_kind <> 'tenant') THEN
+    PERFORM platform.fail('HK_PLT_WALLET_ENTRY_SOURCE', format('%s entries do not belong in a %s wallet', NEW.kind, w.owner_kind));
+  END IF;
+  IF NEW.kind IN ('topup','overpayment') THEN
+    SELECT * INTO p FROM platform.payment WHERE id = NEW.payment_id;
+    IF NOT FOUND OR p.state <> 'verified' OR p.tenant_id IS DISTINCT FROM w.tenant_id OR p.reseller_id IS DISTINCT FROM w.reseller_id
+       OR NEW.amount > p.amount THEN
+      PERFORM platform.fail('HK_PLT_WALLET_ENTRY_SOURCE', 'top-up needs a verified payment of the wallet owner');
+    END IF;
+  ELSIF NEW.kind IN ('invoice_payment','credit_note') THEN
+    SELECT * INTO inv FROM platform.invoice WHERE id = NEW.invoice_id;
+    v_ok := FOUND AND (CASE w.owner_kind WHEN 'tenant' THEN inv.tenant_id = w.tenant_id
+                                         ELSE inv.tenant_id IS NULL AND inv.reseller_id = w.reseller_id END)
+            AND EXISTS (SELECT 1 FROM platform.billing_account b WHERE b.id = inv.billing_account_id
+                          AND b.tenant_id IS NOT DISTINCT FROM w.tenant_id AND b.reseller_id IS NOT DISTINCT FROM w.reseller_id);
+    IF NEW.kind = 'invoice_payment' AND NOT (v_ok AND inv.kind = 'invoice' AND inv.status = 'issued') THEN
+      PERFORM platform.fail('HK_PLT_PAYMENT_TARGET', 'wallet pays only an issued, unpaid invoice of the wallet owner');
+    END IF;
+    IF NEW.kind = 'credit_note' AND NOT (v_ok AND inv.kind = 'credit_note' AND inv.status = 'issued'
+         AND NEW.amount = inv.total - coalesce((SELECT sum(st.amount) FROM platform.invoice_settlement st WHERE st.credit_note_id = inv.id), 0)) THEN
+      PERFORM platform.fail('HK_PLT_WALLET_ENTRY_SOURCE', 'credit-note entry needs an issued credit note of the owner for its unapplied amount');
+    END IF;
+  ELSIF NEW.kind = 'refund_out' THEN
+    IF NOT EXISTS (SELECT 1 FROM platform.refund r WHERE r.id = NEW.refund_id AND r.wallet_id = NEW.wallet_id
+                     AND r.status = 'completed' AND r.amount = -NEW.amount) THEN
+      PERFORM platform.fail('HK_PLT_WALLET_ENTRY_SOURCE', 'refund entry needs the completed refund of this wallet');
+    END IF;
+  ELSIF NEW.kind = 'payout' THEN
+    IF NOT EXISTS (SELECT 1 FROM platform.payout po WHERE po.id = NEW.payout_id AND po.wallet_id = NEW.wallet_id
+                     AND po.status = 'approved' AND po.amount = -NEW.amount) THEN
+      PERFORM platform.fail('HK_PLT_WALLET_ENTRY_SOURCE', 'payout entry needs the approved payout of this wallet');
+    END IF;
+  ELSIF NEW.kind = 'adjustment' THEN
     PERFORM platform.consume_approval(NEW.approval_id, 'wallet.manual_adjustment', 'wallet', NEW.wallet_id,
-                                      'wallet_entry:' || NEW.id::text);
+                                      'wallet_entry:' || NEW.id::text, to_jsonb(NEW));
   END IF;
   NEW.seq := w.last_seq + 1;
   NEW.balance_after := w.balance + NEW.amount;
   NEW.created_at := now();
-  IF NEW.balance_after < -w.credit_limit AND NOT (w.owner_kind = 'reseller' AND NEW.kind = 'commission_reversal') THEN
-    PERFORM platform.fail('HK_PLT_INSUFFICIENT_BALANCE', format('wallet balance %s + %s below -%s', w.balance, NEW.amount, w.credit_limit));
+  -- کف مانده فقط برای برداشت (RV-PLT-09): بستانکاری هرگز رد نمی‌شود، حتی وقتی کیف پول نماینده با بازپس‌گیری بدهکار است.
+  -- برداشت نمی‌تواند مبلغ در تعهد بازپرداخت/تسویه‌های باز دیگر را خرج کند (RV-PLT-10).
+  IF NEW.amount < 0 AND NOT (w.owner_kind = 'reseller' AND NEW.kind = 'commission_reversal')
+     AND NEW.balance_after - platform.wallet_encumbered(w.id, NEW.refund_id, NEW.payout_id) < -w.credit_limit THEN
+    PERFORM platform.fail('HK_PLT_INSUFFICIENT_BALANCE', format('wallet balance %s + %s (encumbered %s) below -%s',
+                          w.balance, NEW.amount, platform.wallet_encumbered(w.id, NEW.refund_id, NEW.payout_id), w.credit_limit));
   END IF;
   RETURN NEW;
 END $$;
@@ -3062,19 +3341,23 @@ DROP TRIGGER IF EXISTS trg_guard ON platform.wallet_entry;
 CREATE TRIGGER trg_guard BEFORE INSERT ON platform.wallet_entry FOR EACH ROW EXECUTE FUNCTION platform.wallet_entry_guard();
 SELECT platform.make_append_only('platform.wallet_entry');
 
+-- تسویهٔ صورتحساب: پول (درگاه یا کیف پول) یا یادداشت اعتباری روی ماندهٔ پرداخت‌نشده (RV-PLT-15). paid_amount = جمع تسویه‌ها.
 CREATE TABLE IF NOT EXISTS platform.invoice_settlement (
   id              uuid PRIMARY KEY DEFAULT uuidv7(),
   invoice_id      uuid NOT NULL REFERENCES platform.invoice(id),
-  source_kind     text NOT NULL CHECK (source_kind IN ('payment','wallet')),
+  source_kind     text NOT NULL CHECK (source_kind IN ('payment','wallet','credit_note')),
   payment_id      uuid REFERENCES platform.payment(id),
   wallet_entry_id uuid REFERENCES platform.wallet_entry(id),
+  credit_note_id  uuid REFERENCES platform.invoice(id),
   amount          numeric(24,0) NOT NULL CHECK (amount > 0),
   created_at      timestamptz NOT NULL DEFAULT now(),
-  CHECK ((source_kind = 'payment') = (payment_id IS NOT NULL AND wallet_entry_id IS NULL)),
-  CHECK ((source_kind = 'wallet') = (wallet_entry_id IS NOT NULL AND payment_id IS NULL))
+  CHECK ((source_kind = 'payment') = (payment_id IS NOT NULL AND wallet_entry_id IS NULL AND credit_note_id IS NULL)),
+  CHECK ((source_kind = 'wallet') = (wallet_entry_id IS NOT NULL AND payment_id IS NULL AND credit_note_id IS NULL)),
+  CHECK ((source_kind = 'credit_note') = (credit_note_id IS NOT NULL AND payment_id IS NULL AND wallet_entry_id IS NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS invoice_settlement_one_per_payment ON platform.invoice_settlement (payment_id) WHERE payment_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS invoice_settlement_one_per_entry ON platform.invoice_settlement (wallet_entry_id) WHERE wallet_entry_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS invoice_settlement_one_per_credit_note ON platform.invoice_settlement (credit_note_id) WHERE credit_note_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION platform.wallet_entry_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -3148,7 +3431,7 @@ BEGIN
       NEW.status := 'active';
     ELSIF NEW.kind = 'comp' THEN
       PERFORM platform.consume_approval(NEW.approval_id, 'subscription.comp_term', 'subscription', NEW.subscription_id,
-                                        'subscription_term:' || NEW.id::text);
+                                        'subscription_term:' || NEW.id::text, to_jsonb(NEW));
       NEW.status := 'active';
     ELSE
       SELECT * INTO inv FROM platform.invoice WHERE id = NEW.invoice_id;
@@ -3208,6 +3491,44 @@ END $$;
 DROP TRIGGER IF EXISTS trg_apply ON platform.subscription_term;
 CREATE TRIGGER trg_apply AFTER INSERT OR UPDATE ON platform.subscription_term FOR EACH ROW EXECUTE FUNCTION platform.subscription_term_apply();
 
+-- outbox تراکنشی حالت مطلوب (RV-PLT-19): هر تغییر حق استفاده یا پوشش در همان تراکنش بازسازی را صف می‌کند؛
+-- سرویس‌ها لازم نیست «به یاد بیاورند». concurrency_key = 'ds:' || tenant_id (یک سازنده در هر لحظه برای هر مستأجر)
+CREATE OR REPLACE FUNCTION platform.desired_state_enqueue() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_tenant uuid;
+  v_cause  text;
+  v_dedupe text;
+BEGIN
+  IF TG_TABLE_NAME = 'tenant_entitlement_override' THEN
+    v_tenant := NEW.tenant_id; v_cause := 'override';
+    v_dedupe := 'ent_override:' || NEW.id::text || ':' || CASE WHEN NEW.revoked_at IS NULL THEN 'set' ELSE 'revoked' END;
+  ELSIF TG_TABLE_NAME = 'subscription' THEN
+    v_tenant := NEW.tenant_id; v_cause := 'subscription';
+    v_dedupe := 'subscription:' || NEW.id::text || ':' || NEW.row_version::text;
+  ELSIF TG_TABLE_NAME = 'subscription_item' THEN
+    SELECT s.tenant_id INTO v_tenant FROM platform.subscription s WHERE s.id = NEW.subscription_id;
+    v_cause := 'subscription';
+    v_dedupe := 'subscription_item:' || NEW.id::text || ':' || coalesce(NEW.valid_to::text, 'open');
+  ELSE   -- subscription_term
+    SELECT s.tenant_id INTO v_tenant FROM platform.subscription s WHERE s.id = NEW.subscription_id;
+    v_cause := 'subscription';
+    v_dedupe := 'subscription_term:' || NEW.id::text || ':' || NEW.status;
+  END IF;
+  PERFORM platform.enqueue('control.desired_state.build', 'sync',
+                           jsonb_build_object('tenant_id', v_tenant, 'cause', v_cause, 'source', TG_TABLE_NAME),
+                           v_dedupe, 'ds:' || v_tenant::text);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_desired_state ON platform.subscription;
+CREATE TRIGGER trg_desired_state AFTER INSERT OR UPDATE ON platform.subscription FOR EACH ROW EXECUTE FUNCTION platform.desired_state_enqueue();
+DROP TRIGGER IF EXISTS trg_desired_state ON platform.subscription_item;
+CREATE TRIGGER trg_desired_state AFTER INSERT OR UPDATE ON platform.subscription_item FOR EACH ROW EXECUTE FUNCTION platform.desired_state_enqueue();
+DROP TRIGGER IF EXISTS trg_desired_state ON platform.subscription_term;
+CREATE TRIGGER trg_desired_state AFTER INSERT OR UPDATE ON platform.subscription_term FOR EACH ROW EXECUTE FUNCTION platform.desired_state_enqueue();
+DROP TRIGGER IF EXISTS trg_desired_state ON platform.tenant_entitlement_override;
+CREATE TRIGGER trg_desired_state AFTER INSERT OR UPDATE ON platform.tenant_entitlement_override FOR EACH ROW EXECUTE FUNCTION platform.desired_state_enqueue();
+
 -- صورتحساب: صدور (شماره در همان تراکنش، جمع‌ها = سطرها)، تغییرناپذیری پس از صدور، ابطال با تأیید دونفره
 CREATE OR REPLACE FUNCTION platform.invoice_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -3255,9 +3576,15 @@ BEGIN
     IF NEW.subtotal <> v_sub OR NEW.discount_total <> v_disc OR NEW.vat_total <> v_vat OR NEW.total <> v_tot THEN
       PERFORM platform.fail('HK_PLT_INVOICE_TOTALS', 'header totals must equal the sum of lines');
     END IF;
-    IF NEW.period_key IS NULL THEN
-      PERFORM platform.fail('HK_PLT_INVOICE_PERIOD', 'period_key (Jalali year) is required to number the invoice');
+    -- تاریخ صدور = امروزِ تهران (بدون پس‌تاریخ یا پیش‌تاریخ) و سری شماره = سال جلالی همان تاریخ (RV-PLT-14)
+    IF NEW.issue_date IS NOT NULL AND NEW.issue_date <> platform.tehran_today() THEN
+      PERFORM platform.fail('HK_PLT_INVOICE_DATE', format('issue date is the Tehran date of issue (%s), not %s', platform.tehran_today(), NEW.issue_date));
     END IF;
+    NEW.issue_date := platform.tehran_today();
+    IF NEW.period_key IS NOT NULL AND NEW.period_key <> 'jy:' || platform.jalali_year(NEW.issue_date) THEN
+      PERFORM platform.fail('HK_PLT_INVOICE_PERIOD', format('period_key must be jy:%s, the Jalali year of the issue date', platform.jalali_year(NEW.issue_date)));
+    END IF;
+    NEW.period_key := 'jy:' || platform.jalali_year(NEW.issue_date);
     IF NEW.kind = 'credit_note' THEN
       SELECT * INTO orig FROM platform.invoice WHERE id = NEW.original_invoice_id;
       IF orig.status NOT IN ('issued','paid') OR orig.kind <> 'invoice' OR orig.billing_account_id <> NEW.billing_account_id THEN
@@ -3266,12 +3593,21 @@ BEGIN
       IF NEW.total <= 0 THEN
         PERFORM platform.fail('HK_PLT_INVOICE_TOTALS', 'credit note total must be positive');
       END IF;
+      NEW.vat_rule_ref := orig.vat_rule_ref;     -- سطرها نرخ، قاعده و شناسهٔ کالای اصل را نگه می‌دارند
+    ELSE
+      -- نرخ هر سطر = مقدار منتشرشدهٔ موتور قواعد در تاریخ صدور (RV-PLT-11)
+      IF EXISTS (SELECT 1 FROM platform.invoice_line l WHERE l.invoice_id = NEW.id
+                  AND platform.vat_rate_for(coalesce(l.vat_rule_ref, NEW.vat_rule_ref), NEW.issue_date) IS DISTINCT FROM l.vat_rate_pct) THEN
+        PERFORM platform.fail('HK_PLT_VAT_RULE', 'each line VAT rate must equal the published, in-force rules value named by its vat_rule_ref');
+      END IF;
+    END IF;
+    IF NEW.moadian_mode = 'house_tenant' AND EXISTS (SELECT 1 FROM platform.invoice_line l WHERE l.invoice_id = NEW.id AND l.sstid IS NULL) THEN
+      PERFORM platform.fail('HK_PLT_INVOICE_SSTID', 'every line needs its 13-digit goods/service id (sstid) for the Moadian e-invoice');
     END IF;
     NEW.number := platform.number_next(CASE NEW.kind WHEN 'invoice' THEN 'invoice' ELSE 'credit_note' END,
                                        NEW.period_key,
                                        CASE NEW.kind WHEN 'invoice' THEN 'INV-' ELSE 'CN-' END || substr(NEW.period_key, 4) || '-');
     NEW.issued_at := now();
-    NEW.issue_date := coalesce(NEW.issue_date, current_date);
     IF NEW.issued_by IS NOT NULL AND NEW.issued_by IS DISTINCT FROM platform.current_staff_id() THEN
       PERFORM platform.fail('HK_PLT_ACTOR_MISMATCH', 'issued_by must be the acting staff member');
     END IF;
@@ -3305,6 +3641,8 @@ LANGUAGE plpgsql AS $$
 DECLARE
   v_house uuid;
   v_wallet uuid;
+  v_apply numeric := 0;
+  orig platform.invoice%ROWTYPE;
 BEGIN
   IF OLD.status = 'draft' AND NEW.status IN ('issued','paid') THEN
     -- همگام‌سازی با مستأجر خانه (صدور صورتحساب الکترونیکی مؤدیان با حافظهٔ صاحب پلتفرم)
@@ -3315,12 +3653,24 @@ BEGIN
     IF NEW.moadian_mode = 'house_tenant' THEN
       PERFORM platform.enqueue('billing.house_sync', 'house_sync', jsonb_build_object('doc_id', NEW.id), 'house:' || NEW.id::text);
     END IF;
-    -- یادداشت اعتباری: مبلغ به کیف پول مشتری برمی‌گردد (بازپرداخت بانکی بعداً از کیف پول)
+    -- یادداشت اعتباری (RV-PLT-15): نخست ماندهٔ پرداخت‌نشدهٔ صورتحساب اصلی را می‌بندد (تسویهٔ credit_note)، و فقط مازاد آن
+    -- (بخشی که مشتری واقعاً پرداخته بود) به کیف پول برمی‌گردد. اعتبار کامل صورتحساب، دوره‌های در انتظار آن را باطل می‌کند
+    -- تا بستن مانده با اعتبار هرگز دوره را فعال نکند.
     IF NEW.kind = 'credit_note' THEN
-      v_wallet := CASE WHEN NEW.tenant_id IS NOT NULL THEN platform.wallet_for('tenant', NEW.tenant_id)
-                       ELSE platform.wallet_for('reseller', NEW.reseller_id) END;
-      INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key, memo)
-      VALUES (v_wallet, 0, 'credit_note', NEW.total, 0, NEW.id, 'credit_note:' || NEW.id::text, NEW.number);
+      SELECT * INTO orig FROM platform.invoice WHERE id = NEW.original_invoice_id FOR UPDATE;
+      IF (SELECT sum(c.total) FROM platform.invoice c WHERE c.original_invoice_id = orig.id AND c.kind = 'credit_note' AND c.status = 'issued') >= orig.total THEN
+        UPDATE platform.subscription_term SET status = 'void' WHERE invoice_id = orig.id AND status = 'pending';
+      END IF;
+      v_apply := CASE WHEN orig.status = 'issued' THEN least(NEW.total, orig.total - orig.paid_amount) ELSE 0 END;
+      IF v_apply > 0 THEN
+        INSERT INTO platform.invoice_settlement (invoice_id, source_kind, credit_note_id, amount) VALUES (orig.id, 'credit_note', NEW.id, v_apply);
+      END IF;
+      IF NEW.total > v_apply THEN
+        v_wallet := CASE WHEN NEW.tenant_id IS NOT NULL THEN platform.wallet_for('tenant', NEW.tenant_id)
+                         ELSE platform.wallet_for('reseller', NEW.reseller_id) END;
+        INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key, memo)
+        VALUES (v_wallet, 0, 'credit_note', NEW.total - v_apply, 0, NEW.id, 'credit_note:' || NEW.id::text, NEW.number);
+      END IF;
     END IF;
   END IF;
   IF NEW.status = 'paid' AND OLD.status <> 'paid' THEN
@@ -3342,6 +3692,9 @@ BEGIN
   SELECT * INTO inv FROM platform.invoice WHERE id = NEW.invoice_id FOR UPDATE;
   IF inv.status <> 'issued' OR inv.kind <> 'invoice' THEN
     PERFORM platform.fail('HK_PLT_SETTLEMENT_STATE', format('cannot settle a %s %s', inv.status, inv.kind));
+  END IF;
+  IF NOT platform.is_nested() THEN
+    PERFORM platform.fail('HK_PLT_DERIVED_COLUMN', 'settlements are written by payment, wallet and credit-note flows only');
   END IF;
   IF inv.paid_amount + NEW.amount > inv.total THEN
     PERFORM platform.fail('HK_PLT_OVERPAYMENT', 'settlement exceeds the outstanding amount');
@@ -3411,12 +3764,29 @@ BEGIN
   IF NEW.state = OLD.state THEN RETURN NEW; END IF;
   ok := (OLD.state = 'created'           AND NEW.state IN ('redirected','failed','expired'))
      OR (OLD.state = 'created'           AND NEW.state = 'verified' AND NEW.method = 'bank_transfer')
-     OR (OLD.state = 'redirected'        AND NEW.state IN ('callback_received','verified','failed','expired','reversed'))
-     OR (OLD.state = 'callback_received' AND NEW.state IN ('verified','failed','reversed','expired'))
-     OR (OLD.state IN ('failed','expired') AND NEW.state = 'verified' AND NEW.late_verification)
+     OR (OLD.state = 'redirected'        AND NEW.state IN ('callback_received','settling','verified','failed','expired','reversed'))
+     OR (OLD.state = 'callback_received' AND NEW.state IN ('settling','verified','failed','reversed','expired'))
+     OR (OLD.state = 'settling'          AND NEW.state IN ('verified','reversed'))
+     OR (OLD.state IN ('failed','expired') AND NEW.state IN ('settling','verified') AND NEW.late_verification)
      OR (OLD.state IN ('verified','partially_refunded') AND NEW.state IN ('partially_refunded','refunded') AND platform.is_nested());
   IF NOT ok THEN
     PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', format('payment %s -> %s', OLD.state, NEW.state));
+  END IF;
+  -- درگاه نیازمند settle (RV-PLT-05): verify موفق ← settling؛ settle موفق (یا ۴۵ تکراری) ← verified؛ ۴۸ یا شکست settle ← reversed.
+  -- تا settle نشده، صورتحساب تسویه و دوره فعال نمی‌شود و کیف پول شارژ نمی‌شود.
+  IF NEW.state = 'settling' THEN
+    IF NEW.provider IS DISTINCT FROM 'mellat' THEN
+      PERFORM platform.fail('HK_PLT_INVALID_TRANSITION', format('provider %s has no settle step', NEW.provider));
+    END IF;
+    IF NEW.verified_amount IS DISTINCT FROM NEW.amount OR NEW.provider_txn_ref IS NULL THEN
+      PERFORM platform.fail('HK_PLT_AMOUNT_MISMATCH', 'settling starts after a successful verify of the exact amount');
+    END IF;
+  END IF;
+  IF NEW.state = 'verified' AND NEW.provider = 'mellat' THEN
+    IF OLD.state <> 'settling' THEN
+      PERFORM platform.fail('HK_PLT_SETTLE_REQUIRED', 'Behpardakht Mellat payments are verified only after a successful settle (bpSettleRequest)');
+    END IF;
+    NEW.settled_at := now();
   END IF;
   IF NEW.state = 'verified' THEN
     IF NEW.verified_amount IS DISTINCT FROM NEW.amount THEN
@@ -3521,9 +3891,9 @@ BEGIN
     IF NEW.requested_by IS DISTINCT FROM platform.current_staff_id() THEN
       PERFORM platform.fail('HK_PLT_ACTOR_MISMATCH', 'requested_by must be the acting staff member');
     END IF;
+    SELECT * INTO w FROM platform.wallet WHERE id = NEW.wallet_id FOR UPDATE;
     IF NEW.payment_id IS NOT NULL THEN
       SELECT * INTO p FROM platform.payment WHERE id = NEW.payment_id;
-      SELECT * INTO w FROM platform.wallet WHERE id = NEW.wallet_id;
       IF p.state NOT IN ('verified','partially_refunded') OR p.tenant_id IS DISTINCT FROM w.tenant_id OR p.reseller_id IS DISTINCT FROM w.reseller_id THEN
         PERFORM platform.fail('HK_PLT_REFUND_SOURCE', 'gateway refund needs a verified payment of the wallet owner');
       END IF;
@@ -3531,6 +3901,12 @@ BEGIN
              WHERE r.payment_id = p.id AND r.status IN ('requested','approved')), 0) THEN
         PERFORM platform.fail('HK_PLT_REFUND_EXCEEDS', 'refund exceeds the refundable amount of the payment');
       END IF;
+    END IF;
+    -- رزرو وجه هنگام درخواست (RV-PLT-10): زیر قفل کیف پول، فقط از ماندهٔ مثبتی که در تعهد بازپرداخت/تسویهٔ باز دیگری نیست
+    -- (بدون سقف اعتبار)؛ لغو یا شکست آن را آزاد می‌کند و تکمیل آن را از دفتر کسر می‌کند
+    IF NEW.amount > w.balance - platform.wallet_encumbered(w.id) THEN
+      PERFORM platform.fail('HK_PLT_INSUFFICIENT_BALANCE', format('refund %s exceeds the available wallet balance %s',
+                            NEW.amount, w.balance - platform.wallet_encumbered(w.id)));
     END IF;
     RETURN NEW;
   END IF;
@@ -3561,8 +3937,8 @@ DECLARE
   p platform.payment%ROWTYPE;
 BEGIN
   IF NEW.status = 'completed' AND OLD.status <> 'completed' THEN
-    INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, payment_id, idempotency_key, memo)
-    VALUES (NEW.wallet_id, 0, 'refund_out', -NEW.amount, 0, NEW.payment_id, 'refund:' || NEW.id::text, NEW.bank_ref);
+    INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, payment_id, refund_id, idempotency_key, memo)
+    VALUES (NEW.wallet_id, 0, 'refund_out', -NEW.amount, 0, NEW.payment_id, NEW.id, 'refund:' || NEW.id::text, NEW.bank_ref);
     IF NEW.payment_id IS NOT NULL THEN
       SELECT * INTO p FROM platform.payment WHERE id = NEW.payment_id FOR UPDATE;
       IF p.refunded_amount + NEW.amount > p.verified_amount THEN
@@ -3609,17 +3985,25 @@ CREATE TABLE IF NOT EXISTS platform.credit_reservation (
   seq               integer NOT NULL CHECK (seq >= 1),
   kind              text NOT NULL CHECK (kind IN ('reserve','release')),
   units             bigint NOT NULL CHECK (units > 0),
-  unit_amount       numeric(24,0) NOT NULL CHECK (unit_amount >= 0),
-  cumulative_units  bigint NOT NULL CHECK (cumulative_units >= 0),
+  unit_amount       numeric(24,0) NOT NULL CHECK (unit_amount >= 0),   -- reserve: تعرفهٔ جاری؛ release: میانگین قیمت رزرو باز (مشتق)
+  amount            numeric(24,0) NOT NULL CHECK (amount >= 0),        -- مبلغ جابه‌جاشده با کیف پول (مشتق)
+  cumulative_units  bigint NOT NULL CHECK (cumulative_units >= 0),     -- سقف تجمعی رزرو باز پس از این ردیف (= credit.* سلول)
+  cumulative_amount numeric(24,0) NOT NULL CHECK (cumulative_amount >= 0),  -- پول رزرو باز پس از این ردیف (مشتق)
   wallet_entry_id   uuid UNIQUE REFERENCES platform.wallet_entry(id),
   created_at        timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (tenant_id, service_key, seq)
+  UNIQUE (tenant_id, service_key, seq),
+  CHECK (kind = 'release' OR amount = units * unit_amount)
 );
 
+-- رزرو: به تعرفهٔ جاری. آزادسازی (RV-PLT-01): از ردیف «آخر» (نه بیشینهٔ تاریخی)، حداکثر رزرو باز منهای مصرف، و به قیمتی که
+-- واقعاً پرداخت شده: سهم نسبی پول رزرو باز (trunc(units × cumulative_amount / cumulative_units))؛ آزادسازی همهٔ واحدهای باز
+-- دقیقاً همهٔ پول باز را برمی‌گرداند. قیمت اعلام‌شدهٔ برنامه (unit_amount) اگر داده شود باید همان میانگین باشد.
 CREATE OR REPLACE FUNCTION platform.credit_reservation_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-  v_prev bigint;
+  v_prev_units  bigint := 0;
+  v_prev_amount numeric := 0;
+  v_prev_seq    integer := 0;
   v_used numeric;
   v_tariff numeric;
   v_wallet uuid;
@@ -3629,29 +4013,44 @@ BEGIN
     PERFORM platform.fail('HK_PLT_RESERVATION_SHAPE', 'credit reservations are for meter features');
   END IF;
   v_wallet := platform.wallet_for('tenant', NEW.tenant_id);
-  PERFORM 1 FROM platform.wallet WHERE id = v_wallet FOR UPDATE;
-  SELECT coalesce(max(cumulative_units), 0), coalesce(max(seq), 0) + 1 INTO v_prev, NEW.seq
-    FROM platform.credit_reservation WHERE tenant_id = NEW.tenant_id AND service_key = NEW.service_key;
+  PERFORM 1 FROM platform.wallet WHERE id = v_wallet FOR UPDATE;      -- سریال‌سازی هر مستأجر
+  SELECT r.cumulative_units, r.cumulative_amount, r.seq INTO v_prev_units, v_prev_amount, v_prev_seq
+    FROM platform.credit_reservation r WHERE r.tenant_id = NEW.tenant_id AND r.service_key = NEW.service_key
+   ORDER BY r.seq DESC LIMIT 1;
+  v_prev_units := coalesce(v_prev_units, 0); v_prev_amount := coalesce(v_prev_amount, 0); v_prev_seq := coalesce(v_prev_seq, 0);
+  NEW.seq := v_prev_seq + 1;
   IF NEW.kind = 'reserve' THEN
     v_tariff := platform.tariff_at(NEW.service_key, now());
-    IF v_tariff IS NULL OR NEW.unit_amount <> v_tariff THEN
+    IF v_tariff IS NULL OR NEW.unit_amount IS DISTINCT FROM v_tariff THEN
       PERFORM platform.fail('HK_PLT_TARIFF_MISMATCH', 'reservation unit price must equal the current tariff');
     END IF;
-    NEW.cumulative_units := v_prev + NEW.units;
+    NEW.amount := NEW.units * NEW.unit_amount;
+    NEW.cumulative_units := v_prev_units + NEW.units;
+    NEW.cumulative_amount := v_prev_amount + NEW.amount;
   ELSE
     v_used := coalesce((SELECT sum(quantity) FROM platform.usage_daily WHERE tenant_id = NEW.tenant_id AND metric = NEW.service_key), 0);
-    IF NEW.units > v_prev - v_used THEN
-      PERFORM platform.fail('HK_PLT_RELEASE_EXCEEDS', 'cannot release more than the unused reserved units');
+    IF NEW.units > v_prev_units - v_used THEN
+      PERFORM platform.fail('HK_PLT_RELEASE_EXCEEDS', format('cannot release %s units: open reservation %s, used %s',
+                            NEW.units, v_prev_units, v_used));
     END IF;
-    NEW.cumulative_units := v_prev - NEW.units;
+    IF NEW.unit_amount IS NOT NULL AND NEW.unit_amount <> trunc(v_prev_amount / v_prev_units) THEN
+      PERFORM platform.fail('HK_PLT_TARIFF_MISMATCH', format('release is priced at the reserved price %s, not %s',
+                            trunc(v_prev_amount / v_prev_units), NEW.unit_amount));
+    END IF;
+    NEW.unit_amount := trunc(v_prev_amount / v_prev_units);
+    NEW.amount := CASE WHEN NEW.units = v_prev_units THEN v_prev_amount ELSE trunc(NEW.units * v_prev_amount / v_prev_units) END;
+    NEW.cumulative_units := v_prev_units - NEW.units;
+    NEW.cumulative_amount := v_prev_amount - NEW.amount;
   END IF;
   NEW.id := coalesce(NEW.id, uuidv7());
-  INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, memo)
-  VALUES (v_wallet, 0, CASE NEW.kind WHEN 'reserve' THEN 'credit_reservation' ELSE 'reservation_release' END,
-          CASE NEW.kind WHEN 'reserve' THEN -1 ELSE 1 END * NEW.units * NEW.unit_amount, 0,
-          'reservation:' || NEW.id::text, NEW.service_key)
-  RETURNING id INTO v_entry;
-  NEW.wallet_entry_id := v_entry;
+  IF NEW.amount > 0 THEN
+    INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, memo)
+    VALUES (v_wallet, 0, CASE NEW.kind WHEN 'reserve' THEN 'credit_reservation' ELSE 'reservation_release' END,
+            CASE NEW.kind WHEN 'reserve' THEN -1 ELSE 1 END * NEW.amount, 0,
+            'reservation:' || NEW.id::text, NEW.service_key)
+    RETURNING id INTO v_entry;
+    NEW.wallet_entry_id := v_entry;
+  END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON platform.credit_reservation;
@@ -3746,6 +4145,29 @@ LANGUAGE sql STABLE AS $$
   LIMIT 1
 $$;
 
+-- رویداد کمیسیون از نوع سطر و تاریخچهٔ مستأجر مشتق می‌شود (§۵-۱۲؛ RV-PLT-16)، نه از ادعای برنامه:
+-- subscription: نخستین سطر اشتراکِ صورتحساب پرداخت‌شدهٔ مستأجر ← first_sale، بعدی‌ها ← renewal؛ addon/extra_units ← addon؛
+-- service ← service؛ license: نخستین ← license_new، بعدی ← license_renewal؛ usage/credit_pack/adjustment ← بدون کمیسیون (NULL).
+CREATE OR REPLACE FUNCTION platform.commission_event_for(p_line uuid) RETURNS text
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  l platform.invoice_line%ROWTYPE;
+  i platform.invoice%ROWTYPE;
+  v_earlier boolean;
+BEGIN
+  SELECT * INTO l FROM platform.invoice_line WHERE id = p_line;
+  SELECT * INTO i FROM platform.invoice WHERE id = l.invoice_id;
+  IF l.line_kind IN ('subscription','license') THEN
+    SELECT EXISTS (SELECT 1 FROM platform.invoice_line l2 JOIN platform.invoice i2 ON i2.id = l2.invoice_id
+                    WHERE i2.tenant_id = i.tenant_id AND i2.kind = 'invoice' AND i2.status = 'paid' AND l2.line_kind = l.line_kind
+                      AND (i2.issued_at, i2.id, l2.line_no) < (i.issued_at, i.id, l.line_no))
+      INTO v_earlier;
+    RETURN CASE WHEN l.line_kind = 'subscription' THEN CASE WHEN v_earlier THEN 'renewal' ELSE 'first_sale' END
+                ELSE CASE WHEN v_earlier THEN 'license_renewal' ELSE 'license_new' END END;
+  END IF;
+  RETURN CASE l.line_kind WHEN 'addon' THEN 'addon' WHEN 'extra_units' THEN 'addon' WHEN 'service' THEN 'service' END;
+END $$;
+
 CREATE TABLE IF NOT EXISTS platform.commission_entry (
   id                 uuid PRIMARY KEY DEFAULT uuidv7(),
   reseller_id        uuid NOT NULL REFERENCES platform.reseller(id),
@@ -3791,6 +4213,12 @@ BEGIN
     IF inv.reseller_id IS DISTINCT FROM NEW.reseller_id OR inv.tenant_id IS NULL THEN
       PERFORM platform.fail('HK_PLT_COMMISSION_BASIS', 'invoice is not attributed to this reseller');
     END IF;
+    IF platform.commission_event_for(ln.id) IS NULL THEN
+      PERFORM platform.fail('HK_PLT_COMMISSION_BASIS', format('%s lines earn no commission', ln.line_kind));
+    END IF;
+    IF NEW.event IS DISTINCT FROM platform.commission_event_for(ln.id) THEN
+      PERFORM platform.fail('HK_PLT_COMMISSION_RULE', format('event for this line is %s, not %s', platform.commission_event_for(ln.id), NEW.event));
+    END IF;
     SELECT pv.product_code INTO v_product FROM platform.product_version pv WHERE pv.id = ln.product_version_id;
     IF NEW.rule_id IS DISTINCT FROM platform.commission_rule_for(NEW.reseller_id, NEW.event, v_product, inv.issue_date) THEN
       PERFORM platform.fail('HK_PLT_COMMISSION_RULE', 'rule is not the applicable commission rule for this sale');
@@ -3808,7 +4236,7 @@ BEGIN
     END IF;
   ELSE
     PERFORM platform.consume_approval(NEW.approval_id, 'commission.adjustment', 'reseller', NEW.reseller_id,
-                                      'commission_entry:' || NEW.id::text);
+                                      'commission_entry:' || NEW.id::text, to_jsonb(NEW));
   END IF;
   v_wallet := platform.wallet_for('reseller', NEW.reseller_id);
   INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key, memo)
@@ -3845,6 +4273,10 @@ CREATE TABLE IF NOT EXISTS platform.payout (
   CHECK (status <> 'failed' OR failure_reason IS NOT NULL)
 );
 SELECT platform.add_touch('platform.payout');
+ALTER TABLE platform.wallet_entry DROP CONSTRAINT IF EXISTS wallet_entry_refund_fk;
+ALTER TABLE platform.wallet_entry ADD CONSTRAINT wallet_entry_refund_fk FOREIGN KEY (refund_id) REFERENCES platform.refund(id);
+ALTER TABLE platform.wallet_entry DROP CONSTRAINT IF EXISTS wallet_entry_payout_fk;
+ALTER TABLE platform.wallet_entry ADD CONSTRAINT wallet_entry_payout_fk FOREIGN KEY (payout_id) REFERENCES platform.payout(id);
 
 CREATE OR REPLACE FUNCTION platform.payout_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -3872,20 +4304,20 @@ BEGIN
   END IF;
   IF NEW.status = OLD.status THEN RETURN NEW; END IF;
   IF OLD.status = 'draft' AND NEW.status = 'submitted' THEN
-    SELECT * INTO w FROM platform.wallet WHERE id = NEW.wallet_id;
-    IF NEW.amount > w.balance - coalesce((SELECT sum(p.amount) FROM platform.payout p WHERE p.wallet_id = NEW.wallet_id
-                                          AND p.id <> NEW.id AND p.status IN ('submitted','approved')), 0) THEN
+    -- زیر قفل کیف پول (RV-PLT-10): دو ارسال هم‌زمان یک مانده را دو بار تعهد نمی‌کنند
+    SELECT * INTO w FROM platform.wallet WHERE id = NEW.wallet_id FOR UPDATE;
+    IF NEW.amount > w.balance - platform.wallet_encumbered(w.id, NULL, NEW.id) THEN
       PERFORM platform.fail('HK_PLT_INSUFFICIENT_BALANCE', 'payout exceeds the available commission balance');
     END IF;
   ELSIF OLD.status = 'submitted' AND NEW.status = 'approved' THEN
-    PERFORM platform.consume_approval(NEW.approval_id, 'payout.approve', 'payout', NEW.id, 'payout:' || NEW.id::text);
+    PERFORM platform.consume_approval(NEW.approval_id, 'payout.approve', 'payout', NEW.id, 'payout:' || NEW.id::text, to_jsonb(NEW));
   ELSIF OLD.status = 'approved' AND NEW.status = 'paid' THEN
     IF (SELECT is_taxpayer FROM platform.reseller WHERE id = NEW.reseller_id) AND NEW.reseller_invoice_taxid IS NULL THEN
       PERFORM platform.fail('HK_PLT_PAYOUT_TAX_INVOICE', 'a taxpayer reseller must issue an e-invoice before payment');
     END IF;
     NEW.paid_at := now();
-    INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, memo)
-    VALUES (NEW.wallet_id, 0, 'payout', -NEW.amount, 0, 'payout:' || NEW.id::text, NEW.bank_ref)
+    INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, payout_id, idempotency_key, memo)
+    VALUES (NEW.wallet_id, 0, 'payout', -NEW.amount, 0, NEW.id, 'payout:' || NEW.id::text, NEW.bank_ref)
     RETURNING id INTO v_entry;
     NEW.wallet_entry_id := v_entry;
   ELSIF OLD.status = 'approved' AND NEW.status = 'failed' THEN
@@ -3941,7 +4373,7 @@ BEGIN
   END IF;
   IF NEW.kind = 'adjustment' THEN
     PERFORM platform.consume_approval(NEW.approval_id, 'reseller.quota_adjustment', 'reseller', NEW.reseller_id,
-                                      'quota_entry:' || NEW.id::text);
+                                      'quota_entry:' || NEW.id::text, to_jsonb(NEW));
   END IF;
   RETURN NEW;
 END $$;
@@ -3955,7 +4387,7 @@ CREATE TABLE IF NOT EXISTS platform.service_order (
   tenant_id             uuid NOT NULL REFERENCES platform.tenant(id),
   kind                  text NOT NULL CHECK (kind IN ('assisted_migration','onprem_install','training','data_conversion')),
   product_version_id    uuid REFERENCES platform.product_version(id),
-  source_system         text CHECK (source_system IN ('holoo','sepidar','hesabfa','mahak','excel','paper','other')),
+  source_system         text CHECK (source_system ~ '^[a-z][a-z0-9_]{1,40}$'),   -- کد migration.source_system (RV-MG-10)
   assignee_kind         text CHECK (assignee_kind IN ('staff','reseller')),
   assignee_staff_id     uuid REFERENCES platform.staff(id),
   assignee_reseller_id  uuid REFERENCES platform.reseller(id),
@@ -4021,7 +4453,7 @@ DROP TRIGGER IF EXISTS trg_no_delete ON platform.service_order;
 CREATE TRIGGER trg_no_delete BEFORE DELETE ON platform.service_order FOR EACH ROW EXECUTE FUNCTION platform.forbid_mutation();
 
 -- =====================================================================
--- ۱۴. سنجش مصرف (از uplink؛ idempotent بر (tenant_id, event_id))
+-- ۱۴. سنجش مصرف (از uplink؛ idempotent بر (tenant_id, event_id, metric))
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS platform.usage_daily (
   tenant_id    uuid NOT NULL REFERENCES platform.tenant(id),
@@ -4042,7 +4474,9 @@ CREATE TABLE IF NOT EXISTS platform.usage_event (
   day          date NOT NULL,                     -- روز محلی (Asia/Tehran) که سلول حساب کرده
   batch_id     uuid NOT NULL REFERENCES platform.uplink_batch(batch_id),
   received_at  timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (tenant_id, event_id),
+  -- یک رویداد outbox ممکن است چند meter بدهد (assistant.run.metered ← ai.tokens، ai.cost، ai.runs؛ RV-PLT-06):
+  -- idempotency برای هر (رویداد، meter)
+  PRIMARY KEY (tenant_id, event_id, metric),
   CHECK (day BETWEEN (occurred_at AT TIME ZONE 'UTC')::date - 1 AND (occurred_at AT TIME ZONE 'UTC')::date + 1)
 );
 
@@ -4078,6 +4512,16 @@ END $$;
 DROP TRIGGER IF EXISTS trg_apply ON platform.usage_event;
 CREATE TRIGGER trg_apply AFTER INSERT ON platform.usage_event FOR EACH ROW EXECUTE FUNCTION platform.usage_event_apply();
 SELECT platform.make_append_only('platform.usage_event');
+DO $$
+BEGIN
+  IF (SELECT array_agg(a.attname::text ORDER BY k.ord) FROM pg_constraint c
+        CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+       WHERE c.conrelid = 'platform.usage_event'::regclass AND c.contype = 'p') <> ARRAY['tenant_id','event_id','metric'] THEN
+    ALTER TABLE platform.usage_event DROP CONSTRAINT usage_event_pkey;
+    ALTER TABLE platform.usage_event ADD CONSTRAINT usage_event_pkey PRIMARY KEY (tenant_id, event_id, metric);
+  END IF;
+END $$;
 
 -- =====================================================================
 -- ۱۵. پشتیبانی: آینهٔ رضایت مستأجر، درخواست ورود به‌جای کاربر، تیکت، اطلاعیه
@@ -4093,6 +4537,7 @@ CREATE TABLE IF NOT EXISTS platform.support_consent (
   expires_at           timestamptz NOT NULL,
   revoked_at           timestamptz,
   reported_at          timestamptz NOT NULL DEFAULT now(),
+  batch_id             uuid NOT NULL REFERENCES platform.uplink_batch(batch_id),   -- دستهٔ uplink آخرین گزارش (RV-X4-02)
   PRIMARY KEY (tenant_id, grant_id),
   CHECK (expires_at > starts_at AND expires_at <= starts_at + interval '7 days'),
   CHECK ((grantee_kind = 'reseller') = (reseller_id IS NOT NULL))
@@ -4105,7 +4550,7 @@ BEGIN
   IF TG_OP = 'DELETE' THEN
     PERFORM platform.fail('HK_PLT_IMMUTABLE', 'consent mirror rows are kept');
   END IF;
-  IF (to_jsonb(NEW) - 'expires_at' - 'revoked_at' - 'reported_at') <> (to_jsonb(OLD) - 'expires_at' - 'revoked_at' - 'reported_at') THEN
+  IF (to_jsonb(NEW) - 'expires_at' - 'revoked_at' - 'reported_at' - 'batch_id') <> (to_jsonb(OLD) - 'expires_at' - 'revoked_at' - 'reported_at' - 'batch_id') THEN
     PERFORM platform.fail('HK_PLT_IMMUTABLE_FIELD', 'consent content is immutable');
   END IF;
   IF NEW.expires_at > OLD.expires_at OR (OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at) THEN
@@ -4382,7 +4827,7 @@ BEGIN
       END IF;
       IF NEW.sms_broadcast THEN
         PERFORM platform.consume_approval(NEW.sms_approval_id, 'announcement.sms_broadcast', 'announcement', NEW.id,
-                                          'announcement:' || NEW.id::text);
+                                          'announcement:' || NEW.id::text, to_jsonb(NEW));
       END IF;
       NEW.published_at := now();
     ELSIF NOT (OLD.status = 'published' AND NEW.status = 'withdrawn') THEN
@@ -4498,6 +4943,7 @@ CREATE TABLE IF NOT EXISTS platform.license (
   online_checkin        text NOT NULL DEFAULT 'optional' CHECK (online_checkin IN ('optional','required_30d','never')),
   reseller_id           uuid REFERENCES platform.reseller(id),
   issued_via            text NOT NULL DEFAULT 'staff' CHECK (issued_via IN ('staff','reseller_quota','renewal_auto','rehost')),
+  renewal_invoice_line_id uuid UNIQUE REFERENCES platform.invoice_line(id),   -- تمدید خودکار: سطر لایسنسِ صورتحساب پرداخت‌شده (RV-PLT-12)
   activation_code_hash  bytea UNIQUE CHECK (octet_length(activation_code_hash) = 32),
   status                text NOT NULL DEFAULT 'draft'
                         CHECK (status IN ('draft','pending_approval','issued','superseded','revoked','expired','cancelled')),
@@ -4543,6 +4989,41 @@ CREATE TABLE IF NOT EXISTS platform.license (
 CREATE UNIQUE INDEX IF NOT EXISTS license_one_issued_per_installation ON platform.license (installation_id) WHERE status = 'issued';
 CREATE UNIQUE INDEX IF NOT EXISTS license_issue_seq ON platform.license (installation_id, issue_seq) WHERE issue_seq IS NOT NULL;
 SELECT platform.add_touch('platform.license');
+
+ALTER TABLE platform.license ADD COLUMN IF NOT EXISTS renewal_invoice_line_id uuid UNIQUE REFERENCES platform.invoice_line(id);
+
+-- لایسنس بی‌تأیید هرگز بیش از حق استفادهٔ نسخهٔ محصول نیست (RV-PLT-12): هر limit ≤ product_entitlement('limit.<k>')
+-- (NULL در set = نامحدود) و هر ماژول دارای product_entitlement('module.<m>', enabled). نبودِ ردیف = خارج از حق استفاده.
+CREATE OR REPLACE FUNCTION platform.license_within_entitlements(p_product_version uuid, p_limits jsonb, p_modules text[]) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT NOT EXISTS (SELECT 1 FROM jsonb_each_text(p_limits) l
+                      WHERE NOT EXISTS (SELECT 1 FROM platform.product_entitlement e
+                                         WHERE e.product_version_id = p_product_version AND e.feature_key = 'limit.' || l.key
+                                           AND (e.limit_value IS NULL OR l.value::numeric <= e.limit_value)))
+     AND NOT EXISTS (SELECT 1 FROM unnest(p_modules) m
+                      WHERE NOT EXISTS (SELECT 1 FROM platform.product_entitlement e
+                                         WHERE e.product_version_id = p_product_version AND e.feature_key = 'module.' || m
+                                           AND e.enabled IS TRUE))
+$$;
+
+-- تمدید خودکار فقط با پرداخت (RV-PLT-12): سطر license صورتحساب پرداخت‌شدهٔ همان مستأجر و همان محصول که از پایان به‌روزرسانی
+-- لایسنس پیشین آغاز می‌شود و تاریخ‌های تازه (به‌روزرسانی، پشتیبانی، اعتبار) را می‌پوشاند؛ هر سطر یک بار (UNIQUE).
+CREATE OR REPLACE FUNCTION platform.license_renewal_paid(p_line uuid, p_tenant uuid, p_product_version uuid, p_prev_updates_until date,
+                                                        p_updates_until date, p_support_until date, p_valid_until date) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM platform.invoice_line l JOIN platform.invoice i ON i.id = l.invoice_id
+      JOIN platform.product_version lpv ON lpv.id = l.product_version_id
+      JOIN platform.product_version npv ON npv.id = p_product_version
+     WHERE l.id = p_line AND l.line_kind = 'license' AND i.kind = 'invoice' AND i.status = 'paid' AND i.tenant_id = p_tenant
+       AND lpv.product_code = npv.product_code
+       AND l.period_start IS NOT NULL AND l.period_end IS NOT NULL
+       AND l.period_start <= p_prev_updates_until + 1
+       AND p_updates_until <= l.period_end AND p_support_until <= l.period_end
+       AND (p_valid_until IS NULL OR p_valid_until <= l.period_end)
+       AND NOT EXISTS (SELECT 1 FROM platform.invoice_line cl JOIN platform.invoice c ON c.id = cl.invoice_id
+                        WHERE cl.original_line_id = l.id AND c.kind = 'credit_note' AND c.status = 'issued'))
+$$;
 
 ALTER TABLE platform.reseller_quota_entry DROP CONSTRAINT IF EXISTS reseller_quota_entry_license_fk;
 ALTER TABLE platform.reseller_quota_entry ADD CONSTRAINT reseller_quota_entry_license_fk FOREIGN KEY (license_id) REFERENCES platform.license(id);
@@ -4638,14 +5119,31 @@ BEGIN
     END IF;
     SELECT count(*) INTO v_rehosts FROM platform.license l
      WHERE l.installation_id = NEW.installation_id AND l.issued_via = 'rehost' AND l.issued_at > now() - interval '365 days';
+    -- معافیت‌های محدود از تأیید دونفرهٔ license.issue (RV-PLT-12؛ INV-PLIC-06):
+    --  سهمیهٔ نماینده: فقط تا حق استفادهٔ محصول (بیشتر از آن اصلاً صادر نمی‌شود)؛
+    --  آزمایشی ≤ ۳۰ روز: فقط نخستین آزمایشیِ مستأجر و تا حق استفادهٔ محصول؛
+    --  rehost: همان شرایط و تاریخ‌ها، حداکثر دو بار در ۳۶۵ روز؛
+    --  renewal_auto: همان شرایط، با سطر لایسنس پرداخت‌شده‌ای که تمدید را می‌پوشاند.
+    IF NEW.issued_via = 'reseller_quota' AND NOT platform.license_within_entitlements(NEW.product_version_id, NEW.limits, NEW.modules) THEN
+      PERFORM platform.fail('HK_PLT_LICENSE_ENTITLEMENT', 'reseller-quota licenses carry at most the product version entitlements');
+    END IF;
     v_exempt := coalesce(NEW.issued_via = 'reseller_quota'
-             OR (NEW.license_model = 'trial' AND NEW.valid_until <= NEW.not_before + 30)
+             OR (NEW.license_model = 'trial' AND NEW.valid_until <= NEW.not_before + 30
+                 AND platform.license_within_entitlements(NEW.product_version_id, NEW.limits, NEW.modules)
+                 AND NOT EXISTS (SELECT 1 FROM platform.license l WHERE l.tenant_id = NEW.tenant_id AND l.license_model = 'trial'
+                                   AND l.issued_at IS NOT NULL AND l.id <> NEW.id))
              OR (NEW.issued_via IN ('renewal_auto','rehost') AND prev.id IS NOT NULL
                  AND prev.limits = NEW.limits AND prev.modules = NEW.modules AND prev.edition = NEW.edition
                  AND prev.license_model = NEW.license_model
-                 AND (NEW.issued_via = 'renewal_auto' OR v_rehosts < 2)), false);
+                 AND CASE NEW.issued_via
+                       WHEN 'rehost' THEN v_rehosts < 2 AND NEW.updates_until <= prev.updates_until
+                                          AND NEW.support_until <= prev.support_until
+                                          AND NEW.valid_until IS NOT DISTINCT FROM prev.valid_until
+                       ELSE platform.license_renewal_paid(NEW.renewal_invoice_line_id, NEW.tenant_id, NEW.product_version_id,
+                                                          prev.updates_until, NEW.updates_until, NEW.support_until, NEW.valid_until)
+                     END), false);
     IF NOT v_exempt THEN
-      PERFORM platform.consume_approval(NEW.approval_id, 'license.issue', 'license', NEW.id, 'license:' || NEW.id::text);
+      PERFORM platform.consume_approval(NEW.approval_id, 'license.issue', 'license', NEW.id, 'license:' || NEW.id::text, to_jsonb(NEW));
     END IF;
     IF NEW.issued_via = 'reseller_quota' THEN
       INSERT INTO platform.reseller_quota_entry (reseller_id, product_code, seq, kind, delta, balance_after, license_id)
@@ -4895,6 +5393,23 @@ CREATE TABLE IF NOT EXISTS platform.rules_value (
   CONSTRAINT rules_value_no_overlap EXCLUDE USING gist (package_id WITH =, key WITH =, qualifier WITH =,
                                                         daterange(effective_from, effective_to, '[)') WITH &&)
 );
+
+-- نرخ مالیات بر ارزش افزودهٔ یک سطر صورتحساب از موتور قواعد (RV-PLT-11): ارجاع '<package>@<version>#<key>' باید به بستهٔ
+-- منتشرشده و ابطال‌نشده‌ای اشاره کند که تاریخ را پوشش می‌دهد و مقدار درصدی کلید در آن تاریخ معتبر است؛ وگرنه NULL.
+CREATE OR REPLACE FUNCTION platform.vat_rate_for(p_ref text, p_on date) RETURNS numeric
+LANGUAGE sql STABLE AS $$
+  SELECT (v.value #>> '{}')::numeric
+    FROM platform.rules_package p
+    JOIN platform.rules_value v ON v.package_id = p.id AND v.qualifier = ''
+    JOIN platform.rules_param_catalog c ON c.key = v.key AND c.value_type = 'percent'
+   WHERE p_ref ~ '^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}@[0-9]{4}\.[0-9]{1,4}#[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,5}$'
+     AND p.code = split_part(split_part(p_ref, '#', 1), '@', 1)
+     AND p.version = split_part(split_part(p_ref, '#', 1), '@', 2)
+     AND v.key = split_part(p_ref, '#', 2)
+     AND p.status = 'published'
+     AND p.covers_from <= p_on AND (p.covers_to IS NULL OR p.covers_to > p_on)
+     AND v.effective_from <= p_on AND (v.effective_to IS NULL OR v.effective_to > p_on)
+$$;
 
 CREATE TABLE IF NOT EXISTS platform.rules_golden_test (
   id          uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -5209,10 +5724,14 @@ CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON platform.industry_
 CREATE TABLE IF NOT EXISTS platform.migration_job_stat (
   tenant_id         uuid NOT NULL REFERENCES platform.tenant(id),
   job_id            uuid NOT NULL,                       -- migration.job.id در سلول
-  source_system     text NOT NULL CHECK (source_system IN ('holoo','sepidar','hesabfa','mahak','excel','paper','other')),
-  profile_code      text,
-  profile_version   text,
-  channel           text NOT NULL CHECK (channel IN ('file','api','agent','assisted')),
+  -- واژگان همان migration.job سلول (RV-MG-10): کد منبع با الگوی migration.source_system.code، کانال api/agent/backup/file،
+  -- و «همراه کارشناس» پرچم جدا (migration.job.assisted)، نه کانال
+  source_system     text NOT NULL CHECK (source_system ~ '^[a-z][a-z0-9_]{1,40}$'),
+  profile_code      text CHECK (profile_code ~ '^[a-z][a-z0-9_]{1,40}$'),
+  profile_version   integer CHECK (profile_version >= 1),
+  channel           text NOT NULL CHECK (channel IN ('api','agent','backup','file')),
+  assisted          boolean NOT NULL DEFAULT false,
+  batch_id          uuid NOT NULL REFERENCES platform.uplink_batch(batch_id),
   status            text NOT NULL,
   rows_total        bigint CHECK (rows_total >= 0),
   rows_failed       bigint CHECK (rows_failed >= 0),
@@ -5238,9 +5757,18 @@ END $$;
 DROP TRIGGER IF EXISTS trg_guard ON platform.migration_job_stat;
 CREATE TRIGGER trg_guard BEFORE UPDATE ON platform.migration_job_stat FOR EACH ROW EXECUTE FUNCTION platform.migration_job_stat_guard();
 
+-- نگاشت kind رویداد migration.mapping.confirmed به dict_kind (§D-P22 و 08 §۵-۱۶؛ RV-MG-10): column ← header_synonym؛
+-- هر value_* ← value_alias (همان dict_kind که payload سلول می‌فرستد؛ ناسازگاری ← رویداد نادیده و هشدار).
+-- account_mapping و unit_alias فقط با تألیف کارمند (نه از uplink) پر می‌شوند.
+CREATE OR REPLACE FUNCTION platform.migration_dict_kind(p_event_kind text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+  SELECT CASE WHEN p_event_kind = 'column' THEN 'header_synonym'
+              WHEN p_event_kind ~ '^value_[a-z_]+$' THEN 'value_alias' END
+$$;
+
 CREATE TABLE IF NOT EXISTS platform.migration_dictionary_candidate (
   id                 uuid PRIMARY KEY DEFAULT uuidv7(),
-  source_system      text NOT NULL,
+  source_system      text NOT NULL CHECK (source_system ~ '^[a-z][a-z0-9_]{1,40}$'),
   dict_kind          text NOT NULL CHECK (dict_kind IN ('header_synonym','account_mapping','unit_alias','value_alias')),
   source_text_norm   text NOT NULL,                      -- پس از fa-norm-v1
   target_key         text NOT NULL,
@@ -5260,6 +5788,7 @@ CREATE TABLE IF NOT EXISTS platform.migration_dictionary_candidate (
 CREATE TABLE IF NOT EXISTS platform.migration_dictionary_vote (
   candidate_id   uuid NOT NULL REFERENCES platform.migration_dictionary_candidate(id),
   tenant_id      uuid NOT NULL REFERENCES platform.tenant(id),
+  batch_id       uuid NOT NULL REFERENCES platform.uplink_batch(batch_id),
   first_seen_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (candidate_id, tenant_id)
 );
@@ -5311,10 +5840,11 @@ ALTER TABLE platform.migration_dictionary_candidate DROP CONSTRAINT IF EXISTS di
 ALTER TABLE platform.migration_dictionary_candidate ADD CONSTRAINT dictionary_candidate_release_fk
   FOREIGN KEY (release_version) REFERENCES platform.migration_dictionary_release(version);
 
+-- کد و نسخهٔ پروفایل همان migration.profile سلول (کد ^[a-z][a-z0-9_]{1,40}$ و نسخهٔ صحیح؛ manifest HIF «version»؛ RV-MG-10)
 CREATE TABLE IF NOT EXISTS platform.migration_profile_release (
-  profile_code           text NOT NULL CHECK (profile_code ~ '^[a-z][a-z0-9_.-]{2,60}$'),
-  version                text NOT NULL CHECK (version ~ '^[0-9]+\.[0-9]+\.[0-9]+$'),
-  source_system          text NOT NULL,
+  profile_code           text NOT NULL CHECK (profile_code ~ '^[a-z][a-z0-9_]{1,40}$'),
+  version                integer NOT NULL CHECK (version >= 1),
+  source_system          text NOT NULL CHECK (source_system ~ '^[a-z][a-z0-9_]{1,40}$'),
   status                 text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','beta','published','retired')),
   golden_dataset_passed  boolean NOT NULL DEFAULT false,
   real_sample_passed     boolean NOT NULL DEFAULT false,
@@ -5356,6 +5886,7 @@ CREATE TABLE IF NOT EXISTS platform.moadian_tenant_stat (
   cert_expires_on           date,
   signer_mode               text CHECK (signer_mode IN ('server_kms','device_agent','tsp_held')),
   signer_online             boolean,
+  batch_id                  uuid NOT NULL REFERENCES platform.uplink_batch(batch_id),
   updated_at                timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, day)
 );
@@ -5367,6 +5898,7 @@ CREATE TABLE IF NOT EXISTS platform.tenant_audit_anchor (
   hash            bytea NOT NULL CHECK (octet_length(hash) = 32),
   checkpoint_id   uuid NOT NULL,
   checkpoint_at   timestamptz NOT NULL,
+  batch_id        uuid NOT NULL REFERENCES platform.uplink_batch(batch_id),   -- منبع لنگر (سلول یا نصب همان مستأجر؛ RV-X4-02)
   received_at     timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, chain_no, seq)
 );
@@ -5698,6 +6230,118 @@ CREATE TRIGGER trg_a_scope BEFORE INSERT ON platform.ticket_message FOR EACH ROW
 DROP TRIGGER IF EXISTS trg_a_scope ON platform.payout;
 CREATE TRIGGER trg_a_scope BEFORE INSERT OR UPDATE ON platform.payout FOR EACH ROW EXECUTE FUNCTION platform.restricted_writer_guard();
 
+-- آینهٔ رضایت دستیار هر مستأجر (رویداد assistant.consent.changed بخش ۱۰؛ RV-AST-18). پیش از فعال‌کردن یا تغییر ارائه‌دهندهٔ
+-- مدل، پنل مستأجرانی را که رضایتشان اثرانگشت مقصد تازه را نمی‌پوشاند فهرست می‌کند (v_ai_consent_gap). رویداد کهنه بی‌اثر.
+CREATE TABLE IF NOT EXISTS platform.ai_tenant_consent (
+  tenant_id        uuid PRIMARY KEY REFERENCES platform.tenant(id),
+  action           text NOT NULL CHECK (action IN ('granted','revoked','superseded')),
+  text_code        text NOT NULL CHECK (char_length(text_code) BETWEEN 1 AND 100),
+  purposes         text[] NOT NULL DEFAULT '{}',
+  fingerprints     text[] NOT NULL DEFAULT '{}',
+  source_event_at  timestamptz NOT NULL,
+  batch_id         uuid NOT NULL REFERENCES platform.uplink_batch(batch_id),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE OR REPLACE FUNCTION platform.ai_tenant_consent_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.source_event_at < OLD.source_event_at THEN
+    RETURN OLD;                         -- uplink نامرتب: رویداد کهنه‌تر بی‌اثر
+  END IF;
+  NEW.updated_at := now();
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON platform.ai_tenant_consent;
+CREATE TRIGGER trg_guard BEFORE UPDATE ON platform.ai_tenant_consent FOR EACH ROW EXECUTE FUNCTION platform.ai_tenant_consent_guard();
+
+CREATE OR REPLACE VIEW platform.v_ai_consent_gap WITH (security_invoker = true) AS
+SELECT c.tenant_id, c.text_code, c.fingerprints, p.id AS provider_id, p.code AS provider_code, p.fingerprint AS provider_fingerprint
+  FROM platform.ai_tenant_consent c CROSS JOIN platform.ai_provider p
+ WHERE c.action = 'granted' AND p.status IN ('validated','active') AND NOT (p.fingerprint = ANY (c.fingerprints));
+
+-- ---------- پیوند uplink به فرستنده (RV-X4-02؛ INV-PCTL-13) ----------
+-- هر دستهٔ uplink با امضای یک سلول یا یک نصب On-prem می‌رسد. سرویس امضا را با کلید همان منبع بررسی می‌کند؛ پایگاه داده
+-- (دفاع در عمق) هر ردیفی را که نقش ingest می‌نویسد به دستهٔ جاری (ستون batch_id یا GUC app.uplink_batch_id) می‌بندد و
+-- می‌پذیرد فقط اگر منبع همان دسته «مالک» آن مستأجر یا شیء باشد: سلول = cell_id یا مقصد جابه‌جایی جای‌گذاری زندهٔ مستأجر؛
+-- نصب = installation.tenant_id. نصب یک مشتری هرگز مصرف، لنگر ممیزی، رضایت یا فهرست ورود مستأجر دیگری را نمی‌نویسد.
+CREATE OR REPLACE FUNCTION platform.uplink_source_owns_tenant(p_kind text, p_source text, p_tenant uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT CASE p_kind
+    WHEN 'cell' THEN EXISTS (SELECT 1 FROM platform.tenant_placement tp
+                              WHERE tp.tenant_id = p_tenant AND tp.state <> 'retired'
+                                AND (tp.cell_id = p_source OR tp.move_target_cell_id = p_source))
+    WHEN 'installation' THEN EXISTS (SELECT 1 FROM platform.installation i
+                                      WHERE i.id::text = p_source AND i.tenant_id = p_tenant
+                                        AND i.status IN ('pending_activation','active'))
+    ELSE false END
+$$;
+
+CREATE OR REPLACE FUNCTION platform.uplink_row_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  r       jsonb;
+  b       platform.uplink_batch%ROWTYPE;
+  v_batch uuid;
+  v_tenant uuid;
+  v_kind  text;     -- شیء سطح منبع: 'cell' یا 'installation'
+  v_obj   text;
+BEGIN
+  IF current_user <> 'hk_platform_ingest' THEN
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+  END IF;
+  r := to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END);
+  v_batch := coalesce(CASE WHEN TG_OP <> 'DELETE' THEN (r->>'batch_id')::uuid END,
+                      NULLIF(current_setting('app.uplink_batch_id', true), '')::uuid);
+  IF v_batch IS NULL THEN
+    PERFORM platform.fail('HK_PLT_UPLINK_BATCH_REQUIRED', format('ingest writes to %s are bound to an uplink batch', TG_TABLE_NAME));
+  END IF;
+  SELECT * INTO b FROM platform.uplink_batch WHERE batch_id = v_batch;
+  IF NOT FOUND THEN
+    PERFORM platform.fail('HK_PLT_UPLINK_BATCH_REQUIRED', 'uplink batch not found');
+  END IF;
+  IF TG_TABLE_NAME = 'installation' THEN
+    v_kind := 'installation'; v_obj := r->>'id';
+  ELSIF TG_TABLE_NAME IN ('cell','cell_command','cell_backup_status') THEN
+    v_kind := 'cell'; v_obj := CASE TG_TABLE_NAME WHEN 'cell' THEN r->>'id' ELSE r->>'cell_id' END;
+  ELSIF TG_TABLE_NAME = 'backup_drill' THEN
+    v_kind := CASE WHEN r->>'cell_id' IS NOT NULL THEN 'cell' ELSE 'installation' END;
+    v_obj := coalesce(r->>'cell_id', r->>'installation_id');
+  ELSIF TG_TABLE_NAME = 'rules_distribution' THEN
+    v_kind := r->>'target_kind'; v_obj := r->>'target_id';
+  ELSIF TG_TABLE_NAME = 'license_activation' THEN
+    v_kind := 'installation'; v_obj := r->>'installation_id';
+  ELSIF TG_TABLE_NAME = 'license_usage_report' THEN
+    SELECT i.tenant_id INTO v_tenant FROM platform.installation i WHERE i.id = (r->>'installation_id')::uuid;
+  ELSIF TG_TABLE_NAME = 'ticket_message' THEN
+    SELECT t.tenant_id INTO v_tenant FROM platform.ticket t WHERE t.id = (r->>'ticket_id')::uuid;
+  ELSE
+    v_tenant := (r->>'tenant_id')::uuid;
+  END IF;
+  IF v_kind IS NOT NULL THEN
+    IF b.source_kind IS DISTINCT FROM v_kind OR b.source_id IS DISTINCT FROM v_obj THEN
+      PERFORM platform.fail('HK_PLT_UPLINK_FOREIGN_SOURCE', format('%s %s is not the sender of batch %s (%s %s)',
+                            v_kind, v_obj, v_batch, b.source_kind, b.source_id));
+    END IF;
+  ELSIF v_tenant IS NULL OR NOT platform.uplink_source_owns_tenant(b.source_kind, b.source_id, v_tenant) THEN
+    PERFORM platform.fail('HK_PLT_UPLINK_FOREIGN_TENANT', format('%s %s does not own tenant %s (%s)',
+                          b.source_kind, b.source_id, v_tenant, TG_TABLE_NAME));
+  END IF;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['usage_event','tenant_audit_anchor','support_consent','moadian_tenant_stat','login_directory',
+                           'migration_job_stat','migration_dictionary_vote','ticket','ticket_message','tenant_runtime',
+                           'impersonation_request','installation','license_usage_report','license_activation','ai_tenant_consent',
+                           'cell','cell_command','cell_backup_status','backup_drill','rules_distribution'] LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS trg_a_uplink ON platform.%I', t);
+    EXECUTE format('CREATE TRIGGER trg_a_uplink BEFORE INSERT OR UPDATE OR DELETE ON platform.%I FOR EACH ROW EXECUTE FUNCTION platform.uplink_row_guard()', t);
+  END LOOP;
+END $$;
+
 -- =====================================================================
 -- ۲۵. کاتالوگ‌های کدی (با migration؛ برنامه فقط می‌خواند)
 -- =====================================================================
@@ -5815,11 +6459,17 @@ SELECT r, p FROM (VALUES
 ) v(r, p)
 ON CONFLICT DO NOTHING;
 
+-- هر نقشی که مجوز critical دارد ممتاز است (RV-PLT-18؛ نگهبان همین را از role_is_privileged هم می‌گیرد)
+UPDATE platform.staff_role r SET is_privileged = true
+ WHERE NOT r.is_privileged
+   AND EXISTS (SELECT 1 FROM platform.staff_role_permission rp JOIN platform.staff_permission p ON p.code = rp.permission_code
+                WHERE rp.role_code = r.code AND p.risk = 'critical');
+
 INSERT INTO platform.approval_action (code, subject_type, approver_permission, ttl, description_fa) VALUES
   ('tenant.purge',               'tenant',                'platform.tenant.purge.approve',              interval '24 hours', 'پاک‌سازی دادهٔ مستأجر از سلول'),
   ('tenant.restore_archive',     'tenant',                'platform.tenant.restore.approve',            interval '24 hours', 'بازگردانی مستأجر بایگانی‌شده'),
   ('tenant.legal_hold_release',  'legal_hold',            'platform.tenant.legal_hold.release.approve', interval '24 hours', 'آزادسازی توقیف قانونی'),
-  ('staff.grant_privileged_role','staff',                 'platform.staff.role.approve',                interval '24 hours', 'اعطای نقش مالک/مدیر'),
+  ('staff.grant_privileged_role','staff',                 'platform.staff.role.approve',                interval '24 hours', 'اعطای نقش ممتاز (مالک، مدیر، یا هر نقش دارای مجوز critical)'),
   ('price.publish',              'product_version',       'platform.price.publish.approve',             interval '72 hours', 'انتشار قیمت و پلن'),
   ('invoice.void',               'invoice',               'platform.billing.invoice.void.approve',      interval '24 hours', 'ابطال صورتحساب پرداخت‌نشده'),
   ('refund.execute',             'refund',                'platform.billing.refund.approve',            interval '24 hours', 'بازپرداخت وجه'),
@@ -5836,6 +6486,26 @@ INSERT INTO platform.approval_action (code, subject_type, approver_permission, t
   ('ai_provider.activate',       'ai_provider',           'platform.ai.approve',                        interval '24 hours', 'فعال‌سازی ارائه‌دهندهٔ مدل دستیار'),
   ('ai.tenant_override',         'tenant',                'platform.ai.approve',                        interval '24 hours', 'روشن‌کردن یا افزایش سقف دستیار برای مستأجر')
 ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO platform.uplink_event_type (event_type, producer, handler, target_table, description_fa) VALUES
+  ('core.support_access.granted',    'core',      'consent_upsert',     'support_consent',               'رضایت دسترسی پشتیبانی داده شد (آینه)'),
+  ('core.support_access.shortened',  'core',      'consent_shorten',    'support_consent',               'رضایت کوتاه شد'),
+  ('core.support_access.revoked',    'core',      'consent_revoke',     'support_consent',               'رضایت لغو شد'),
+  ('core.impersonation.started',     'core',      'impersonation_ack',  'impersonation_request',         'نشست ورود به‌جای کاربر آغاز شد (used)'),
+  ('core.impersonation.ended',       'core',      'impersonation_end',  'impersonation_request',         'نشست ورود به‌جای کاربر پایان یافت'),
+  ('core.support_ticket.opened',     'core',      'ticket_open',        'ticket',                        'تیکت درون‌برنامه'),
+  ('core.audit.checkpoint_created',  'core',      'audit_anchor',       'tenant_audit_anchor',           'لنگر زنجیرهٔ ممیزی مستأجر؛ result=broken هشدار بحرانی'),
+  ('migration.job.status_changed',   'migration', 'job_stat',           'migration_job_stat',            'آمار بی‌دادهٔ شخصی کار مهاجرت'),
+  ('migration.mapping.confirmed',    'migration', 'dictionary_vote',    'migration_dictionary_vote',     'رأی مستأجر برای فرهنگ نگاشت'),
+  ('rules.package.installed',        'rules',     'rules_distribution', 'rules_distribution',            'نصب بستهٔ قواعد در سلول (رویداد سلولی، tenant_id NULL)'),
+  ('rules.package.activated',        'rules',     'rules_distribution', 'rules_distribution',            'فعال‌شدن بستهٔ قواعد در سلول (رویداد سلولی، نه رونوشت مستأجری)'),
+  ('rules.package.rejected',         'rules',     'rules_distribution', 'rules_distribution',            'رد بسته در سلول'),
+  ('rules.package.superseded',       'rules',     'rules_distribution', 'rules_distribution',            'جایگزینی بسته در سلول'),
+  ('rules.package.withdrawn',        'rules',     'rules_distribution', 'rules_distribution',            'برداشتن بسته در سلول'),
+  ('rules.package.golden_verified',  'rules',     'rules_distribution', 'rules_distribution',            'آزمون طلایی بسته روی موتور سلول'),
+  ('assistant.run.metered',          'assistant', 'ai_meter',           'usage_event',                   'سه meter: ai.tokens، ai.cost، ai.runs'),
+  ('assistant.consent.changed',      'assistant', 'ai_consent_mirror',  'ai_tenant_consent',             'آینهٔ رضایت دستیار مستأجر (هشدار پیش از تغییر ارائه‌دهنده)')
+ON CONFLICT (event_type) DO NOTHING;
 
 INSERT INTO platform.tenant_lifecycle_transition (from_status, to_status, actor_kinds, approval_action) VALUES
   ('provisioning','trial',     '{system}',               NULL),
@@ -5973,7 +6643,11 @@ GRANT INSERT, UPDATE ON platform.usage_daily, platform.migration_job_stat, platf
   platform.moadian_tenant_stat, platform.cell_backup_status, platform.support_consent, platform.rules_distribution,
   platform.ticket, platform.number_counter
 TO hk_platform_ingest;
-GRANT INSERT, UPDATE, DELETE ON platform.login_directory TO hk_platform_ingest;
+GRANT SELECT, INSERT, UPDATE, DELETE ON platform.login_directory TO hk_platform_ingest;   -- upsert/حذف با WHERE به SELECT نیاز دارد
+GRANT SELECT, INSERT, UPDATE ON platform.ai_tenant_consent TO hk_platform_ingest;
+GRANT SELECT ON platform.uplink_event_type TO hk_platform_ingest;
+-- replay همان رویداد با ON CONFLICT DO NOTHING به SELECT روی ستون‌های کلید نیاز دارد (RV-PLT-06)
+GRANT SELECT (tenant_id, event_id, metric) ON platform.usage_event TO hk_platform_ingest;
 GRANT UPDATE (last_seen_at, app_version, schema_head, state_applied_version) ON platform.cell TO hk_platform_ingest;
 GRANT UPDATE (status, attempts) ON platform.cell_command TO hk_platform_ingest;
 GRANT UPDATE (applied_version, applied_at, last_uplink_at, last_activity_at, active_users, companies, branches, pos_devices,
@@ -6099,10 +6773,16 @@ LANGUAGE sql STABLE AS $$
   SELECT 'readonly reads a secret column', 'platform.idempotency_key.response_body'
    WHERE has_column_privilege('hk_platform_readonly', 'platform.idempotency_key', 'response_body', 'SELECT')
   UNION ALL
+  SELECT 'role with a critical permission is not marked privileged', 'platform.staff_role.' || r.code
+    FROM platform.staff_role r
+   WHERE NOT r.is_privileged AND NOT r.grants_all
+     AND EXISTS (SELECT 1 FROM platform.staff_role_permission rp JOIN platform.staff_permission p ON p.code = rp.permission_code
+                  WHERE rp.role_code = r.code AND p.risk = 'critical')
+  UNION ALL
   SELECT 'app role writes a code catalog', 'platform.' || t.relname
     FROM tbl t
    WHERE t.relname IN ('staff_role','staff_permission','staff_role_permission','approval_action','tenant_lifecycle_transition',
-                       'feature','rules_param_catalog','geo_province','geo_city','audit_chain_head')
+                       'feature','rules_param_catalog','geo_province','geo_city','audit_chain_head','uplink_event_type')
      AND (has_table_privilege('hk_platform_app', t.oid, 'INSERT') OR has_table_privilege('hk_platform_app', t.oid, 'UPDATE')
           OR has_table_privilege('hk_platform_app', t.oid, 'DELETE'))
 $$;

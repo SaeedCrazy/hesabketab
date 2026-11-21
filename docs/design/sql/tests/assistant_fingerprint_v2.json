@@ -1,0 +1,38 @@
+{
+  "format": "hk-vectors/1",
+  "name": "assistant.provider_fingerprint",
+  "version": "hkllm2",
+  "algorithm": "hex(sha256(utf8('hkllm2|' + ascii_lower(strip_ascii_space(operator)) + '|' + lower(host(base_url)) + '|' + data_location + '|' + (data_location in ('lan','cell_private') ? '' : model))))",
+  "rules": [
+    "strip_ascii_space: remove only U+0020 at both ends (Python: s.strip(' '); SQL: btrim(s, ' ')); never str.strip()",
+    "ascii_lower: map only A-Z to a-z (Python: s.translate(ASCII_LOWER); SQL: translate(...)); never str.lower() or PG lower(), which differ for characters such as U+0130",
+    "operator with a control character, tab, NBSP or other non-ASCII space, bidi or zero-width character (except ZWNJ) is rejected before hashing (SQL: assistant.is_clean_operator; CHECK on tenant_provider.operator)",
+    "model is part of the destination for 'iran' and 'other' (a reseller gateway serves domestic and resold foreign models on one host); for 'lan' and 'cell_private' the data never leaves the private network and the model is ignored"
+  ],
+  "twins": ["SQL assistant.provider_fingerprint(operator, base_url, data_location, model)", "Python hesabketab.assistant.domain.provider.fingerprint"],
+  "supersedes": "assistant_fingerprint_v1.json (hkllm1, without model; kept only until section 09 switches platform.ai_provider_fingerprint to hkllm2)",
+  "vectors": [
+    {"operator": "Iranian AI Co", "base_url": "https://API.Example.ir/v1", "data_location": "iran", "model": "hoosh-7b-instruct",
+     "expected": "f5b6e6f06e2c7d0dddfa64b83db5f78f01da920132494f4a37e830806829a34a"},
+    {"operator": "  Our LAN vLLM ", "base_url": "http://10.0.0.5:8000/v1", "data_location": "lan", "model": "qwen2.5-7b",
+     "expected": "e6cfeeb53945b2c0816cd874697e3d7b9da0905c3efb7f09d5b92465233ccc23"},
+    {"operator": "شرکت هوش ایران", "base_url": "https://llm.hooshiran.ir:8443/openai/v1", "data_location": "iran", "model": "gpt-4o-mini",
+     "expected": "89c54e466189309d37f4bda7e183129297ee1b05f0da7b8936bfa5f15353ff27"},
+    {"operator": "شرکت هوش ایران", "base_url": "https://llm.hooshiran.ir:8443/openai/v1", "data_location": "iran", "model": "hoosh-fa-8b",
+     "expected": "b9bdce0f5acb0757886fda36892bc269161059761b89048ba7f50e394d594764",
+     "note": "same reseller host, different model => different destination => re-consent"},
+    {"operator": "Our LAN vLLM", "base_url": "http://10.0.0.5:9000/v2", "data_location": "lan", "model": "llama-3.1-8b",
+     "expected": "e6cfeeb53945b2c0816cd874697e3d7b9da0905c3efb7f09d5b92465233ccc23",
+     "note": "LAN: port, path and model are not part of the destination"},
+    {"operator": "İSTANBUL AI", "base_url": "https://X.Example.com/v1", "data_location": "other", "model": "m1",
+     "expected": "be4be2f173d12c471fa315253f6b32dae6e84523cc06df6aee1382e0c987ab82",
+     "note": "only ASCII letters are lowered: canonical operator is 'İstanbul ai'"},
+    {"operator": "Cell vLLM", "base_url": "http://10.20.0.5:8000/v1", "data_location": "cell_private", "model": "qwen2.5-14b",
+     "expected": "f91c6d0365dbd3d650bfc07df42f53835acd292a50d8d48061b0d15fc8672887"}
+  ],
+  "rejected_operators": [
+    {"operator": "\tAcme AI", "reason": "tab"},
+    {"operator": "Acme AI", "reason": "no-break space"},
+    {"operator": "Acme‮IA", "reason": "bidi override"}
+  ]
+}

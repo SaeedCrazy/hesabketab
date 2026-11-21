@@ -7,6 +7,17 @@
     {"memory": "DEF5GH", "day": 18463, "serial": 8173,      "control": "68697057172018463000000008173", "taxid": "DEF5GH0481F0000001FED8", "standard_verhoeff_taxid": "DEF5GH0481F0000001FED7"},
     {"memory": "DEF5GH", "day": 18463, "serial": 2572613409, "control": "68697057172018463002572613409", "taxid": "DEF5GH0481F009956F7211", "standard_verhoeff_taxid": "DEF5GH0481F009956F7214"}
   ],
+  "boundary_note": "Edge of the 22-character format: day up to 0xFFFFF (7 decimal digits) and serial up to 0xFFFFFFFFFF (13 decimal digits). The control string pads like Python str.zfill (pad when shorter, never truncate); merged from tests/mig_taxid_v1.json (CR-MG22 / RV-IT-12) so tax.taxid_valid and migration.taxid_is_valid agree.",
+  "boundary": [
+    {"memory": "A1B2C3", "day": 18463,   "serial": 1099511627775, "control": "6516626730184631099511627775",   "taxid": "A1B2C30481FFFFFFFFFFF0"},
+    {"memory": "ZZZZZZ", "day": 1048575, "serial": 1,             "control": "9090909090901048575000000000001", "taxid": "ZZZZZZFFFFF00000000010"},
+    {"memory": "DEF5GH", "day": 18463,   "serial": 1000000000005, "control": "686970571720184631000000000005",  "taxid": "DEF5GH0481FE8D4A510051"}
+  ],
+  "out_of_range": [
+    {"memory": "DEF5GH", "day": 1048576, "serial": 1,             "note": "day needs 6 hex digits"},
+    {"memory": "DEF5GH", "day": 18463,   "serial": 1099511627776, "note": "serial needs 11 hex digits"},
+    {"memory": "DEF5GH", "day": -1,      "serial": 1,             "note": "negative day"}
+  ],
   "accepted": ["A1121604C220002F095011", "A111DW04E8300004349008", "A2HP31050B0006A607FE39"],
   "invalid": ["DEF5GH0481F000000000C0", "DEF5GH0481000000F1FED8", "def5gh0481f000000000c2", "DEF5GH0481F000000000C", "A111DW04E8300004349007"],
   "line_math": [

@@ -20,7 +20,7 @@
 9. **BOM سبک.** سه نوع دارد: `kit` (بستهٔ فروشی)، `recipe` (دستور پخت کافه) و `production` (تولید داخلی نیمه‌آماده). هر BOM نسخه دارد و چرخهٔ `draft → active → archived` را طی می‌کند. هم‌پوشانی نسخهٔ فعال و چرخه در BOM ساختاری رد می‌شود. منطق مصرف در بخش انبار است.
 10. **قفل پس از استفاده.** با اولین ثبت قطعی، کالا قفل می‌شود. از آن پس واحد پایه، نوع، ردیابی (سریال، بچ و انقضا)، ضریب واحدها و محورهای موجود ثابت‌اند و کالا حذف نمی‌شود؛ تریگر این را اجرا می‌کند (افزودن محور به کالای ساده مجاز است). حذف فیزیکی کالا فقط پیش از استفاده ممکن است. شخص حذف فیزیکی ندارد (D-M25).
 
-اندازه: ۳۹ جدول مستأجری (۱۵ در `parties` و ۲۴ در `catalog`)، ۸ جدول مرجع در `ref`، ۸ ویو با `security_invoker`، __NFUNC__ تابع، __NTRG__ تریگر و __NINV__ ناوردا (§۷). آزمون پایگاه داده هر ناوردای سطح پایگاه داده را با کد یا نام قید دقیق خودش، با نقش `hk_app` (و برای مسیر درون‌ریزی و همروندی با نقش مالک و دو نشست dblink) اجرا می‌کند و سبز است. آزمون جهش هر تریگر، ایندکس یکتای جزئی و قید CHECK/EXCLUDE را می‌کشد، جز بازماندگانی که دسترس‌ناپذیری‌شان در §۹-۱ اثبات شده است.
+اندازه: ۳۹ جدول مستأجری (۱۵ در `parties` و ۲۴ در `catalog`)، ۸ جدول مرجع در `ref`، ۸ ویو با `security_invoker`، ۵۶ تابع (۹ در `ref`، ۱۶ در `parties` و ۳۱ در `catalog`)، ۶۵ تریگر (به‌اضافهٔ تریگرهای فیلد سفارشی که `core.attach_custom_fields` می‌گذارد) و ۵۹ ناوردا (§۷). آزمون پایگاه داده هر ناوردای سطح پایگاه داده را با کد یا نام قید دقیق خودش، با نقش `hk_app` (و برای مسیر درون‌ریزی و همروندی با نقش مالک و دو نشست dblink) اجرا می‌کند و سبز است. آزمون جهش هر تریگر، ایندکس یکتای جزئی و قید CHECK/EXCLUDE را می‌کشد، جز بازماندگانی که دسترس‌ناپذیری‌شان در §۹-۱ اثبات شده است.
 
 ## ۲. دامنه
 
@@ -273,7 +273,8 @@
 
 ### D-M15 — سریال، بچ و انقضا پرچم کالا؛ داده‌اش در انبار
 - **تصمیم:**
-  - `track_serial`، `track_batch`، `track_expiry` (نیازمند بچ)، `shelf_life_days` (نیازمند انقضا)، `warranty_days` و `warranty_provider_party_id` روی کالا هستند. ردیابی فقط برای کالای `stock` مجاز است.
+  - `track_serial`، `track_batch`، `track_expiry` (نیازمند بچ)، `shelf_life_days` (نیازمند انقضا)، `warranty_days`، `warranty_basis` و `warranty_provider_party_id` روی کالا هستند. ردیابی فقط برای کالای `stock` مجاز است.
+  - `warranty_basis ∈ {sale_date, activation}` (پیش‌فرض `sale_date`) آغاز گارانتی هر سریال را تعیین می‌کند: تاریخ فروش (موتور سریال بخش ۰۵)، یا فعال‌سازی کارت گارانتی توسط خریدار (رایج در کالای برقی؛ آغاز را inventory هنگام ثبت فعال‌سازی می‌نویسد). `v_sku` هر سه ستون گارانتی را می‌دهد (05:CR-C08).
   - شمارهٔ سریال، بچ، تاریخ انقضا و گارانتی هر سریال جدول‌های inventory هستند (الگوی bundle).
   - پس از استفاده `track_serial`، `track_batch` و `track_expiry` قفل می‌شوند (RV-MD-18): بچ‌های موجود تاریخ انقضا ندارند، پس روشن کردن انقضا FEFO و قاعدهٔ «فروش بچ منقضی» بخش ۰۵ را می‌شکند. `shelf_life_days` فقط پیش‌فرض تاریخ انقضای بچ تازه است و پس از قفل هم قابل ویرایش است؛ چون به `track_expiry` بسته است، با قفل انقضا نمی‌تواند انقضا را دور بزند. گارانتی (`warranty_days` و ارائه‌دهنده) قفل نمی‌شود، چون فقط فروش‌های بعدی را تعیین می‌کند (گارانتی هر سریال روی خود سریال ثبت می‌شود).
 - **دلیل:** کالای برقی سریال و گارانتی، و داروخانه و سوپرمارکت بچ و انقضا لازم دارند. تغییر ردیابی پس از وجود موجودی، دفتر انبار را ناسازگار می‌کند.
@@ -556,7 +557,7 @@ erDiagram
 | `attribute_set` و `attribute_set_member` | قالب ویژگی | عضو: `usage ∈ {variant_axis, descriptive}`، `axis_position` (۱ تا ۳، یکتا؛ فقط برای محور)، `is_required`. تریگر `trg_axis_guard`: محور باید `can_be_variant_axis` باشد |
 | `brand` | برند | `code`، `name`، `name_search` |
 | `item_category` | دستهٔ درختی | `parent_id` (FK خودی)، پیش‌فرض‌ها (`default_posting_group_id`، `default_tax_category_code`، `default_uom_id`، `default_attribute_set_id`). `trg_category_guard`: بی‌چرخه، عمق ≤ ۱۰ |
-| `item` | الگوی کالا یا خدمت | `code`، `name`، `short_name` (چاپ رسید، ≤ ۴۰)، `description`، `item_type ∈ {stock, non_stock, service}`، دسته، برند، گروه ثبت، قالب ویژگی، `base_uom_id`، `has_variants` و `variant_axis1..3_id`، ردیابی (`track_serial`، `track_batch`، `track_expiry`، `shelf_life_days`)، گارانتی، `sstid` و `sstid_kind`، `moadian_title`، `tax_category_code` و `other_tax_category_code`، `is_sellable`، `is_purchasable`، `allow_discount`، `allow_price_override`، `status`، `usage_locked_at`، `custom`، `company_id` (محدودیت دید) |
+| `item` | الگوی کالا یا خدمت | `code`، `name`، `short_name` (چاپ رسید، ≤ ۴۰)، `description`، `item_type ∈ {stock, non_stock, service}`، دسته، برند، گروه ثبت، قالب ویژگی، `base_uom_id`، `has_variants` و `variant_axis1..3_id`، ردیابی (`track_serial`، `track_batch`، `track_expiry`، `shelf_life_days`)، گارانتی (`warranty_days`، `warranty_basis`، `warranty_provider_party_id`)، `sstid` و `sstid_kind`، `moadian_title`، `tax_category_code` و `other_tax_category_code`، `is_sellable`، `is_purchasable`، `allow_discount`، `allow_price_override`، `status`، `usage_locked_at`، `custom`، `company_id` (محدودیت دید) |
 | `item_variant` | SKU | `code` (یکتا در مستأجر، ≤ ۶۰)، `is_default`، `axis1..3_value_id`، `name_suffix`، `sstid` و `sstid_kind` (استثنا)، `plu_code` (کد ترازو و صندوق، یکتا)، `status`. `UNIQUE NULLS NOT DISTINCT (tenant_id, item_id, axis1, axis2, axis3)`. پیش‌فرض بی‌محور است. `UNIQUE (tenant_id, item_id, id)` هدف FKهای «variant همان کالا» است |
 | `item_uom` | واحدهای کالا | `factor core.rate > 0`، `is_base` (یکی، با factor=1)، فروش و خرید مجاز، پیش‌فرض فروش و خرید (یکی؛ نیازمند مجاز بودن)، `moadian_unit_code` استثنا، `is_active`. هدف FK ترکیبی `(tenant_id, item_id, uom_id)` برای بارکد، قیمت و BOM |
 | `item_attribute_value` | ویژگی توصیفی کالا | دقیقاً یکی از `value_id`، `value_text`، `value_number` یا `value_bool`. تریگر نوع مقدار و «نه محور» را بررسی می‌کند |
@@ -611,7 +612,7 @@ erDiagram
 | `party_ref_check(...)` و `scale_prefix_lock(tenant, prefix)` | داخلی | نگهبان ارجاع به شخص و قفل مشورتی پیشوند ترازو |
 | `rewire_merged_party(merge_id)` | `→ jsonb` | مشترک `catalog.party_merge`: انتساب قیمت، تأمین‌کننده و شرکت گارانتی بازنده → جانشین؛ idempotent (RV-MD-09) |
 | `v_category_effective` | ویو بازگشتی | فقط نمای درخت (UI): مسیر (`path_ids`، `path_codes`، `path_names`)، عمق، و پیش‌فرض‌های ارث‌برده |
-| `v_sku` | ویو | SKU با نام نمایشی، نوع، واحد پایه، گروه ثبت مؤثر (`category_posting_group`)، ردیابی، `sstid` مؤثر، طبقهٔ مالیات، پرچم‌ها، `is_active` (کالا و variant)، محورها، PLU، `warranty_days` و `warranty_provider_party_id` (05:CR-C08) |
+| `v_sku` | ویو | SKU با نام نمایشی، نوع، واحد پایه، گروه ثبت مؤثر (`category_posting_group`)، ردیابی، `sstid` مؤثر، طبقهٔ مالیات، پرچم‌ها، `is_active` (کالا و variant)، محورها، PLU، `warranty_days`، `warranty_basis` و `warranty_provider_party_id` (05:CR-C08) |
 | `v_item_uom_effective` | ویو | واحدهای کالا با کد، نام، اعشار و `moadian_unit_code` مؤثر |
 | `v_barcode_lookup` | ویو | کد → (variant، کالا، واحد، ضریب، فعال بودن) |
 
@@ -831,6 +832,7 @@ class ItemCreate(BaseModel):
     variant_code_pattern: str = "{item}-{a1}{-a2}{-a3}"              # توکن‌ها: item, a1..a3 (کد مقدار)
     track_serial: bool = False; track_batch: bool = False; track_expiry: bool = False
     shelf_life_days: int | None = None; warranty_days: int | None = None; warranty_provider_party_id: UUID | None = None
+    warranty_basis: Literal["sale_date", "activation"] = "sale_date"
     sstid: str | None = None; sstid_kind: Literal["general", "specific"] | None = None; moadian_title: str | None = None
     tax_category_code: str | None = None          # None ← پیش‌فرض دسته ← 'standard'
     other_tax_category_code: str | None = None
@@ -1004,12 +1006,14 @@ class PriceQuery:
     async def applicable_lists(self, uow, *, kind: str, company_id: UUID, branch_id: UUID | None,
                                party_id: UUID | None, channel: str | None, on: date) -> list[UUID]: ...  # ترتیب‌شده برای sales
 
-class MasterdataImportService:    # فقط برای migration (و API عمومی bulk)
-    async def upsert_parties(self, uow, run_id: UUID, source_system: str, source_scope: str,
+class MasterdataImportService:    # فقط برای migration (و API عمومی bulk). job_id = migration.job (08:CR-MG09)؛ source_scope = source_db بخش ۰۸
+    async def upsert_parties(self, uow, job_id: UUID, source_system: str, source_scope: str,
                              rows: list[PartyImportRow]) -> ImportBatchResult: ...
-    async def upsert_items(self, uow, run_id: UUID, source_system: str, source_scope: str,
+    async def upsert_items(self, uow, job_id: UUID, source_system: str, source_scope: str,
                            rows: list[ItemImportRow]) -> ImportBatchResult: ...
-    async def upsert_prices(self, uow, run_id: UUID, rows: list[PriceImportRow], *, backdate: bool) -> ImportBatchResult: ...
+    async def upsert_prices(self, uow, job_id: UUID, rows: list[PriceImportRow], *, backdate: bool) -> ImportBatchResult: ...
+    async def deactivate_if_unused(self, uow, kind: Literal["party", "item"],
+                                   ids: list[UUID]) -> DeactivationReport: ...   # rollback جبرانی مهاجرت (§۵-۶-۱۰؛ CR-MG17)
 ```
 
 ### ۵-۶. الگوریتم‌های کلیدی
@@ -1347,7 +1351,7 @@ apply(pack, version):
 | `HK_CATALOG_CATEGORY_NOT_FOUND` | `catalog.category.not_found` | 404 |
 | `HK_PARTY_CODE_SERIES_INACTIVE` و `HK_CATALOG_CODE_SERIES_INACTIVE` | `parties.code_series.inactive` و `catalog.code_series.inactive` | 409 |
 | `HK_IMMUTABLE` (`party_merge`، `party_taxpayer_inquiry`) | `core.record.immutable` | 409 |
-| `HK_CF_*` (فیلد سفارشی) | کدهای `core.custom_field.*` کاتالوگ kernel | 422 |
+| `HK_CF_*` (فیلد سفارشی) | `core.validation.failed` با `errors[].field` (کاتالوگ core؛ 02 §۵) | 422 |
 | `HK_ENCODING` (فقط هنگام migration) | — (شکست استقرار) | — |
 | `HK_TENANT_CONTEXT_MISSING` | `core.internal.tenant_isolation` | 500 (باگ) |
 
@@ -1530,8 +1534,8 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | **INV-MD-03** | همهٔ ویوهای این بخش `security_invoker` هستند | `WITH (security_invoker = true)` | `T17 INV-MD-03 views are security_invoker` |
 | **INV-MD-04** | `hk_readonly` می‌خواند و نمی‌نویسد | GRANT | `T19 INV-MD-04 readonly can read` و `readonly cannot write` |
 | **INV-MD-05** | ستون‌های متنی نرمال fa-norm-v1 هستند. کدها (شخص، کالا، SKU، گروه، ...) در مستأجر یکتا و ASCII‌اند. ستون‌های جست‌وجو مولدند | CHECK `x = core.fa_normalize_text(x)`؛ UNIQUE؛ `GENERATED` | `T02 INV-MD-05 fa-norm …`؛ `T06 INV-MD-05 unnormalized name (Arabic yeh)` و `duplicate party code` |
-| **INV-MD-06** | هر به‌روزرسانی ردیف تغییرپذیر `row_version` را یک واحد زیاد و `updated_at` را تازه می‌کند | `trg_touch` (`core.touch_row`) | `T06 INV-MD-06 row_version increments`؛ `tests/db/masterdata/test_concurrency.py::test_if_match_conflict_409` |
-| **INV-MD-07** | هر جدول مستأجری این بخش در `core.export_table_registry` (با ستون‌های PII) ثبت است؛ مجوزها و محافظ فیلد §۵-۱۲، سهم قالب‌های نقش، تنظیم `parties.duplicate.threshold`، مشترک `catalog.party_merge` و فیلد سفارشی `party` و `item` در core ثبت‌اند؛ `core.security_lint()` برای `parties`، `catalog` و `ref` تهی است | بخش ۱۲ فایل SQL (وقتی 10 اعمال شده؛ R-ORDER) | `T21 RV-IT-01 …`، `RV-IT-02 …`، `RV-X1-23 …`، `RV-MD-09 catalog subscribes to parties.party.merged` و `RV-IT-CUSTOM …` (کلید تعریف‌نشده ← `HK_CF_UNKNOWN_FIELD`) |
+| **INV-MD-06** | هر به‌روزرسانی ردیف تغییرپذیر `row_version` را یک واحد زیاد و `updated_at` را تازه می‌کند | `trg_touch` (`core.touch_row`) | `T06 INV-MD-06 row_version increments`؛ `tests/db/masterdata/test_concurrency.py::test_if_match_stale_412` |
+| **INV-MD-07** | هر جدول مستأجری این بخش در `core.export_table_registry` (با ستون‌های PII) ثبت است؛ مجوزها و محافظ فیلد §۵-۱۲، سهم قالب‌های نقش، تنظیم `parties.duplicate.threshold`، مشترک `catalog.party_merge` و فیلد سفارشی `party` و `item` در core ثبت‌اند؛ کنشگر هر ستون `*_by` عضو مستأجر و تصویر کالا پیوست core است (۱۴ FK، R-ACTOR)؛ `core.security_lint()` برای `parties`، `catalog` و `ref` تهی است | بخش ۱۲ فایل SQL (وقتی 10 اعمال شده؛ R-ORDER) | `T21 RV-IT-01 …`، `RV-IT-02 …`، `RV-X1-23 …`، `RV-MD-09 catalog subscribes to parties.party.merged`، `RV-IT-CUSTOM …` (کلید تعریف‌نشده ← `HK_CF_UNKNOWN_FIELD`)، `R-ORDER actor and attachment FKs …`، `R-ACTOR party created_by must be a tenant member`، `R-ACTOR merge actor must be a tenant member` و `R-ORDER item image must reference a core attachment` |
 | **INV-MD-08** | هر قید CHECK دو اسکیما (حتی در مسیر درون‌ریزی با `session_replication_role=replica` که تریگر و FK خاموش‌اند) مقدار ناقض را با نام خودش رد می‌کند | قیدهای CHECK | `T23 every CHECK of parties and catalog is exercised by name` (شمارش = همهٔ CHECKهای کاتالوگ) و `T23 unique index …` |
 | **INV-PTY-01** | `national_id` و `national_id_status` هر دو NULL یا هر دو پرند. قالب بر حسب نوع: حقیقی ۱۰، حقوقی ۱۱، مشارکت مدنی ۱۱ (`format_only`)، تبعهٔ حقیقی ۱۲ (`format_only`)، تبعهٔ حقوقی بدون شناسه | CHECK `party_national_id_presence` و `party_national_id_valid` (`parties.national_id_acceptable`) | `T06 INV-PTY-01 legal id with 10 digits`، `civil partnership marked valid`، `foreign legal with national id` و `national id without status` |
 | **INV-PTY-02** | `valid` ⇔ checksum درست. `override` فقط برای checksum غلط، با دلیل ≥ ۵ نویسه و زمان، و هرگز برای «همه رقم یکسان». ستون‌های override فقط با `override` پرند | CHECK `party_national_id_valid` و `party_national_id_override`؛ سرویس: وضعیت را خودش تعیین می‌کند و مجوز `override_id` می‌خواهد | `T06 INV-PTY-02 bad checksum marked valid`، `override of a valid code`، `override without reason`، `override of all-same digits` و `override fields on valid`؛ `tests/integration/parties/test_party_create.py::test_override_requires_permission` |
@@ -1566,7 +1570,7 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | **INV-CAT-07** | درخت دسته بی‌چرخه است و عمقش ≤ ۱۰ | `trg_category_guard` | `T12 INV-CAT-07 category cycle` |
 | **INV-CAT-08** | کد بارکد در مستأجر یکتاست. GTINها طول و رقم کنترل درست دارند. variant و واحد بارکد مال همان کالایند. هویت بارکد تغییرناپذیر است. هر (variant، واحد) یک بارکد اصلی دارد. بارکد کارتن ضریب واحد را برمی‌گرداند | UNIQUE؛ CHECK `barcode_gtin_*`؛ FK ترکیبی `(item, variant)` و `(item, uom)`؛ `trg_barcode_guard`؛ `v_barcode_lookup` | `T14 INV-CAT-08 carton barcode resolves factor 24`، `bad EAN check digit`، `duplicate barcode`، `variant of another item`، `unit not allowed for item` و `barcode identity immutable` |
 | **INV-CAT-09** | بارکد `internal` همیشه EAN-13 با پیشوند `04` است. تخصیص‌دهنده کدهای پیاپی با رقم کنترل درست می‌دهد و هیچ کد موجودی را تکرار نمی‌کند | CHECK `barcode_internal_rcn`؛ `allocate_internal_barcode` با قفل شمارنده | `T14 INV-CAT-09 internal barcode outside 04`، `first internal barcode` و `allocator skips manually used code`؛ `test_concurrency.py::test_parallel_internal_barcodes_unique` |
-| **INV-CAT-10** | پیشوند الگوی ترازو ∈ {02، 20..29} است. بازه‌ها در ارقام ۳ تا ۱۲ و بی‌هم‌پوشانی‌اند. هر پیشوند یک الگوی فعال دارد. هیچ بارکد ۱۳ رقمی با پیشوند الگوی فعال وجود ندارد (هر دو جهت). وزن واحد جرم و قیمت ارز و واحد مبلغ صریح دارد. تجزیه فقط با رقم کنترل درست انجام می‌شود | CHECKهای `scale_*`؛ ایندکس `scale_pattern_active_prefix`؛ `trg_barcode_guard` و `trg_scale_pattern_guard`؛ `parse_scale_barcode` | `T14 INV-CAT-10 parse weight barcode`، `bad check digit not parsed`، `barcode collides with scale prefix`، `pattern collides with existing barcode`، `prefix outside 02/20-29 (19)`، `prefix 04 (internal RCN space) rejected`، `overlapping ranges`، `second active pattern on prefix`، `price pattern needs explicit amount unit` و `weight unit must be mass` |
+| **INV-CAT-10** | پیشوند الگوی ترازو ∈ {02، 20..29} است. بازه‌ها در ارقام ۳ تا ۱۲ و بی‌هم‌پوشانی‌اند. هر پیشوند یک الگوی فعال دارد. هیچ بارکد ۱۳ رقمی با پیشوند الگوی فعال وجود ندارد (هر دو جهت). وزن واحد جرم و قیمت ارز و واحد مبلغ صریح دارد. تجزیه فقط با رقم کنترل درست انجام می‌شود | CHECKهای `scale_*`؛ ایندکس `scale_pattern_active_prefix`؛ `trg_barcode_guard` و `trg_scale_pattern_guard`؛ `parse_scale_barcode` | `T14 INV-CAT-10 parse weight barcode`، `bad check digit not parsed`، `barcode collides with scale prefix`، `pattern collides with existing barcode`، `prefix outside 02/20-29 (19)`، `prefix 04 (internal RCN space) rejected`، `overlapping ranges`، `second active pattern on prefix`، `price pattern needs explicit amount unit` و `weight unit must be mass`؛ `T20 RV-MD-17 …` (دو نشست، هر دو ترتیب) |
 | **INV-CAT-11** | برای یک (فهرست، کالا، variant یا همه، واحد، `min_qty`) بازه‌های اعتبار هم‌پوشانی ندارند | EXCLUDE `price_list_item_no_overlap` | `T15 INV-CAT-11 overlapping validity`؛ hypothesis `test_set_prices_never_overlaps` |
 | **INV-CAT-12** | دقت مبلغ ردیف قیمت ≤ `price_precision` فهرست است، هم هنگام نوشتن ردیف و هم هنگام کاهش دقت فهرست | `trg_price_list_item_guard`؛ `trg_price_list_guard` | `T15 INV-CAT-12 precision of IRR list`؛ `T15b RV-MD-04 precision lowered below existing entries` |
 | **INV-CAT-13** | ردیف قیمت با `valid_from < امروزِ مستأجر` با هیچ پرچمی تغییر یا حذف نمی‌شود، جز بستن `valid_to ≥ دیروز`. درج پس‌تاریخ ممنوع است، جز با `hk.catalog_allow_backdate` در UoW مهاجرت، و این پرچم فقط درج را باز می‌کند. هویت ردیف ثابت است. ردیف آینده آزاد است ولی به گذشته نمی‌رود. قاعدهٔ فهرستی که تاریخچه دارد منجمد است | `trg_price_list_item_guard`؛ `trg_price_list_guard`؛ سرویس: پرچم فقط با مجوز `catalog.price.backdate` | `T15 INV-CAT-13 …`؛ `T15b RV-MD-11 backdate flag does not …` (سه مورد) و `RV-MD-04 …` |
@@ -1581,6 +1585,7 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | **INV-CAT-22** | گروه ثبت مؤثر SKU = گروه کالا، وگرنه پیش‌فرض نزدیک‌ترین نیای دسته، با پیمایش رو به بالا (بی ساختن درخت). `catalog.posting_attributes` آن را با `attr:item_type` و `attr:item_category` می‌دهد | `category_posting_group`؛ `category_path`؛ `v_sku`؛ تابع | `T18 INV-CAT-22 …`؛ `T22 RV-MD-13 v_sku plan has no recursive tree build`، `posting attributes walk up by key, no category table scan`، `next_item_code walks up by key …` و `category_path root-first` (۳۳۳۰ دسته) |
 | **INV-CAT-23** | `next_item_code` کدی می‌دهد که نه کالا و نه SKU مستأجر دارد، از سری خود دسته، نزدیک‌ترین نیا، یا پیش‌فرض. هر دسته یک سری دارد | تابع با قفل؛ UNIQUE | `T18 INV-CAT-23 default series created on demand`، `own category series`، `nearest ancestor series; skips used item/SKU code`، `own series beats ancestor`، `unknown category` و `second series for one category` |
 | **INV-CAT-24** | کد کالای تأمین‌کننده برای هر تأمین‌کننده یکتاست؛ هر (کالا، variant) حداکثر یک تأمین‌کنندهٔ ترجیحی فعال دارد. تأمین‌کننده و شرکت گارانتی ادغام‌شده پذیرفته نمی‌شوند و مشترک ادغام آن‌ها را به جانشین می‌برد | ایندکس‌های `item_supplier_code` و `item_supplier_one_preferred`؛ `trg_item_supplier_guard`؛ `trg_item_guard`؛ `rewire_merged_party` | `T12b INV-CAT-24 supplier item code unique per supplier`، `INV-PTY-14 item supplier is a merged party` و `warranty provider is a merged party`؛ `T15c RV-MD-09 …`؛ `T23 unique index item_supplier_one_preferred` |
+| **INV-CAT-25** | مبنای آغاز گارانتی کالا یکی از `sale_date` یا `activation` است (پیش‌فرض `sale_date`) و `v_sku` مدت، مبنا و ارائه‌دهندهٔ گارانتی را برای موتور سریال می‌دهد (05:CR-C08) | CHECK `item_warranty_basis_check`؛ `v_sku` | `T18 05:CR-C08 v_sku exposes warranty_basis (default sale_date)` و `unknown warranty basis`؛ `T23` |
 
 ## ۸. سناریوهای مرزی و خطا
 
@@ -1594,12 +1599,12 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | خریدار حقوقی خارجی | `foreign_legal` بدون شناسهٔ ملی. نگاشت `tob` در بخش مالیات است (پرسش باز آن بخش) |
 | شخص هم مشتری، هم تأمین‌کننده، هم کارمند | یک ردیف و سه نقش. یک مقدار بُعد. دریافتنی، پرداختنی و حقوق پرداختنی با حساب‌های معین جدا (قاعدهٔ نگاشت) |
 | شخصی که فقط برای شرکت ۱ تعریف شده و شرکت ۲ می‌خواهد به او بفروشد | `HK_PARTY_ROLE_COMPANY_SCOPE`. کاربر باید `company_id` شخص را NULL کند (گسترش دید) |
-| ویرایش هم‌زمان یک شخص در دو مرورگر | دومی `If-Match` قدیمی دارد → ۴۰۹ `core.concurrency.conflict` |
+| ویرایش هم‌زمان یک شخص در دو مرورگر | دومی `If-Match` قدیمی دارد → `412 core.concurrency.stale`؛ نبود سرآیند → `428 core.concurrency.precondition_required` (R-IDEM، 01:2132) |
 | ادغام A←B و هم‌زمان B←A | قفل به ترتیب `id`. دومی پس از اولی `HK_PARTY_ALREADY_MERGED` می‌گیرد |
 | ادغام وقتی بازنده چک در جریان دارد | چک در treasury به بازنده اشاره می‌ماند (سند قطعی). گزارش‌ها با جانشین تجمیع می‌کنند. subscriber treasury فقط «طرف‌حساب پیگیری» را عوض می‌کند |
 | ادغام وقتی هر دو کد ملی متفاوت دارند | `HK_PARTY_MERGE_IDENTITY_CONFLICT`. کاربر ابتدا دادهٔ غلط را اصلاح می‌کند. ادغام دو شخص واقعاً متفاوت ممکن نیست |
 | شخص اشتباه ادغام شد | ادغام برگشت ندارد. اصلاح: شخص تازه بسازید و اسناد تازه را با او ثبت کنید. اسناد گذشته با سند اصلاحی جابه‌جا می‌شوند (کار حسابدار). برای همین پیش‌نمایش و تأیید اجباری‌اند |
-| حذف شخص دارای فاکتور | FK در sales → `parties.party.in_use`. پیشنهاد: غیرفعال کردن |
+| کنار گذاشتن شخص اشتباه یا دارای فاکتور | شخص حذف فیزیکی ندارد (D-M25، RV-MD-20؛ مسیر DELETE و گرنت آن نیست). `POST /parties/{id}/status` با `inactive` (پنهان از انتخابگر، سند تازه نمی‌پذیرد) یا ادغام در شخص درست |
 | توقیف `credit_control` و دستی هم‌زمان | دو ردیف جدا (source متفاوت). آزاد کردن یکی دیگری را نگه می‌دارد |
 | شبای بانک ادغام‌شده (قوامین، `052`) | معتبر و ذخیره می‌شود. `bank_code='ghavamin'` (غیرفعال، `merged_into_code='sepah'`). UI «اکنون بانک سپه» را نشان می‌دهد |
 | شبای بانک آینده (`062`) پس از لغو مجوز | معتبر است. `status_note` آینده هشدار می‌دهد. treasury پیش از پرداخت هشدار «احتمال بسته بودن حساب» می‌دهد (اطمینان متوسط) |
@@ -1632,12 +1637,23 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 
 ### ۹-۱. سطح پایگاه داده (اجرا شده و سبز)
 
-[`sql/tests/25_masterdata_test.sql`](sql/tests/25_masterdata_test.sql):
-- بخش ۱ با `postgres` اجرا می‌شود و fixture است: دو مستأجر، دو شرکت، شعبه، و استان و شهر آزمایشی.
-- بخش ۲ با `SET ROLE hk_app` اجرا می‌شود و شامل T01 تا T18 است: ادعاهای مثبت و منفی همهٔ ناورداهای DB، موارد deferred با `SET CONSTRAINTS ALL IMMEDIATE`، و جداسازی مستأجر T17.
-- بخش ۳ با `hk_readonly` اجرا می‌شود (T19).
+[`sql/tests/25_masterdata_test.sql`](sql/tests/25_masterdata_test.sql) یک نشست psql است. هر بررسی منفی با **کد `HK_…` یا نام دقیق قید یا ایندکس** خودش سنجیده می‌شود (`md_expect_error`؛ R-QUALITY)، و SQLSTATE خالی فقط برای `42501` (نبود grant) پذیرفته است:
 
-فرمان‌ها در سرآیند فایل است. خروجی موفق `ALL 25_masterdata TESTS PASSED` است. دو حالت اجرا شد: (۱) `00 → 25`، (۲) `00 → 10 → 20 → 25` و سپس FKهای §۱۲. آزمون جهش هم اجرا شد: خراب کردن عمدی `catalog.next_item_code` آزمون را با `TEST FAILED [INV-CAT-23 …]` شکست داد.
+| بخش | نقش | محتوا |
+|---|---|---|
+| ۱ | `postgres` | fixture: دو مستأجر، دو شرکت، شعبه، استان و شهر آزمایشی، توابع کمکی |
+| ۲ | `hk_app` | T01 تا T18: ادعاهای مثبت و منفی همهٔ ناورداهای §۷. زیرآزمون‌های بازبینی: T10b (ادغام: توقیف، گروه مؤثر، repoint، پس‌شرط‌ها، محدودهٔ شرکت، بازاریاب)، T10c (همان نگهبان‌ها با نقش مالک و مسیر درون‌ریزی `replica`)، T12b و T14b (هر تریگر فرزند، ایندکس یکتای جزئی و قید نام‌دار)، T13b (حذف و انقضای کالای قفل‌شده)، T15b (قاعدهٔ منجمد فهرست، پرچم پس‌تاریخ، گرد کردن تبدیل واحد)، T15c (ارجاع‌های catalog پس از ادغام و `rewire_merged_party`)، T16b (BOM گذشته)، و T17 جداسازی مستأجر. موارد deferred با `SET CONSTRAINTS ALL IMMEDIATE` درون زیرتراکنش |
+| ۳ | `hk_readonly` | T19 |
+| ۴ | دو نشست dblink با `hk_app` | T20 همروندی واقعی: درج فرزند هم‌زمان با ادغام (RV-MD-05)، نقش شرکت هم‌زمان با تنگ کردن محدوده در هر دو ترتیب (RV-MD-14)، بارکد و الگوی ترازوی هم‌زمان در هر دو ترتیب (RV-MD-17). نشست دوم باید منتظر بماند و پس از commit اولی رد شود. در نبود افزونهٔ contrib `dblink` با NOTICE «SKIP» |
+| ۵ | `postgres` و `hk_app` | T21 (فقط وقتی 10 اعمال شده): رجیستری صدور هر ۳۹ جدول و `core.security_lint()` تهی، مجوزها، محافظ فیلد، قالب‌های نقش، تنظیم، مشترک رویداد، فیلد سفارشی (`HK_CF_UNKNOWN_FIELD`) و ۱۴ FK کنشگر و پیوست (`fk_party__created_by`، `fk_party_merge__merged_by`، `fk_item_image__attachment`) |
+| ۶ | `hk_app` | T22 مقیاس: ۲۰ هزار شخص هم‌نام‌گونه و ۳۳۳۰ دسته. معیار قطعی: شمار seq scan تراکنش روی `party`، `party_contact` و `item_category` صفر است و طرح `v_sku` پیمایش بازگشتی ندارد (زمان فقط گزارش می‌شود؛ معیار زمانی در bench شبانه) |
+| ۷ | `postgres` با `session_replication_role=replica` | T23: **هر** قید CHECK دو اسکیما روی یک ردیف موجود با مقدار ناقض و نام دقیق خودش (شمارش = همهٔ CHECKهای کاتالوگ؛ مسیر درون‌ریزی تریگر و FK ندارد)، و ایندکس‌های یکتای جزئی‌ای که مسیر `hk_app` جدا نمی‌آزماید |
+
+خروجی موفق `ALL 25_masterdata TESTS PASSED` است. زنجیره‌های اجراشده: `00 → 25` (T21 با NOTICE «SKIP»)، `00 → 10 → 25`، و هارنس کامل `PREFIX=fx_masterdata docs/design/sql/run_all.sh` (پایگاه یکپارچه، ترتیب دوم و اعمال دوباره).
+
+**آزمون جهش (R-QUALITY، RV-MD-07):** روی پایگاه الگوی `00 → 10 → 25`، برای هر جهش یک کپی ساخته و کل آزمون اجرا شد: حذف هر تریگر غیر `trg_touch` (و غیر تریگرهای core)، هر ایندکس یکتای جزئی و هر قید CHECK و EXCLUDE دو اسکیما؛ بازگرداندن هر تابع اصلاح‌شده در این بازبینی به نسخهٔ پیش از اصلاح (`party_guard`، `child_party_guard`، `party_role_guard`، `merge_parties`، `role_settings`، `posting_attributes` هر دو ماژول، `find_duplicate_candidates`، `item_guard` و رویدادهای تریگرش، `barcode_guard`، `scale_pattern_guard`، `price_list_guard`، `price_list_item_guard`، نگهبان‌های انتساب و تأمین‌کننده، `bom_guard`، `resolve_price`، `next_item_code` و `v_sku`)؛ بی‌اثر کردن `scale_prefix_lock`، `party_merge_consistent`، `rewire_merged_party`، `category_posting_group` و `price_list_family_has_history`؛ حذف ثبت‌های core (رجیستری صدور، مجوز، محافظ فیلد، قالب نقش، تنظیم، مشترک، تریگر فیلد سفارشی)، بازگرداندن DELETE شخص، و حذف FKهای کنشگر و پیوست. نتیجه: **۳۳۹ از ۳۳۹ جهش کشته شد** (۴۱ حذف تریگر، ۱۸ حذف ایندکس یکتای جزئی، ۲۴۳ حذف قید CHECK یا EXCLUDE و ۳۷ جهش تابع، ثبت و FK) و هیچ بازمانده‌ای نماند. ۳۳۴ جهش با برچسب `TEST FAILED [...]` یک بررسی مشخص کشته شدند و ۵ بازگردانی تابع (نسخه‌های پیش از اصلاح `party_guard`، `merge_parties`، `child_party_guard` و دو نگهبان catalog) پیش از رسیدن به assert با خطای fixture شکستند. سه جهش تکمیلی پس از افزودن `warranty_basis` و آزمون ترتیب وارون ترازو (حذف `item_warranty_basis_check`، بی‌اثر کردن `scale_prefix_lock`، و `barcode_guard` بی‌قفل) هم کشته شدند. ادعای پیشین «جهش اجرا شد» (فقط یک جهش) با این اجرای کامل جایگزین شد (RV-MD-07). اسکریپت جهش در CI (job شبانهٔ `sql-mutation`، ۰۱ §CI) همین فهرست را از کاتالوگ پایگاه داده می‌سازد، پس هر قید یا تریگر تازه خودکار در آن است.
+
+**نتیجهٔ هارنس پس از این بازبینی** (`PREFIX=fx_masterdata`): زنجیرهٔ مستقل این بخش و آزمونش، و گام `25_masterdata` در همهٔ زنجیره‌ها، پایگاه یکپارچه، ترتیب دوم و اعمال دوباره سبزند. `core.security_lint()` روی هر سه پایگاه یکپارچه تهی است (RV-IT-01 بسته شد) و 99 هر ۱۴ FK این بخش را «هم‌ارز» شناخت. این آزمون روی پایگاه یکپارچهٔ دارای 99 هم سبز است. سه شکست باقی‌مانده مال بخش‌های دیگرند: `commerce:test` (fixture پس‌تاریخ BOM؛ CR-14)، `assistant:test` (بررسی `T20 security_lint source` که با نسخهٔ پیش از اصلاح این فایل هم شکست می‌خورد)، و ۱۷ بررسی `99_integration_test` که هیچ‌کدام `parties` یا `catalog` نیست.
 
 در CI همین فایل با `pytest tests/db/test_sql_suites.py::test_masterdata_sql_suite` روی PostgreSQL 18 واقعی اجرا می‌شود.
 
@@ -1679,7 +1695,7 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | `tests/integration/masterdata/test_import.py` | `test_reimport_is_update` (همان فایل دو بار ⇒ صفر insert)، `test_link_by_national_id`، `test_holoo_flags_to_roles`، `test_bad_item_code_gets_series_code_and_legacy`، `test_amount_unit_required` |
 | `tests/integration/catalog/test_packs.py` | `test_apply_twice_noop`، `test_user_edit_not_overwritten`، `test_code_conflict_reported` |
 | `tests/integration/catalog/test_pos_snapshot.py` | `test_delta_since_token`، `test_barcode_tombstone`، `test_identity_hidden_without_permission` |
-| `tests/db/masterdata/test_concurrency.py` | `test_if_match_conflict_409`، `test_mark_used_vs_base_uom_change` (دو اتصال؛ یکی باید شکست بخورد)، `test_parallel_internal_barcodes_unique` و `test_parallel_code_allocation_unique` |
+| `tests/db/masterdata/test_concurrency.py` | `test_if_match_stale_412`، `test_mark_used_vs_base_uom_change` (دو اتصال؛ یکی باید شکست بخورد)، `test_parallel_internal_barcodes_unique` و `test_parallel_code_allocation_unique` |
 | `tests/security/test_rls_coverage.py` و `test_fk_lint.py` (مشترک بخش ۰۱) | همهٔ جدول‌های `parties` و `catalog` در فهرست |
 
 ### ۹-۵. E2E (Playwright، RTL فارسی) و vitest
@@ -1725,7 +1741,7 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | بارکد چندتایی، داخلی RCN-13 «04»، چاپ برچسب | ● | | |
 | الگوی ترازو (وزن، قیمت، تعداد) و PLU | ● | | |
 | بررسی رقم کنترل داخلی قیمت یا وزن در بارکد ترازو (`value_check_position`) | | ● | |
-| پرچم‌های سریال، بچ، انقضا و گارانتی | ● | | |
+| پرچم‌های سریال، بچ، انقضا و گارانتی (مدت، ارائه‌دهنده، آغاز از فروش یا فعال‌سازی) | ● | | |
 | `sstid` و کد واحد مؤدیان، طبقهٔ مالیاتی | ● | | |
 | همگام‌سازی snapshot `ref.sstid` از پنل مالک | ● | | |
 | تصویر کالا، کد تأمین‌کننده، کد قدیمی | ● | | |
@@ -1748,21 +1764,23 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | جهت | ماژول | چه چیزی |
 |---|---|---|
 | این بخش ← | `kernel` | `UnitOfWork`، `OutboxWriter`، `AuditWriter`، `validators.iran`، `text` (fa-norm)، `money` (`AmountIn` و تبدیل واحد)، جلالی |
-| این بخش ← | `core` | مجوز و `field_guard`، `core.attachment` (تصویر)، فیلد سفارشی، تنظیمات (`parties.duplicate.threshold`)، `approval_policy` (ادغام)، snapshot حق‌ها (Q-H)، اعلان (صف تکراری) |
+| این بخش ← | `core` | پیش‌نیاز فایل SQL (R-ORDER). ثبت در بخش ۱۲ فایل: رجیستری صدور (R-EXPORT)، مجوز، `field_guard` و قالب نقش، تنظیم `parties.duplicate.threshold`، مشترک رویداد `catalog.party_merge`، فیلد سفارشی (`attach_custom_fields`)، و FK کنشگرها به `core.tenant_membership` و تصویر به `core.attachment`. در زمان اجرا: `approval_policy` (ادغام)، `EntitlementGate` (Q-H)، اعلان (صف تکراری) |
 | این بخش ← | `ref` | تقسیمات، بانک، واحد مؤدیان و snapshot `sstid`. در این فایل تعریف شده‌اند (CR-02) |
-| این بخش ← | `rules` | manifest امضاشدهٔ بستهٔ صنفی؛ کاتالوگ کدهای طبقهٔ مالیاتی (CR-08) |
+| این بخش ← | `rules` | manifest امضاشدهٔ بستهٔ صنفی و `pack_artifact.content_sha256` (05:CR-C10)؛ کاتالوگ سراسری `rules.tax_category` (CR-08؛ سه FK در `99_cross_fk.sql`) |
 | این بخش ← | `integrations` | v2: `BankInquiry` (شبا و کارت) از راه سرویس‌دهندهٔ داخلی. parties در L2 مستقیم integrations (L1) را صدا می‌زند و این هم‌جهت DAG است |
 | catalog ← parties | | CR-01 |
 | ← این بخش | ledger | `v_party_ledger_identity`، `posting_attributes` (هر دو ماژول)، رویدادهای `party.created`، `renamed` و `merged` |
 | ← این بخش | inventory | `item_variant`، `item_uom`، `convert_qty`، `bom_for`، `mark_used` و پرچم‌های ردیابی |
-| ← این بخش | sales، purchase و pos | `require_usable`، `require_sellable`، `lookup_code`، `resolve_price`، `applicable_lists`، `credit_settings`، `hold_state`، `posting_attributes` و `pos_snapshot` |
+| ← این بخش | sales، purchase و pos | `require_usable`، `require_sellable`، `lookup_code`، `resolve_price` (قیمت واحد بی‌گرد برای واحد تبدیل‌شده؛ RV-MD-22)، `applicable_lists`، `credit_settings`، `hold_state`، `posting_attributes` (کلیدهای `attr:`) و `pos_snapshot`؛ تریگر `child_party_guard` روی جدول‌های تغییرپذیرشان (CR-06) |
 | ← این بخش | tax | `moadian_profile`، `tax_profile`، `record_taxpayer_inquiry` و رویداد `identity_changed` |
 | ← این بخش | treasury | `primary_bank_account`، `party_bank_account` (FK از treasury) و رویداد `bank_account.changed` |
 | ← این بخش | payroll | `parties.party` (FK از `payroll.employee`) و فیلدهای هویتی لیست بیمه |
-| ← این بخش | migration | `MasterdataImportService` و `validate` |
+| ← این بخش | migration | `MasterdataImportService` (`job_id`، `deactivate_if_unused`؛ 08:CR-MG09) و `validate`؛ پرچم `hk.catalog_allow_backdate` فقط برای درج تاریخچهٔ قیمت و فعال‌سازی BOM پس‌تاریخ |
 | ← این بخش | reports | ویوهای `v_party_canonical`، `v_sku` و `v_category_effective` |
 
 ### ۱۱-۲. اثر پاسخ‌های صاحب محصول (Q-x)
+
+همهٔ پرسش‌های Q-A تا Q-H پاسخ گرفته‌اند ([`docs/00-decisions.md`](../00-decisions.md)، جدول دوم) و هیچ‌کدام در این بخش «باز» نیست. Q-H (مبنای قیمت‌گذاری) عمداً قابل تنظیم می‌ماند و این بخش به هیچ مبنای مشخصی وابسته نیست.
 
 | پرسش | پاسخ | اثر بر این بخش | اگر پاسخ عوض شود |
 |---|---|---|---|
@@ -1773,7 +1791,7 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | **Q-E** شبکهٔ نمایندگی | مدل داده v1، پرتال v1.1 | نمایندهٔ فروش پلتفرم در صفحهٔ کنترل است، نه شخص مستأجر. بازاریاب خود مستأجر نقش `sales_agent` است و به هم ربطی ندارند | — |
 | **Q-F** دستیار | در محصول، اختیاری، فقط پیشنهاد | §۵-۱۰: فقط query و validate. هیچ مجوز نوشتنی برای دستیار نیست | اگر دستیار خاموش باشد، هیچ اثری ندارد |
 | **Q-G** و **Q-G2** نرم‌افزار مبدأ و نمونهٔ واقعی | هلو، سپیدار، حسابفا و اکسل در v1؛ نمونهٔ واقعی با رضایت کتبی | `MasterdataImportService` و جدول‌های کد قدیمی با `source_scope`. نگاشت پرچم‌های هلو به نقش‌ها. **نمونه‌های واقعی** (پس از ناشناس‌سازی) بردارهای `iran_id_normalize_v1.json` و fixtureهای `test_import.py` را می‌سازند: کد ملی بی‌صفر، ی و ک عربی و کد گروه صفردار | — |
-| **Q-H** مبنای قیمت‌گذاری | قابل تنظیم در پنل مالک | قابلیت‌های قابل‌فروش جدا به‌صورت پرچم حق در snapshot core بررسی می‌شوند: `catalog.variants`، `catalog.scale_barcode`، `catalog.bom`، `catalog.price_lists.multi` و `parties.bank_inquiry`. سقف‌های شمارشی (`max_items` و `max_parties`) را سرویس هنگام ساخت بررسی می‌کند (`core.entitlements.limit`) و خطای `core.entitlement.exceeded` (۴۰۲) می‌دهد. هیچ قیدی در پایگاه داده نیست | هر طرح قیمت فقط داده است |
+| **Q-H** مبنای قیمت‌گذاری | **قابل تنظیم می‌ماند** (تصمیم نهایی نیست؛ پنل مالک) | قابلیت‌های قابل‌فروش جدا کلید حق استفاده (`feature_key`) در `core.tenant_entitlement` هستند: `catalog.variants`، `catalog.scale_barcode`، `catalog.bom`، `catalog.price_lists.multi` و `parties.bank_inquiry`. سرویس با `EntitlementGate.require(feature_key, quantity_after)` بررسی می‌کند و خطا `402 core.entitlement.limit_reached` است. اگر طرحی سقف شمارشی بر شمار اشخاص یا کالاها بگذارد، همین مسیر با `quantity_after` آن را می‌سنجد. سقف سخت پایگاه داده‌ای core فقط شمارش‌های خودش (عضو، شرکت، شعبه، دستگاه) را دارد و این بخش تریگر سقف ندارد | هر مبنای قیمت تازه فقط یک `feature_key` و شمارش است؛ طرح‌واره تغییر نمی‌کند |
 
 ### ۱۱-۳. تصمیم‌های باز فنی (بیرون از Q-x)
 
@@ -1783,79 +1801,82 @@ parties و catalog هیچ import یا وابستگی به ماژول دستیا�
 | `tob` برای `foreign_legal` | نگاشتی در این بخش نیست | tax |
 | آستانهٔ تکراری | ۹۲ (تنظیم مستأجر، ۸۰ تا ۱۰۰) | پس از آزمون روی دادهٔ واقعی Q-G2 بازبینی شود |
 | فهرست کامل واحدهای RC_UMGS (۱۰۲) و تقسیمات کشوری | بستهٔ مرجع نسخه‌دار. منبع رسمی و نسخهٔ آن باید پیش از عرضه وارد شود | platform و rules |
+| حذف shim `core.fa_*` (CR-03) | shim فقط در نبود 10 ساخته می‌شود و T02 هم‌خوانی‌اش را با بردارهای هسته می‌سنجد. با تغییر زنجیرهٔ مستقل هارنس به `00 → 10 → 25` حذف می‌شود | یکپارچه‌ساز (هارنس) و این بخش |
+| پرسش‌های باز صاحب محصول در [`change-requests.md`](change-requests.md) (ویندوز عامل مهاجرت، بستهٔ قواعد on-prem، شرکت تمرینی، تسعیر ارز، سقف پیامک) | هیچ‌کدام بر parties و catalog اثر ندارد | صاحب محصول |
 
 ## ۱۲. کلیدهای خارجی بین‌ماژولی
 
-این دستورها را یکپارچه‌ساز در `99_cross_fk.sql` می‌گذارد. همه روی زنجیرهٔ `00 → 10 → 20 → 25` اجرا شدند و سپس آزمون `25_masterdata_test.sql` روی همان پایگاه سبز ماند. همهٔ FKها هم‌جهت DAG هستند: `parties` و `catalog` (L2) → `core` (L0).
+**FKهای این بخش به core در خود `25_masterdata.sql` (بخش ۱۲ فایل) ساخته می‌شوند** (R-ORDER: «FKهای ۰۳ و ۰۴ به core به فایل خودشان برود»؛ R-ACTOR). بلوک با `to_regclass` محافظت شده است: روی زنجیرهٔ `00 → 25` (بی core) کاری نمی‌کند، و FK هم‌ارز (همان ستون‌ها به همان جدول، با هر نامی) را دوباره نمی‌سازد؛ پس اعمال دوباره و ترتیب دوم هارنس بی‌خطرند. `99_cross_fk.sql` همین قیدها را «هم‌ارز» می‌شناسد و تکرار نمی‌کند. آزمون `T21` شمار ۱۴ قید و ردِ کنشگرِ غیرعضو و پیوست ناموجود را با نام دقیق قید می‌سنجد. همهٔ FKها هم‌جهت DAG هستند: `parties` و `catalog` (L2) → `core` (L0).
 
 ```sql
--- 25_masterdata → core (10_core.sql): بازیگر هر عمل = عضو مستأجر. عمل سیستمی (job، مهاجرت بدون کاربر) ← NULL.
-ALTER TABLE parties.party ADD CONSTRAINT fk_party__created_by
-  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE parties.party ADD CONSTRAINT fk_party__national_id_override_by
-  FOREIGN KEY (tenant_id, national_id_override_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE parties.party_hold ADD CONSTRAINT fk_party_hold__placed_by
-  FOREIGN KEY (tenant_id, placed_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE parties.party_hold ADD CONSTRAINT fk_party_hold__released_by
-  FOREIGN KEY (tenant_id, released_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE parties.party_merge ADD CONSTRAINT fk_party_merge__merged_by
-  FOREIGN KEY (tenant_id, merged_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE parties.duplicate_dismissal ADD CONSTRAINT fk_duplicate_dismissal__dismissed_by
-  FOREIGN KEY (tenant_id, dismissed_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE parties.party_taxpayer_inquiry ADD CONSTRAINT fk_party_taxpayer_inquiry__inquired_by
-  FOREIGN KEY (tenant_id, inquired_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE catalog.item ADD CONSTRAINT fk_item__created_by
-  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE catalog.barcode ADD CONSTRAINT fk_barcode__created_by
-  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE catalog.price_list ADD CONSTRAINT fk_price_list__created_by
-  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE catalog.price_list_item ADD CONSTRAINT fk_price_list_item__created_by
-  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE catalog.bom ADD CONSTRAINT fk_bom__created_by
-  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-ALTER TABLE catalog.bom ADD CONSTRAINT fk_bom__activated_by
-  FOREIGN KEY (tenant_id, activated_by) REFERENCES core.tenant_membership (tenant_id, user_id);
-
--- 25_masterdata → core: فایل تصویر کالا (core.attachment)
-ALTER TABLE catalog.item_image ADD CONSTRAINT fk_item_image__attachment
-  FOREIGN KEY (tenant_id, attachment_id) REFERENCES core.attachment (tenant_id, id);
-
--- ثبت موجودیت‌های دارای فیلد سفارشی در رجیستری سراسری core (داده، نه FK؛ ستون json = custom)
-INSERT INTO core.custom_field_entity (entity_type, module, table_name, json_column, max_fields, description_key) VALUES
-  ('parties.party', 'parties', 'parties.party', 'custom', 50, 'custom_field.entity.parties.party'),
-  ('catalog.item',  'catalog', 'catalog.item',  'custom', 50, 'custom_field.entity.catalog.item')
-ON CONFLICT (entity_type) DO NOTHING;
+-- 25_masterdata.sql §۱۲ (معادل؛ هر سطر: ALTER TABLE <src> ADD CONSTRAINT <fk> FOREIGN KEY (tenant_id, <col>) REFERENCES <dst> (tenant_id, <refcol>))
+-- کنشگر = عضو مستأجر؛ کنشگر سیستمی (job، مهاجرت بی کاربر) ← NULL و نوعش در core.audit_log.actor_kind
+fk_party__created_by                    parties.party (created_by)                  → core.tenant_membership (user_id)
+fk_party__national_id_override_by       parties.party (national_id_override_by)     → core.tenant_membership (user_id)
+fk_party_hold__placed_by                parties.party_hold (placed_by)              → core.tenant_membership (user_id)
+fk_party_hold__released_by              parties.party_hold (released_by)            → core.tenant_membership (user_id)
+fk_party_merge__merged_by               parties.party_merge (merged_by)             → core.tenant_membership (user_id)
+fk_duplicate_dismissal__dismissed_by    parties.duplicate_dismissal (dismissed_by)  → core.tenant_membership (user_id)
+fk_party_taxpayer_inquiry__inquired_by  parties.party_taxpayer_inquiry (inquired_by) → core.tenant_membership (user_id)
+fk_item__created_by                     catalog.item (created_by)                   → core.tenant_membership (user_id)
+fk_barcode__created_by                  catalog.barcode (created_by)                → core.tenant_membership (user_id)
+fk_price_list__created_by               catalog.price_list (created_by)             → core.tenant_membership (user_id)
+fk_price_list_item__created_by          catalog.price_list_item (created_by)        → core.tenant_membership (user_id)
+fk_bom__created_by                      catalog.bom (created_by)                    → core.tenant_membership (user_id)
+fk_bom__activated_by                    catalog.bom (activated_by)                  → core.tenant_membership (user_id)
+fk_item_image__attachment               catalog.item_image (attachment_id)          → core.attachment (id)
 ```
 
+**ثبت فیلد سفارشی** (`core.custom_field_entity` برای `parties.party` و `catalog.item` و `core.attach_custom_fields` روی ستون `custom`) هم در بخش ۱۲ همین فایل است (RV-IT-CUSTOM)؛ کلید تعریف‌نشده `HK_CF_UNKNOWN_FIELD` می‌گیرد (`T21`). دستورهای هم‌ارز بند ۶ فایل 99 idempotent‌اند و دیگر کاری نمی‌کنند.
+
+**در `99_cross_fk.sql` (انجام‌شده؛ CR-08):** `rules` در ترتیب فایل‌ها پس از 25 می‌آید، پس FK به کاتالوگ سراسری طبقهٔ مالیاتی آن‌جاست:
+- `fk_item__rules_tax_category`: `catalog.item (tax_category_code) → rules.tax_category (code)`
+- `fk_item__rules_tax_category_other`: `catalog.item (other_tax_category_code) → rules.tax_category (code)`
+- `fk_item_category__rules_tax_category`: `catalog.item_category (default_tax_category_code) → rules.tax_category (code)`
+
 ارجاع‌هایی که عمداً FK **ندارند**:
-- `party_legacy_code.migration_run_id` و `item_legacy_code.migration_run_id` → `migration.*`: migration در L7 بالادست است و FK خلاف DAG می‌شد. ارجاع نرم است و job شبانهٔ migration آن را تطبیق می‌دهد.
-- `item.tax_category_code`، `other_tax_category_code` و `item_category.default_tax_category_code` → کاتالوگ طبقه‌های rules. تا وقتی بخش rules جدول سراسری منتشر کند (CR-08)، سرویس آن را با `RulesQuery.classification_exists('tax_category', code, on)` اعتبارسنجی می‌کند. پیشنهاد پس از انتشار:
-  ```sql
-  -- (پیشنهادی؛ منوط به rules.tax_category (code text PRIMARY KEY, ...) سراسری در بخش rules)
-  -- ALTER TABLE catalog.item ADD CONSTRAINT fk_item__tax_category
-  --   FOREIGN KEY (tax_category_code) REFERENCES rules.tax_category (code);
-  ```
+- `party_legacy_code.migration_job_id` و `item_legacy_code.migration_job_id` → `migration.job` (نام پیشین `migration_run_id`؛ 08:CR-MG09؛ فایل SQL تغییر نام را idempotent انجام می‌دهد): migration در L7 بالادست است و FK خلاف DAG می‌شد. ارجاع نرم است و job شبانهٔ migration آن را تطبیق می‌دهد.
 - `item.sstid` و `item_variant.sstid` → `ref.sstid`: عمداً FK ندارند (D-M13).
 
 FKهایی که **بخش‌های دیگر** به این بخش می‌زنند، و این بخش آن‌ها را قرارداد پایدار می‌داند. ستون‌ها و جدول‌های هدف بدون نسخهٔ تازهٔ قرارداد تغییر نمی‌کنند:
-- `ledger.dimension_value (tenant_id, party_id) → parties.party (tenant_id, id)` (بخش ۰۳ §۱۲)
+- `ledger.dimension_value (tenant_id, party_id) → parties.party (tenant_id, id)` (بخش ۰۳ §۱۲؛ در 99). شخص حذف فیزیکی ندارد (D-M25)، پس این FK هرگز حذف شخص را «در حال استفاده» رد نمی‌کند.
 - `* (tenant_id, party_id) → parties.party (tenant_id, id)`، `* (tenant_id, item_id, variant_id) → catalog.item_variant (tenant_id, item_id, id)`، `* (tenant_id, item_id, uom_id) → catalog.item_uom (tenant_id, item_id, uom_id)`، `* (tenant_id, bank_account_id) → parties.party_bank_account (tenant_id, id)` و `* (tenant_id, bom_id) → catalog.bom (tenant_id, id)`
 - همراه این FKها، تریگر `parties.child_party_guard('<column>')` روی جدول‌های **تغییرپذیر** آن ماژول (CR-06)
 
 ## ۱۳. تعارض‌ها و درخواست تغییر
 
-| کد | موضوع | وضعیت فعلی | درخواست |
+| کد | موضوع | وضعیت فعلی | درخواست | تصمیم یکپارچه‌سازی ([`change-requests.md`](change-requests.md)) |
+|---|---|---|---|---|
+| **CR-01** | جهت DAG بین parties و catalog | بخش ۰۱ §۵-۱ `catalog` را فقط وابسته به `core`، `ref` و `rules` می‌داند و parties و catalog را خواهر مستقل L2 می‌گیرد. catalog سه ارجاع ذاتی به شخص دارد: تأمین‌کنندهٔ کالا، شرکت گارانتی و انتساب فهرست قیمت به شخص یا گروه (D-M24) | `catalog.depends_on += {"parties"}`. در import-linter، `parties` پایین‌تر از `catalog` در L2 (یا L2a و L2b). یال `catalog --> parties` در نمودار ۵-۲. parties هیچ ارجاعی به catalog ندارد، پس چرخه پیش نمی‌آید | **پذیرفته** (در `core.module_registry()` پایه اعمال شد و lint DAG آن را می‌پذیرد). باز در ۰۱: جدول §۵-۱، نمودار ۵-۲ و import-linter |
+| **CR-02** | مالکیت فایل دادهٔ مرجع | جدول‌های `ref.country`، `province`، `city`، `bank`، `bank_sheba_code`، `bank_card_bin`، `moadian_unit` و `sstid`، و توابع `ref.is_valid_*` در `25_masterdata.sql` هستند، چون ماژول `ref` (L0) فایل SQL و بخش طراحی ندارد | یا فایل `05_ref.sql` (مالک: ماژول ref) ساخته و این تعریف‌ها عیناً به آن منتقل شود، یا مالکیت آن‌ها رسماً با این بخش بماند. در هر دو حالت هیچ بخش دیگری آن‌ها را دوباره تعریف نکند. همهٔ تعریف‌ها `IF NOT EXISTS` و `CREATE OR REPLACE` هستند، پس انتقال بی‌خطر است | **پذیرفته: مالکیت رسمی با این بخش** (R-REF)؛ یک‌جاسازی در فایل جدا به تعویق. انجام‌شده |
+| **CR-03** | shim نرمال‌سازی | هارنس هنوز زنجیرهٔ مستقل این بخش را `00 → 25` اجرا می‌کند، ولی ستون‌های نرمال به `core.fa_*` از `10_core.sql` نیاز دارند. پس فایل اگر توابع نبودند، همان متن fa-norm-v1 را می‌سازد (shim محافظت‌شده با `to_regprocedure`). T02 هم‌خوانی را با بردارهای هسته اثبات می‌کند | پیش‌نیازهای اعتبارسنجی بخش‌های مرحلهٔ ۲ و این بخش `00 → 10` باشد. سپس shim حذف شود تا متن نرمال‌سازی فقط یک مالک داشته باشد. تا آن زمان، هر تغییر fa-norm (نسخهٔ v2) باید هر دو جا را به‌روز کند. آزمون T02 واگرایی را می‌گیرد | **پذیرفته** (R-ORDER). این طرف: 10 پیش‌نیاز رسمی، ثبت‌ها و FKهای core در فایل. باز: هارنس زنجیرهٔ مستقل را به `00 → 10 → 25` عوض کند؛ سپس shim حذف می‌شود |
+| **CR-04** | ساخت تنبل مقدار بُعد | بخش ۰۳ ساخت مقدار بُعد شخص را به subscriber رویداد `parties.party.created` سپرده است. تحویل outbox ناهمگام است، پس فاکتورِ ثانیه‌ای پس از ساخت مشتری ممکن است مقدار بُعد پیدا نکند | در `ledger.post` گام ۴b: اگر `DimensionRef(type, entity_id)` مقدار ندارد و `type.owner_module` یک «منبع تفصیلی» ثبت‌شده است، `ensure_value` را با `PartyQuery.ledger_identity` (ledger مجاز است parties را بخواند) **در همان تراکنش** صدا بزند. subscriber هم می‌ماند، و چون `ensure_value` idempotent است هم‌روندی هر دو مسیر بی‌خطر است | **پذیرفته**؛ اجرا با ۰۳ (`ensure_value` تنبل در همان تراکنش `post`). باز |
+| **CR-05** | نوع بُعد `employee` در برابر `party` | کاتالوگ ابعاد بخش ۰۳ نوع `employee` (مالک payroll، جایگاه ۱) را جدا از `party` (جایگاه ۱) دارد. کارمندی که مشتری هم هست دو «کارت» می‌گیرد و سطر سند نمی‌تواند هر دو را داشته باشد | payroll برای مانده‌های شخصی کارمند (حقوق پرداختنی، مساعده، وام) از بُعد `party` استفاده کند، چون کارمند شخصی با نقش `employee` است. نوع `employee` فقط اگر payroll تفکیک بیشتری (مثلاً قرارداد کار) بخواهد و در جایگاهی جز ۱ بماند. تصمیم نهایی با بخش payroll است | **پذیرفته**؛ اجرا با ۰۳ و ۰۷ (`employee` هنوز در `dimension_type_catalog`). باز |
+| **CR-06** | محافظ «شخص ادغام‌شده» در ماژول‌های دیگر | فقط parties و catalog تریگر دارند | هر ماژول با ستون شخص در جدول تغییرپذیر (پیش‌نویس‌ها، سفارش، چک در جریان، صف POS) `CREATE TRIGGER … EXECUTE FUNCTION parties.child_party_guard('<col>')` بگذارد، در `jobs.py` مشترک `parties.party.merged` شود (§۵-۶-۳) و در سرویس‌های نوشتنی `PartyQuery.require_usable` را صدا بزند | **پذیرفته**؛ ۰۶ و ۰۷ تریگر گذاشته‌اند. باز در ۰۵ (RV-IT-04: پیش‌نویس فاکتور برای شخص ادغام‌شده) |
+| **CR-07** | ترتیب فایل‌های SQL | بخش ۰۳ (C-L07) پیشنهاد داده parties پیش از ledger اجرا شود تا FK `ledger.dimension_value → parties.party` مستقیم بیاید | موافق. این فایل فقط به `00` (و در عمل `10`) وابسته است. نام‌گذاری مجدد به `15_masterdata.sql` (پیش از `20_ledger.sql`) بی‌خطر است. آزمون این بخش روی ترتیب `00 → 10 → 25 → 20` هم معتبر می‌ماند، چون به ledger ارجاعی ندارد | **به تعویق** (R-ORDER: تغییر نام وسط بازبینی همهٔ زنجیره‌ها را جابه‌جا می‌کند). این فایل به ledger ارجاع ندارد و ترتیب دوم هارنس (`00,10,25,20,…`) سبز است |
+| **CR-08** | کاتالوگ طبقهٔ مالیاتی | `tax_category_code` کد آزاد با الگوی `^[a-z][a-z0-9_.]{1,63}$` است و FK ندارد | بخش rules یا tax جدول سراسری نسخه‌دار `rules.tax_category(code, title_fa, kind, valid_from, valid_to, source, confidence)` منتشر کند. سپس FK پیشنهادی §۱۲ افزوده شود. نرخ‌ها در پارامترهای تاریخ‌دار همان بخش می‌مانند | **پذیرفته و انجام‌شده**: ۰۷ `rules.tax_category` را ساخت (CR-CMP-13) و سه FK در 99 است (§۱۲) |
+| **CR-09** | بررسی encoding پایگاه داده | `00_foundation.sql` UTF8 بودن پایگاه را بررسی نمی‌کند. این فایل یک بلوک `DO` نگهبان دارد (`HK_ENCODING`)، چون CHECKهای نرمال‌سازی با encoding دیگر معنا ندارند | بررسی به `00_foundation.sql` منتقل شود. ساخت پایگاه در استقرار با `ENCODING 'UTF8' TEMPLATE template0` و collation ثابت مستند شود (آزمون‌ها `C.UTF-8` استفاده می‌کنند) | **پذیرفته و انجام‌شده** (R-DB): `00_foundation.sql` `HK_ENCODING` را assert می‌کند؛ تکرار نگهبان در این فایل بی‌خطر است |
+| **CR-10** | GUCهای تراکنشی | این بخش اکنون فقط یک GUC محلی تراکنش دارد: `hk.catalog_allow_backdate` (فقط UoW مهاجرت با مجوز `catalog.price.backdate`؛ فقط درج تاریخچهٔ قیمت و فعال‌سازی BOM پس‌تاریخ، هرگز ویرایش یا حذف). `hk.parties_merge` با پس‌شرط‌های ساختاری ادغام (RV-MD-11) حذف شد. `set_config(…, true)` با PgBouncer در حالت transaction سازگار است | core فهرست رسمی GUCهای `app.*` و `hk.*` را نگه دارد. `UnitOfWork` تنظیم `hk.*` را از کد غیرمجاز رد کند (فقط سرویس‌های ثبت‌شده) و lint آن را بررسی کند | **پذیرفته** (R-GUC؛ مالک رجیستری ۰۲). پس از RV-MD-11 این بخش فقط `hk.catalog_allow_backdate` دارد و `hk.parties_merge` حذف شد (درخواست به ۰۲ و یکپارچه‌ساز برای حذفش از رجیستری). باز (UoW) |
+| **CR-11** | نقش‌های پایگاه داده | به‌روزرسانی `ref` (بانک، snapshot شناسهٔ کالا، تقسیمات) با `hk_migrator` فرض شده است که هنوز در foundation نیست | همان C-02 و C-05 بخش ۰۱. این بخش تغییر دیگری نمی‌خواهد | **پذیرفته و انجام‌شده** (R-ROLE: `hk_migrator` در پایه) |
+| **C-01** (توضیح، نه درخواست) | شماره‌گذاری کد شخص و کالا | قرارداد «شماره‌گذاری پیوسته با شمارندهٔ قفل‌دار» برای اسناد است. کد شخص و کالا دادهٔ پایه است و این بخش سری خودش را دارد (D-M09). آن سری سطح مستأجر و غیرپیوسته است و کد دستی را می‌پذیرد | قرارداد مشترک بی‌تغییر می‌ماند. اگر core بعداً سری سطح مستأجر اضافه کند، `code_series` به آن مهاجرت می‌کند | **پذیرفته**؛ انجام‌شده |
+
+**درخواست‌های بخش‌های دیگر از این بخش** (جدول ۶ [`change-requests.md`](change-requests.md)) و وضعیت پس از بازبینی:
+
+| شناسه | درخواست | تصمیم | وضعیت در این بخش |
 |---|---|---|---|
-| **CR-01** | جهت DAG بین parties و catalog | بخش ۰۱ §۵-۱ `catalog` را فقط وابسته به `core`، `ref` و `rules` می‌داند و parties و catalog را خواهر مستقل L2 می‌گیرد. catalog سه ارجاع ذاتی به شخص دارد: تأمین‌کنندهٔ کالا، شرکت گارانتی و انتساب فهرست قیمت به شخص یا گروه (D-M24) | `catalog.depends_on += {"parties"}`. در import-linter، `parties` پایین‌تر از `catalog` در L2 (یا L2a و L2b). یال `catalog --> parties` در نمودار ۵-۲. parties هیچ ارجاعی به catalog ندارد، پس چرخه پیش نمی‌آید |
-| **CR-02** | مالکیت فایل دادهٔ مرجع | جدول‌های `ref.country`، `province`، `city`، `bank`، `bank_sheba_code`، `bank_card_bin`، `moadian_unit` و `sstid`، و توابع `ref.is_valid_*` در `25_masterdata.sql` هستند، چون ماژول `ref` (L0) فایل SQL و بخش طراحی ندارد | یا فایل `05_ref.sql` (مالک: ماژول ref) ساخته و این تعریف‌ها عیناً به آن منتقل شود، یا مالکیت آن‌ها رسماً با این بخش بماند. در هر دو حالت هیچ بخش دیگری آن‌ها را دوباره تعریف نکند. همهٔ تعریف‌ها `IF NOT EXISTS` و `CREATE OR REPLACE` هستند، پس انتقال بی‌خطر است |
-| **CR-03** | shim نرمال‌سازی | قانون اعتبارسنجی این بخش فقط `00_foundation.sql` را پیش‌نیاز می‌داند، ولی ستون‌های نرمال به `core.fa_*` از `10_core.sql` نیاز دارند. پس فایل اگر توابع نبودند، همان متن fa-norm-v1 را می‌سازد (shim محافظت‌شده با `to_regprocedure`). T02 هم‌خوانی را با بردارهای هسته اثبات می‌کند | پیش‌نیازهای اعتبارسنجی بخش‌های مرحلهٔ ۲ و این بخش `00 → 10` باشد. سپس shim حذف شود تا متن نرمال‌سازی فقط یک مالک داشته باشد. تا آن زمان، هر تغییر fa-norm (نسخهٔ v2) باید هر دو جا را به‌روز کند. آزمون T02 واگرایی را می‌گیرد |
-| **CR-04** | ساخت تنبل مقدار بُعد | بخش ۰۳ ساخت مقدار بُعد شخص را به subscriber رویداد `parties.party.created` سپرده است. تحویل outbox ناهمگام است، پس فاکتورِ ثانیه‌ای پس از ساخت مشتری ممکن است مقدار بُعد پیدا نکند | در `ledger.post` گام ۴b: اگر `DimensionRef(type, entity_id)` مقدار ندارد و `type.owner_module` یک «منبع تفصیلی» ثبت‌شده است، `ensure_value` را با `PartyQuery.ledger_identity` (ledger مجاز است parties را بخواند) **در همان تراکنش** صدا بزند. subscriber هم می‌ماند، و چون `ensure_value` idempotent است هم‌روندی هر دو مسیر بی‌خطر است |
-| **CR-05** | نوع بُعد `employee` در برابر `party` | کاتالوگ ابعاد بخش ۰۳ نوع `employee` (مالک payroll، جایگاه ۱) را جدا از `party` (جایگاه ۱) دارد. کارمندی که مشتری هم هست دو «کارت» می‌گیرد و سطر سند نمی‌تواند هر دو را داشته باشد | payroll برای مانده‌های شخصی کارمند (حقوق پرداختنی، مساعده، وام) از بُعد `party` استفاده کند، چون کارمند شخصی با نقش `employee` است. نوع `employee` فقط اگر payroll تفکیک بیشتری (مثلاً قرارداد کار) بخواهد و در جایگاهی جز ۱ بماند. تصمیم نهایی با بخش payroll است |
-| **CR-06** | محافظ «شخص ادغام‌شده» در ماژول‌های دیگر | فقط parties و catalog تریگر دارند | هر ماژول با ستون شخص در جدول تغییرپذیر (پیش‌نویس‌ها، سفارش، چک در جریان، صف POS) `CREATE TRIGGER … EXECUTE FUNCTION parties.child_party_guard('<col>')` بگذارد، در `jobs.py` مشترک `parties.party.merged` شود (§۵-۶-۳) و در سرویس‌های نوشتنی `PartyQuery.require_usable` را صدا بزند |
-| **CR-07** | ترتیب فایل‌های SQL | بخش ۰۳ (C-L07) پیشنهاد داده parties پیش از ledger اجرا شود تا FK `ledger.dimension_value → parties.party` مستقیم بیاید | موافق. این فایل فقط به `00` (و در عمل `10`) وابسته است. نام‌گذاری مجدد به `15_masterdata.sql` (پیش از `20_ledger.sql`) بی‌خطر است. آزمون این بخش روی ترتیب `00 → 10 → 25 → 20` هم معتبر می‌ماند، چون به ledger ارجاعی ندارد |
-| **CR-08** | کاتالوگ طبقهٔ مالیاتی | `tax_category_code` کد آزاد با الگوی `^[a-z][a-z0-9_.]{1,63}$` است و FK ندارد | بخش rules یا tax جدول سراسری نسخه‌دار `rules.tax_category(code, title_fa, kind, valid_from, valid_to, source, confidence)` منتشر کند. سپس FK پیشنهادی §۱۲ افزوده شود. نرخ‌ها در پارامترهای تاریخ‌دار همان بخش می‌مانند |
-| **CR-09** | بررسی encoding پایگاه داده | `00_foundation.sql` UTF8 بودن پایگاه را بررسی نمی‌کند. این فایل یک بلوک `DO` نگهبان دارد (`HK_ENCODING`)، چون CHECKهای نرمال‌سازی با encoding دیگر معنا ندارند | بررسی به `00_foundation.sql` منتقل شود. ساخت پایگاه در استقرار با `ENCODING 'UTF8' TEMPLATE template0` و collation ثابت مستند شود (آزمون‌ها `C.UTF-8` استفاده می‌کنند) |
-| **CR-10** | GUCهای تراکنشی | این بخش دو GUC محلی تراکنش دارد: `hk.parties_merge` (فقط درون `merge_parties`) و `hk.catalog_allow_backdate` (فقط UoW مهاجرت با مجوز `catalog.price.backdate`). هر دو با `set_config(…, true)` تنظیم می‌شوند و با PgBouncer در حالت transaction سازگارند | core فهرست رسمی GUCهای `app.*` و `hk.*` را نگه دارد. `UnitOfWork` تنظیم `hk.*` را از کد غیرمجاز رد کند (فقط سرویس‌های ثبت‌شده) و lint آن را بررسی کند |
-| **CR-11** | نقش‌های پایگاه داده | به‌روزرسانی `ref` (بانک، snapshot شناسهٔ کالا، تقسیمات) با `hk_migrator` فرض شده است که هنوز در foundation نیست | همان C-02 و C-05 بخش ۰۱. این بخش تغییر دیگری نمی‌خواهد |
-| **C-01** (توضیح، نه درخواست) | شماره‌گذاری کد شخص و کالا | قرارداد «شماره‌گذاری پیوسته با شمارندهٔ قفل‌دار» برای اسناد است. کد شخص و کالا دادهٔ پایه است و این بخش سری خودش را دارد (D-M09). آن سری سطح مستأجر و غیرپیوسته است و کد دستی را می‌پذیرد | قرارداد مشترک بی‌تغییر می‌ماند. اگر core بعداً سری سطح مستأجر اضافه کند، `code_series` به آن مهاجرت می‌کند |
+| 05:CR-C14، 06:CR-T15، 08:CR-MG20 (RV-IT-01) | ۳۹ جدول بیرون از `core.export_table_registry` | پذیرفته (R-EXPORT) | **انجام‌شده**: هر ۳۹ جدول با `rows` و ستون‌های PII در بخش ۱۲ فایل SQL؛ `T21` و `core.security_lint()` تهی برای `parties`، `catalog` و `ref` |
+| 10:C-AS-10 (RV-IT-02) | مجوزهای `parties.*` و `catalog.*` و `field_guard` | پذیرفته | **انجام‌شده**: ۲۲ مجوز، ۶ محافظ فیلد، سهم قالب‌های نقش (§۵-۱۲)؛ `T21` |
+| RV-IT-CUSTOM | ثبت فیلد سفارشی در 25 | پذیرفته (پس از R-ORDER) | **انجام‌شده** (§۱۲)؛ بند ۶ فایل 99 دیگر کاری نمی‌کند و می‌تواند حذف شود |
+| 05:CR-C08 | `warranty_days` و `warranty_basis` در `catalog.v_sku` | پذیرفته | **انجام‌شده**: `v_sku` ستون‌های `warranty_days`، `warranty_basis` و `warranty_provider_party_id` را دارد |
+| 05:CR-C10 | تشخیص ویرایش کاربر با `content_sha256` | پذیرفته | **انجام‌شده** در متن D-M22 و §۵-۶-۱۱ (`CatalogPackApplier`) |
+| 08:CR-MG09 | `run_id` ← `job_id`؛ `source_scope` = `source_db`؛ `deactivate_if_unused` | پذیرفته (R-GLOSSARY) | **انجام‌شده**: ستون `migration_job_id` (تغییر نام idempotent در SQL)، امضاهای §۵-۵ و §۵-۶-۱۰ |
+| RV-X1-23 | تنظیم `parties.duplicate.threshold` در `core.setting_def` | — (یافتهٔ بازبینی) | **انجام‌شده** (`T21`). نام ویو در 05 و نام تنظیم در 08 درخواست به همان بخش‌هاست (پایین) |
+
+**درخواست‌های تازهٔ این بازبینی به بخش‌های دیگر:**
+
+| کد | به | درخواست |
+|---|---|---|
+| **CR-12** | یکپارچه‌ساز (هارنس) | `CHAIN[masterdata]` در `run_all.sh` به `00_foundation 10_core 25_masterdata` تغییر کند (R-ORDER). سپس این بخش shim `core.fa_*` را حذف می‌کند (CR-03) |
+| **CR-13** | ۰۲ و یکپارچه‌ساز | `hk.parties_merge` از رجیستری GUC (02 §۵ «رجیستری GUC» و R-GUC) حذف شود؛ تنها GUC این بخش `hk.catalog_allow_backdate` است و فقط درج تاریخچه را باز می‌کند |
+| **CR-14** | ۰۵ | fixture `30_commerce_test.sql` نسخهٔ BOM را از تاریخ گذشته فعال می‌کند (`valid_from = 2026-03-21`). پس از RV-MD-16 این کار فقط با پرچم مهاجرت ممکن است: پیش از آن `UPDATE` در همان تراکنش `PERFORM set_config('hk.catalog_allow_backdate', 'on', true)` بیاید (آزموده شد: آزمون 30 سبز می‌شود). همچنین «گزارش‌ها از `parties.v_party_identity` می‌خوانند» (05:969) باید `parties.v_party_canonical` (و برای کد و نام `parties.v_party_ledger_identity`) شود (RV-X1-23)، و موتور سریال `warranty_basis` را از `v_sku` بخواند |
+| **CR-15** | ۰۸ | نام تنظیم `migration.hesabfa.max_rps` (08:234) با ثبت SQL (`migration.api.hesabfa.max_rps`) یکی شود (RV-X1-23)؛ متن 08:1956 و 08:1978 نام ستون `migration_job_id` را که انجام شده ثبت کند |

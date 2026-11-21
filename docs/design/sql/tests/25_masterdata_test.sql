@@ -17,6 +17,10 @@
 --                      set_config('app.tenant_id', '<uuid>', true) تنظیم می‌کند. موارد deferred با
 --                      SET CONSTRAINTS ALL IMMEDIATE درون زیرتراکنش آزموده می‌شوند.
 --   بخش ۳ (readonly) — T19: «SET ROLE hk_readonly»: فقط خواندن.
+--   بخش ۴ — T20: همروندی واقعی با دو نشست dblink (RV-MD-05/14/17).
+--   بخش ۵ — T21: ثبت در کاتالوگ‌های core و FKهای کنشگر/پیوست (فقط وقتی 10_core اعمال شده؛ R-ORDER).
+--   بخش ۶ — T22: مقیاس (۲۰ هزار شخص، ۳۳۳۰ دسته؛ بدون seq scan).
+--   بخش ۷ — T23: هر CHECK با نام دقیقش در مسیر درون‌ریزی (replica) و ایندکس‌های یکتای جزئی باقی‌مانده.
 -- خروجی موفق با «ALL 25_masterdata TESTS PASSED» پایان می‌یابد؛ هر شکست «TEST FAILED [...]» می‌دهد
 -- و psql با کد ≠ ۰ خارج می‌شود. مسیر بردارها: -v id_vectors_file=... و -v fa_vectors_file=...
 -- =====================================================================
@@ -1497,6 +1501,12 @@ BEGIN
                            = '{"attr:item_posting_group":"GOODS","attr:item_type":"stock","attr:item_category":"SHOES"}'::jsonb, 'INV-CAT-22 item posting attributes');
   PERFORM public.md_assert(public.md_attr_keys_ok(catalog.posting_attributes('25a00000-0000-7000-8000-00000000c121')),
                            'INV-CAT-22 item posting attribute keys follow ledger condition grammar');
+  -- 05:CR-C08: v_sku گارانتی را با مبنای آغازش می‌دهد (پیش‌فرض sale_date)
+  PERFORM public.md_assert((SELECT warranty_basis = 'sale_date' FROM catalog.v_sku WHERE variant_id = '25a00000-0000-7000-8000-00000000c121'),
+                           '05:CR-C08 v_sku exposes warranty_basis (default sale_date)');
+  PERFORM public.md_expect_error('05:CR-C08 unknown warranty basis',
+    $q$UPDATE catalog.item SET warranty_basis = 'delivery' WHERE id = (SELECT item_id FROM catalog.item_variant WHERE id = '25a00000-0000-7000-8000-00000000c121')$q$,
+    'item_warranty_basis_check');
 
   -- INV-CAT-23: سری کد کالا
   PERFORM public.md_assert(catalog.next_item_code() = '00001', 'INV-CAT-23 default series created on demand');
@@ -1722,6 +1732,25 @@ BEGIN
   PERFORM md_cc.dblink_disconnect('b'); PERFORM md_cc.dblink_disconnect('p');
   PERFORM public.md_assert(NOT EXISTS (SELECT 1 FROM catalog.scale_barcode_pattern WHERE prefix = '27' AND is_active), 'RV-MD-17 no active pattern 27');
 END $$;
+-- RV-MD-17 ترتیب وارون: الگوی ترازوی ۲۶ در جریان، سپس بارکد ۱۳ رقمی با پیشوند ۲۶
+DO $$
+DECLARE pid_b integer; v text; v_code text := '261234567890' || ref.gtin_check_digit('261234567890')::text;
+BEGIN
+  IF to_regnamespace('md_cc') IS NULL THEN RETURN; END IF;
+  PERFORM public.md_cc_open('p'); pid_b := public.md_cc_open('b');
+  PERFORM 1 FROM md_cc.dblink('p', $q$INSERT INTO catalog.scale_barcode_pattern (tenant_id, code, name, prefix, plu_start, plu_length, value_kind, value_start, value_length, weight_uom_id)
+     VALUES ('25a00000-0000-7000-8000-000000000001','W26','ترازوی ۲۶','26',3,5,'weight',8,5,'25a00000-0000-7000-8000-00000000c003') RETURNING id::text$q$) AS x(v text);
+  PERFORM md_cc.dblink_send_query('b', format($q$INSERT INTO catalog.barcode (tenant_id, item_id, variant_id, uom_id, code, symbology, source)
+     VALUES ('25a00000-0000-7000-8000-000000000001','25a00000-0000-7000-8000-00000000c101','25a00000-0000-7000-8000-00000000c111','25a00000-0000-7000-8000-00000000c001',%L,'ean13','manufacturer') RETURNING id::text$q$, v_code));
+  PERFORM public.md_assert(public.md_cc_blocked(pid_b), 'RV-MD-17 barcode insert waits for an in-flight pattern activation with its prefix');
+  PERFORM md_cc.dblink_exec('p', 'COMMIT');
+  v := public.md_cc_finish('b');
+  PERFORM public.md_assert(v LIKE 'ERROR: HK_CATALOG_BARCODE_SCALE_PREFIX:%', 'RV-MD-17 barcode sees the committed pattern: ' || coalesce(v, '-'));
+  PERFORM md_cc.dblink_exec('b', 'ROLLBACK');
+  PERFORM md_cc.dblink_disconnect('p'); PERFORM md_cc.dblink_disconnect('b');
+  PERFORM public.md_assert(NOT EXISTS (SELECT 1 FROM catalog.barcode WHERE code = v_code), 'RV-MD-17 no barcode with active prefix 26');
+  UPDATE catalog.scale_barcode_pattern SET is_active = false WHERE tenant_id = '25a00000-0000-7000-8000-000000000001' AND prefix = '26';
+END $$;
 DROP SCHEMA IF EXISTS md_cc CASCADE;
 
 -- =====================================================================
@@ -1772,6 +1801,11 @@ BEGIN
   SELECT count(*) INTO n FROM pg_trigger WHERE tgname = 'trg_custom_fields_check' AND tgrelid IN ('parties.party'::regclass, 'catalog.item'::regclass);
   PERFORM public.md_assert(n = 2 AND (SELECT count(*) FROM core.custom_field_entity WHERE entity_type IN ('parties.party','catalog.item')) = 2,
                            'RV-IT-CUSTOM custom fields attached to party and item');
+  -- R-ORDER / R-ACTOR: FKهای کنشگر و پیوست به core در خود 25 ساخته می‌شوند (۱۳ کنشگر + ۱ پیوست)
+  SELECT count(*) INTO n FROM pg_constraint
+   WHERE contype = 'f' AND confrelid IN ('core.tenant_membership'::regclass, 'core.attachment'::regclass)
+     AND connamespace IN ('parties'::regnamespace, 'catalog'::regnamespace);
+  PERFORM public.md_assert(n = 14, 'R-ORDER actor and attachment FKs to core are created by 25_masterdata (' || n || ')');
 END $$;
 SET ROLE hk_app;
 DO $$
@@ -1783,6 +1817,18 @@ BEGIN
     'HK_CF_UNKNOWN_FIELD');
   PERFORM public.md_expect_error('RV-IT-CUSTOM undefined custom key on an item',
     $q$UPDATE catalog.item SET custom = '{"undefined_key":1}' WHERE id = '25a00000-0000-7000-8000-00000000c104'$q$, 'HK_CF_UNKNOWN_FIELD');
+  PERFORM public.md_expect_error('R-ACTOR party created_by must be a tenant member',
+    $q$INSERT INTO parties.party (tenant_id, code, person_type, name, created_by) VALUES ('25a00000-0000-7000-8000-000000000001','FK1','natural','x','25a00000-0000-7000-8000-0000000000ee')$q$,
+    'fk_party__created_by');
+  PERFORM public.md_expect_error('R-ACTOR merge actor must be a tenant member',
+    $q$INSERT INTO parties.party (tenant_id, id, code, person_type, name) VALUES
+         ('25a00000-0000-7000-8000-000000000001','25a00000-0000-7000-8000-0000000fe001','FKW','natural','الف'),
+         ('25a00000-0000-7000-8000-000000000001','25a00000-0000-7000-8000-0000000fe002','FKL','natural','ب');
+       SELECT parties.merge_parties('25a00000-0000-7000-8000-0000000fe001', '25a00000-0000-7000-8000-0000000fe002', 'ادغام آزمون کنشگر', '25a00000-0000-7000-8000-0000000000ee')$q$,
+    'fk_party_merge__merged_by');
+  PERFORM public.md_expect_error('R-ORDER item image must reference a core attachment',
+    $q$INSERT INTO catalog.item_image (tenant_id, item_id, attachment_id) VALUES ('25a00000-0000-7000-8000-000000000001','25a00000-0000-7000-8000-00000000c101','25a00000-0000-7000-8000-0000000000ef')$q$,
+    'fk_item_image__attachment');
 END $$;
 RESET ROLE;
 
@@ -2108,6 +2154,7 @@ BEGIN
     ('catalog.item', 'sstid_kind = NULL', 'sstid IS NOT NULL', 'item_sstid_pair'),
     ('catalog.item', 'item_type = ''service''', 'track_serial OR track_batch', 'item_tracking_stock_only'),
     ('catalog.item', 'warranty_days = NULL', 'warranty_provider_party_id IS NOT NULL', 'item_warranty_provider'),
+    ('catalog.item', 'warranty_basis = ''zz_bad''', 'true', 'item_warranty_basis_check'),
     ('catalog.item_variant', 'axis1_value_id = NULL', 'axis2_value_id IS NOT NULL', 'variant_axes_shape'),
     ('catalog.item_variant', 'axis1_value_id = ''25a00000-0000-7000-8000-00000000c021''', 'is_default', 'variant_default_no_axes'),
     ('catalog.item_variant', 'sstid = ''2710000138624''', 'sstid IS NULL', 'variant_sstid_pair'),

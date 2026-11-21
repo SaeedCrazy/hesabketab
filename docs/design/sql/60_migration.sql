@@ -107,6 +107,71 @@ BEGIN
   RETURN migration.verhoeff_digit(mem || days || serial) = substr(t, 22, 1)::int;
 END $$;
 
+-- شمار ردیف خام هر جدول مبدأ طبق manifest بستهٔ HIF (§۵-۲): {"<table>": rows} از files[] با kind='raw'.
+-- NULL یعنی manifest بدشکل است (files آرایه نیست، یا فایل raw بی‌جدول یا با rows ناعدد).
+CREATE OR REPLACE FUNCTION migration.manifest_raw_counts(p_manifest jsonb) RETURNS jsonb
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE f jsonb; r jsonb := '{}'; t text;
+BEGIN
+  IF jsonb_typeof(p_manifest -> 'files') IS DISTINCT FROM 'array' THEN RETURN NULL; END IF;
+  FOR f IN SELECT x FROM jsonb_array_elements(p_manifest -> 'files') x LOOP
+    CONTINUE WHEN f ->> 'kind' IS DISTINCT FROM 'raw';
+    t := f ->> 'table';
+    IF coalesce(t, '') = '' OR jsonb_typeof(f -> 'rows') IS DISTINCT FROM 'number' OR (f ->> 'rows') !~ '^[0-9]{1,15}$' THEN
+      RETURN NULL;
+    END IF;
+    r := r || jsonb_build_object(t, coalesce((r ->> t)::bigint, 0) + (f ->> 'rows')::bigint);
+  END LOOP;
+  RETURN r;
+END $$;
+
+-- INV-MIG-04 (RV-MG-18): ستون row_count_total همان manifest.row_count_total و جمع files[].rows فایل‌های raw است
+CREATE OR REPLACE FUNCTION migration.manifest_rows_ok(p_manifest jsonb, p_total bigint) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE c jsonb := migration.manifest_raw_counts(p_manifest); s bigint := 0; k text;
+BEGIN
+  IF c IS NULL OR jsonb_typeof(p_manifest -> 'row_count_total') IS DISTINCT FROM 'number'
+     OR (p_manifest ->> 'row_count_total') !~ '^[0-9]{1,15}$' OR (p_manifest ->> 'row_count_total')::bigint <> p_total THEN
+    RETURN false;
+  END IF;
+  FOR k IN SELECT jsonb_object_keys(c) LOOP s := s + (c ->> k)::bigint; END LOOP;
+  RETURN s = p_total;
+END $$;
+
+-- ترتیب ثابت مرحله‌های commit (D-MG17؛ RV-MG-15). inventory_conversion: سند تبدیل ادواری به دائمی در D-1 (RV-MG-21).
+CREATE OR REPLACE FUNCTION migration.stage_rank(p_stage text) RETURNS integer
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+SELECT CASE p_stage WHEN 'masterdata' THEN 1 WHEN 'coa' THEN 2 WHEN 'dimensions' THEN 3 WHEN 'funds' THEN 4
+                    WHEN 'opening_gl' THEN 5 WHEN 'history_gl' THEN 6 WHEN 'regenerated_docs' THEN 7
+                    WHEN 'inventory_conversion' THEN 8 WHEN 'subledger_positions' THEN 9 WHEN 'tax_continuity' THEN 10
+                    WHEN 'payroll' THEN 11 WHEN 'archive' THEN 12 END
+$$;
+
+-- RV-MG-22: dry-run حالت full_tx همان کد commit را روی کار validated اجرا می‌کند. GUC تراکنشی hk.migration_dry_run='on'
+-- (رجیستری R-GUC بخش ۰۲) گیت‌های «فقط committing» را برای همان تراکنش باز می‌کند و نگهبان تأخیری هر COMMIT آن را رد می‌کند.
+CREATE OR REPLACE FUNCTION migration.in_dry_run() RETURNS boolean
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+SELECT coalesce(current_setting('hk.migration_dry_run', true), '') = 'on'
+$$;
+
+-- RV-MG-13: کنش انسانی (امضای رضایت، تأیید واحد، پذیرش پیش‌نمایش، تأیید زنده شدن، تأیید توضیح، تأیید نگاشت، override)
+-- فقط کار خود کاربر جاری است: app.user_id تنظیم و برابر ستون باشد، و نه از دستیار (app.actor_via). کنش critical
+-- (p_critical) فقط مستقیم و بدون نشست ورود به‌جای کاربر است؛ بقیه تأیید پیشنهاد دستیار (assistant_confirm) را هم می‌پذیرند.
+CREATE OR REPLACE FUNCTION migration.assert_human_act(p_user uuid, p_what text, p_critical boolean DEFAULT false) RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+DECLARE v_via text := coalesce(nullif(current_setting('app.actor_via', true), ''), 'direct');
+BEGIN
+  IF core.current_user_id() IS NULL OR p_user IS DISTINCT FROM core.current_user_id() THEN
+    PERFORM migration.raise_error('HK_MIG_ACTOR', format('%s is recorded only as the acting user''s own act', p_what));
+  END IF;
+  IF NOT (v_via = 'direct' OR (v_via = 'assistant_confirm' AND NOT p_critical)) THEN
+    PERFORM migration.raise_error('HK_MIG_ACTOR', format('%s is not allowed when app.actor_via = %s', p_what, v_via));
+  END IF;
+  IF p_critical AND coalesce(current_setting('app.impersonation_session_id', true), '') <> '' THEN
+    PERFORM migration.raise_error('HK_MIG_ACTOR', format('%s is never done through impersonation', p_what));
+  END IF;
+END $$;
+
 -- =====================================================================
 -- ۲. کاتالوگ‌های سراسری (بدون tenant_id؛ hk_app فقط SELECT؛ پر شدن فقط با migration پایگاه داده
 --    یا بستهٔ امضاشدهٔ انتشار از پنل مالک که فرایند migrate با hk_migrator اعمال می‌کند)
@@ -172,9 +237,13 @@ CREATE TABLE IF NOT EXISTS migration.template_column (
   data_type         text NOT NULL CHECK (data_type IN ('text','code','int','decimal','amount','qty','rate','date','bool','enum')),
   enum_values       text[],
   title_key         text NOT NULL,
+  -- اجبار شرطی (RV-MG-20): ستون وقتی اجباری است که ستون نام‌برده (همان شیت یا شیت سرآیند) پر باشد؛ مثل sstid سطر T15b
+  -- وقتی فاکتور در T15 شمارهٔ مالیاتی دارد. اعتبارسنج در نبودش MIG_SSTID_REQUIRED یا MIG_REQUIRED_MISSING می‌دهد.
+  required_if       text CHECK (required_if IS NULL OR required_if ~ '^T(0[0-9]|1[0-7])b?\.[a-z][a-z0-9_]{0,60}$'),
   PRIMARY KEY (template_version, sheet_code, column_key),
   UNIQUE (template_version, sheet_code, ordinal),
-  CHECK ((data_type = 'enum') = (enum_values IS NOT NULL))
+  CHECK ((data_type = 'enum') = (enum_values IS NOT NULL)),
+  CHECK (NOT (is_required AND required_if IS NOT NULL))
 );
 
 -- کاتالوگ کد مشکل اعتبارسنجی (شدت پیش‌فرض، قابلیت override، مجوز override)
@@ -479,7 +548,7 @@ CREATE TABLE IF NOT EXISTS migration.package (
   producer                   text NOT NULL CHECK (producer IN ('agent','server_backup','server_api','server_file')),
   agent_session_id           uuid,
   format_version             text NOT NULL CHECK (format_version ~ '^hif/1(\.[0-9]{1,3})?$'),
-  manifest                   jsonb NOT NULL CHECK (jsonb_typeof(manifest) = 'object'),
+  manifest                   jsonb NOT NULL CONSTRAINT package_a_manifest_object CHECK (jsonb_typeof(manifest) = 'object'),
   manifest_sha256            bytea NOT NULL CHECK (octet_length(manifest_sha256) = 32),
   signer_key_id              text NOT NULL,
   signature_verified_at      timestamptz,
@@ -493,7 +562,7 @@ CREATE TABLE IF NOT EXISTS migration.package (
   amount_unit                core.amount_unit NOT NULL,
   date_mode                  text NOT NULL CHECK (date_mode IN ('gregorian_datetime','jalali_text','excel_serial','mixed')),
   extracted_at               timestamptz NOT NULL,
-  row_count_total            bigint NOT NULL CHECK (row_count_total >= 0),
+  row_count_total            bigint NOT NULL CONSTRAINT package_a_row_count_nonneg CHECK (row_count_total >= 0),
   status                     text NOT NULL DEFAULT 'received' CHECK (status IN ('received','verified','rejected','superseded')),
   reject_code                text REFERENCES migration.issue_code(code),
   verified_at                timestamptz,
@@ -511,7 +580,9 @@ CREATE TABLE IF NOT EXISTS migration.package (
   CHECK (producer <> 'agent' OR upload_id IS NOT NULL),
   CHECK (status NOT IN ('verified','superseded') OR (signature_verified_at IS NOT NULL AND verified_at IS NOT NULL)),
   CHECK ((status = 'rejected') = (reject_code IS NOT NULL)),
-  CHECK ((status = 'superseded') = (superseded_at IS NOT NULL))
+  CHECK ((status = 'superseded') = (superseded_at IS NOT NULL)),
+  -- INV-MIG-04 (RV-MG-18): شمار اعلام‌شده همان manifest است (row_count_total و جمع files[].rows فایل‌های raw)
+  CHECK (migration.manifest_rows_ok(manifest, row_count_total))
 );
 SELECT core.enable_tenant_rls('migration.package');
 -- INV-MIG-05: در هر کار حداکثر یک بستهٔ فعال
@@ -553,7 +624,7 @@ CREATE TABLE IF NOT EXISTS migration.staged_record (
                        'bank_account','cash_box','petty_cash','card_terminal',
                        'opening_balance_line','open_document','cheque','bank_unreconciled_item','stock_opening','fixed_asset',
                        'voucher','voucher_line','invoice_history','invoice_line_history','receipt_payment',
-                       'employee','payroll_ytd','tax_continuity')),
+                       'employee','payroll_ytd','tax_continuity','serial_history')),
   source_system      text NOT NULL,
   source_db          text NOT NULL,
   source_table       text NOT NULL,
@@ -620,6 +691,7 @@ CREATE INDEX IF NOT EXISTS staged_parent_idx ON migration.staged_record (tenant_
 CREATE TABLE IF NOT EXISTS migration.id_map (
   tenant_id      uuid NOT NULL REFERENCES core.tenant(id),
   id             uuid NOT NULL DEFAULT uuidv7(),
+  company_id     uuid,                                -- RV-MG-01: شرکت مقصد؛ NULL = مقصد مشترک مستأجر (شخص/کالای بی‌شرکت)
   source_system  text NOT NULL,
   source_db      text NOT NULL,
   source_table   text NOT NULL,
@@ -636,10 +708,14 @@ CREATE TABLE IF NOT EXISTS migration.id_map (
   row_version    integer NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
-  -- INV-MIG-07: هر رکورد مبدأ برای هر نوع مقصد حداکثر یک مقصد دارد (اجرای دوباره = به‌روزرسانی، نه تکرار)
-  UNIQUE (tenant_id, source_system, source_db, source_table, source_key, target_kind),
+  -- INV-MIG-07: هر رکورد مبدأ برای هر نوع مقصد در هر شرکت (یا یک‌بار برای مقصد مشترک مستأجر) حداکثر یک مقصد دارد
+  -- (اجرای دوباره = به‌روزرسانی، نه تکرار). RV-MG-01: شرکت دوم یا شرکت تمرینی همان مستأجر کلید جدا دارد.
+  UNIQUE NULLS NOT DISTINCT (tenant_id, company_id, source_system, source_db, source_table, source_key, target_kind),
+  FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, first_job_id) REFERENCES migration.job(tenant_id, id),
-  FOREIGN KEY (tenant_id, last_job_id) REFERENCES migration.job(tenant_id, id)
+  FOREIGN KEY (tenant_id, last_job_id) REFERENCES migration.job(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, first_job_id) REFERENCES migration.job(tenant_id, company_id, id),
+  FOREIGN KEY (tenant_id, company_id, last_job_id) REFERENCES migration.job(tenant_id, company_id, id)
 );
 SELECT core.enable_tenant_rls('migration.id_map');
 CREATE INDEX IF NOT EXISTS id_map_target_idx ON migration.id_map (tenant_id, target_kind, target_id);
@@ -757,10 +833,9 @@ CREATE TABLE IF NOT EXISTS migration.commit_chunk (
   id            uuid NOT NULL DEFAULT uuidv7(),
   job_id        uuid NOT NULL,
   chunk_no      integer NOT NULL CHECK (chunk_no >= 1),
-  stage         text NOT NULL CHECK (stage IN ('masterdata','coa','dimensions','funds','opening_gl','history_gl',
-                                                'subledger_positions','regenerated_docs','tax_continuity','payroll','archive')),
+  stage         text NOT NULL CHECK (migration.stage_rank(stage) IS NOT NULL),   -- D-MG17: ترتیب ثابت در stage_rank
   status        text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','done','failed')),
-  item_count    integer NOT NULL CHECK (item_count >= 0),
+  item_count    integer NOT NULL CONSTRAINT commit_chunk_a_item_count_nonneg CHECK (item_count >= 0),
   done_count    integer NOT NULL DEFAULT 0 CHECK (done_count >= 0),
   attempts      integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   started_at    timestamptz,
@@ -783,8 +858,13 @@ CREATE TABLE IF NOT EXISTS migration.posting (
   tenant_id         uuid NOT NULL REFERENCES core.tenant(id),
   id                uuid NOT NULL DEFAULT uuidv7(),
   job_id            uuid NOT NULL,
+  company_id        uuid NOT NULL,                     -- RV-MG-01: شرکت کار (تریگر از کار پر می‌کند؛ FK سه‌ستونی)
   chunk_no          integer NOT NULL,
-  staged_record_id  uuid,
+  staged_record_id  uuid,                              -- پس از پاک‌سازی نگهداری NULL می‌شود (RV-MG-08)؛ lineage در ستون‌های زیر می‌ماند
+  staged_entity     text,                              -- رونوشت تریگر از رکورد مرحله‌ای (RV-MG-08، RV-MG-19)
+  legacy_code       text,
+  partition_class   text,
+  disposition       text,
   source_system     text NOT NULL,
   source_db         text NOT NULL,
   source_table      text NOT NULL,
@@ -797,23 +877,33 @@ CREATE TABLE IF NOT EXISTS migration.posting (
   gl_effect         text NOT NULL CHECK (gl_effect IN ('posted','none')),
   amount_base       core.amount,
   state             text NOT NULL DEFAULT 'live' CHECK (state IN ('live','compensated')),
+  compensation_kind text CHECK (compensation_kind IN ('void','cancel','deactivate','revert')),
   compensation_doc_id uuid,
   compensated_at    timestamptz,
   posted_at         timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, job_id) REFERENCES migration.job(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, job_id) REFERENCES migration.job(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, job_id, chunk_no) REFERENCES migration.commit_chunk(tenant_id, job_id, chunk_no),
-  FOREIGN KEY (tenant_id, job_id, staged_record_id) REFERENCES migration.staged_record(tenant_id, job_id, id),
-  FOREIGN KEY (tenant_id, journal_id) REFERENCES ledger.journal(tenant_id, id),
+  -- RV-MG-08/19: پاک‌سازی ردیف مرحله‌ای فقط همین ستون را NULL می‌کند؛ صدور .hkx هم آن را NULL می‌نویسد (قلاب صدور)
+  FOREIGN KEY (tenant_id, job_id, staged_record_id) REFERENCES migration.staged_record(tenant_id, job_id, id)
+    ON DELETE SET NULL (staged_record_id),
+  -- RV-MG-07: سند دفتر کل از همان شرکت کار است
+  FOREIGN KEY (tenant_id, company_id, journal_id) REFERENCES ledger.journal(tenant_id, company_id, id),
   CHECK ((gl_effect = 'posted') = (journal_id IS NOT NULL)),
-  CHECK ((state = 'compensated') = (compensated_at IS NOT NULL))
+  -- RV-MG-15: جبران همیشه نوع دارد؛ جز غیرفعال‌سازی دادهٔ پایه، سند جبران دارد؛ اثر GL فقط با ابطال یا لغو سند جبران می‌شود
+  CHECK ((state = 'compensated') = (compensated_at IS NOT NULL AND compensation_kind IS NOT NULL)),
+  CHECK (state <> 'compensated' OR compensation_doc_id IS NOT NULL OR compensation_kind = 'deactivate'),
+  CHECK (state <> 'compensated' OR gl_effect = 'none' OR compensation_kind IN ('void','cancel'))
 );
 SELECT core.enable_tenant_rls('migration.posting');
--- INV-MIG-03: هر سند مبدأ حداکثر یک‌بار (برای هر نوع سند مقصد) به‌صورت زنده ثبت می‌شود
+-- INV-MIG-03: هر سند مبدأ در هر شرکت حداکثر یک‌بار (برای هر نوع سند مقصد) به‌صورت زنده ثبت می‌شود (RV-MG-01: کلید شرکت‌دار)
 CREATE UNIQUE INDEX IF NOT EXISTS posting_one_live_per_source
-  ON migration.posting (tenant_id, source_system, source_db, source_table, source_key, target_doc_type) WHERE state = 'live';
+  ON migration.posting (tenant_id, company_id, source_system, source_db, source_table, source_key, target_doc_type) WHERE state = 'live';
 CREATE INDEX IF NOT EXISTS posting_job_idx ON migration.posting (tenant_id, job_id, state);
+-- RV-MG-25: drill-down «این سند از کجا آمد» (LineageQuery.for_journal)
+CREATE INDEX IF NOT EXISTS posting_journal_idx ON migration.posting (tenant_id, journal_id) WHERE journal_id IS NOT NULL;
 
 -- ---------- ۳-۱۶. ارقام کنترلی سمت مبدأ (فقط‌افزودنی) ----------
 CREATE TABLE IF NOT EXISTS migration.source_balance (
@@ -871,7 +961,11 @@ CREATE TABLE IF NOT EXISTS migration.explanation (
   -- INV-MIG-19: اختلاف تراز آزمایشی و شمار اسناد فقط با دسته‌های مشخص و محدود توضیح‌پذیر است
   CHECK (check_kind NOT IN ('trial_balance','doc_count','clearing')
          OR category IN ('source_inconsistency','deleted_in_source','excluded_by_user','source_rounding')),
-  CHECK (category <> 'unknown_cost' OR check_kind IN ('stock_value','control_account'))
+  CHECK (category <> 'unknown_cost' OR check_kind IN ('stock_value','control_account')),
+  -- RV-MG-21 / INV-MIG-38: حساب کنترل (GL در برابر زیردفتر مقصد) تلورانس صفر دارد؛ فقط بهای نامعلومِ با GL معوق
+  -- (inventory gl_status='deferred') توضیح‌پذیر است. اختلاف ادواری/دائمی با سند تبدیل بسته می‌شود، نه با توضیح.
+  CHECK (check_kind <> 'control_account' OR category = 'unknown_cost'),
+  CHECK (category <> 'perpetual_vs_periodic' OR check_kind = 'source_cross_check')
 );
 SELECT core.enable_tenant_rls('migration.explanation');
 
@@ -908,6 +1002,7 @@ CREATE TABLE IF NOT EXISTS migration.reconciliation_line (
   id                 uuid NOT NULL DEFAULT uuidv7(),
   job_id             uuid NOT NULL,
   reconciliation_id  uuid NOT NULL,
+  line_no            integer NOT NULL CHECK (line_no >= 1),     -- RV-MG-04: ۱..line_count سرآیند؛ سطر دیرهنگام جا ندارد
   check_kind         text NOT NULL CHECK (check_kind IN ('trial_balance','control_account','party','bank','cash','petty_cash',
                                                          'cheque','stock_qty','stock_value','asset','doc_count','clearing',
                                                          'moadian_continuity','source_cross_check')),
@@ -923,6 +1018,7 @@ CREATE TABLE IF NOT EXISTS migration.reconciliation_line (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, reconciliation_id, check_kind, key),
+  UNIQUE (tenant_id, reconciliation_id, line_no),
   FOREIGN KEY (tenant_id, job_id, reconciliation_id) REFERENCES migration.reconciliation(tenant_id, job_id, id),
   FOREIGN KEY (tenant_id, job_id, explanation_id) REFERENCES migration.explanation(tenant_id, job_id, id)
 );
@@ -934,8 +1030,8 @@ CREATE TABLE IF NOT EXISTS migration.moadian_continuity (
   id               uuid NOT NULL DEFAULT uuidv7(),
   job_id           uuid NOT NULL,
   company_id       uuid NOT NULL,
-  memory_id        text NOT NULL CHECK (memory_id ~ '^[A-Z0-9]{6}$'),
-  last_inno        text NOT NULL CHECK (last_inno ~ '^[0-9A-F]{10}$'),
+  memory_id        text NOT NULL CONSTRAINT moadian_continuity_a_memory_id CHECK (memory_id ~ '^[A-Z0-9]{6}$'),
+  last_inno        text NOT NULL CONSTRAINT moadian_continuity_a_last_inno CHECK (last_inno ~ '^[0-9A-F]{10}$'),
   last_taxid       text NOT NULL,
   connection_mode  text NOT NULL CHECK (connection_mode IN ('direct','trusted_company')),
   origin           text NOT NULL CHECK (origin IN ('template_t17','source_db','user_entry')),
@@ -968,6 +1064,8 @@ CREATE TABLE IF NOT EXISTS migration.archive_entry (
   amount_unit   core.amount_unit NOT NULL,
   description   text,
   payload       jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+  source_system text NOT NULL,
+  source_db     text NOT NULL DEFAULT '',
   source_table  text NOT NULL,
   source_key    text NOT NULL,
   search_key    text GENERATED ALWAYS AS (core.fa_search_key(coalesce(doc_no, '') || ' ' || coalesce(party_name, '') || ' '
@@ -975,7 +1073,8 @@ CREATE TABLE IF NOT EXISTS migration.archive_entry (
   created_at    timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
-  UNIQUE (tenant_id, company_id, source_table, source_key, fiscal_label),
+  -- RV-MG-27: دو پایگاه مبدأ (Holoo1/Holoo2؛ §۸ ردیف ۳۶) کلید جدا دارند
+  UNIQUE (tenant_id, company_id, source_system, source_db, source_table, source_key, fiscal_label),
   FOREIGN KEY (tenant_id, company_id, job_id) REFERENCES migration.job(tenant_id, company_id, id)
 );
 SELECT core.enable_tenant_rls('migration.archive_entry');
@@ -991,16 +1090,27 @@ LANGUAGE sql STABLE AS $$
   SELECT status FROM migration.job WHERE tenant_id = p_tenant AND id = p_job
 $$;
 
+-- RV-MG-02: هر نوشتن فرزند وضعیت کار را با FOR SHARE می‌خواند. این قفل با قفل ردیفِ گذار وضعیت (FOR NO KEY UPDATE)
+-- تعارض دارد؛ پس نوشتن فرزند و گذار کار سریالی‌اند: گیت گذار نوشتهٔ commitشدهٔ هم‌زمان را می‌بیند و نوشتنِ منتظر،
+-- پس از commit گذار، وضعیت تازه را می‌خواند (READ COMMITTED آخرین نسخهٔ ردیف قفل‌شده را برمی‌گرداند).
+CREATE OR REPLACE FUNCTION migration.lock_job_status(p_tenant uuid, p_job uuid) RETURNS text
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE v text;
+BEGIN
+  SELECT j.status INTO v FROM migration.job j WHERE j.tenant_id = p_tenant AND j.id = p_job FOR SHARE;
+  RETURN v;
+END $$;
+
 CREATE OR REPLACE FUNCTION migration.assert_job_status(p_tenant uuid, p_job uuid, p_allowed text[], p_what text) RETURNS void
-LANGUAGE plpgsql STABLE AS $$
-DECLARE v text := migration.job_status_of(p_tenant, p_job);
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE v text := migration.lock_job_status(p_tenant, p_job);
 BEGIN
   IF v IS NULL OR NOT (v = ANY (p_allowed)) THEN
     PERFORM migration.raise_error('HK_MIG_JOB_STATE', format('%s is not allowed while the job is %s', p_what, coalesce(v, 'missing')));
   END IF;
 END $$;
 
--- گذارهای مجاز ماشین حالت کار
+-- گذارهای مجاز ماشین حالت کار. RV-MG-06: failed → validated حذف شد؛ بازگشت از failed همیشه از mapping (یا قبل‌تر) می‌گذرد.
 CREATE OR REPLACE FUNCTION migration.job_transition_allowed(p_from text, p_to text) RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$
 SELECT (p_from, p_to) IN (
@@ -1014,7 +1124,7 @@ SELECT (p_from, p_to) IN (
   ('committed','reconciled'), ('committed','rolling_back'),
   ('reconciled','committed'), ('reconciled','live'), ('reconciled','rolling_back'),
   ('rolling_back','rolled_back'),
-  ('failed','awaiting_source'), ('failed','staged'), ('failed','mapping'), ('failed','validated'), ('failed','cancelled')
+  ('failed','awaiting_source'), ('failed','staged'), ('failed','mapping'), ('failed','cancelled')
 )
 $$;
 
@@ -1025,6 +1135,14 @@ LANGUAGE sql STABLE AS $$
                     AND c.revoked_at IS NULL AND c.valid_until > now())
 $$;
 
+-- RV-MG-17 / D-MG24: مهاجرت همراه‌با‌کارشناس فقط با رضایت پشتیبانی نوشتنی، لغونشده و در بازهٔ اعتبار
+CREATE OR REPLACE FUNCTION migration.support_grant_ok(p_tenant uuid, p_grant uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM core.support_access_grant g
+                  WHERE g.tenant_id = p_tenant AND g.id = p_grant AND g.access_mode = 'read_write'
+                    AND g.revoked_at IS NULL AND now() >= g.starts_at AND now() < g.expires_at)
+$$;
+
 CREATE OR REPLACE FUNCTION migration.job_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -1033,61 +1151,114 @@ DECLARE
   v_dr       record;
   v_rec      record;
   v_latest   uuid;
+  -- وضعیت‌هایی که تنظیمات کار در آن‌ها تغییرپذیر است (RV-MG-05)
+  c_open     CONSTANT text[] := ARRAY['draft','awaiting_source','staged','mapping','failed'];
 BEGIN
   IF TG_OP = 'DELETE' THEN
     PERFORM migration.raise_error('HK_MIG_JOB_DELETE', 'migration jobs are never deleted; cancel or roll back instead');
   END IF;
 
   IF TG_OP = 'INSERT' THEN
-    IF NEW.status <> 'draft' OR NEW.preview_dry_run_id IS NOT NULL OR NEW.reconciliation_id IS NOT NULL
-       OR NEW.golive_approved_by IS NOT NULL OR NEW.preview_accepted_by IS NOT NULL OR NEW.inputs_hash IS NOT NULL THEN
+    IF NEW.status <> 'draft' OR NEW.consent_id IS NOT NULL OR NEW.inputs_hash IS NOT NULL OR NEW.preview_dry_run_id IS NOT NULL
+       OR NEW.preview_accepted_by IS NOT NULL OR NEW.reconciliation_id IS NOT NULL OR NEW.golive_approved_by IS NOT NULL
+       OR NEW.golive_client_ip IS NOT NULL OR NEW.locked_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL
+       OR NEW.cancelled_at IS NOT NULL OR NEW.failure_code IS NOT NULL THEN
       PERFORM migration.raise_error('HK_MIG_JOB_INITIAL', 'a job starts as an empty draft');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM migration.source_system s WHERE s.code = NEW.source_system AND NEW.channel = ANY (s.channels)) THEN
       PERFORM migration.raise_error('HK_MIG_CHANNEL', format('source %s does not support channel %s', NEW.source_system, NEW.channel));
     END IF;
+    IF NEW.support_grant_id IS NOT NULL AND NOT migration.support_grant_ok(NEW.tenant_id, NEW.support_grant_id) THEN
+      PERFORM migration.raise_error('HK_MIG_SUPPORT_GRANT', 'an assisted job needs a valid, unrevoked read_write support grant');
+    END IF;
+    IF NEW.amount_unit_confirmed_by IS NOT NULL THEN
+      PERFORM migration.assert_human_act(NEW.amount_unit_confirmed_by, 'confirming the amount unit');
+      NEW.amount_unit_confirmed_at := now();
+    END IF;
+    NEW.created_at := now();
+    NEW.status_changed_at := now();
     RETURN NEW;
   END IF;
 
   -- UPDATE ------------------------------------------------------------------
-  IF (NEW.tenant_id, NEW.id, NEW.company_id, NEW.source_system, NEW.channel, NEW.mode, NEW.is_rehearsal, NEW.created_by, NEW.created_at)
-     IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.company_id, OLD.source_system, OLD.channel, OLD.mode, OLD.is_rehearsal, OLD.created_by, OLD.created_at) THEN
-    PERFORM migration.raise_error('HK_MIG_JOB_IMMUTABLE', 'company, source, channel, mode and rehearsal flag are fixed at creation');
+  IF (NEW.tenant_id, NEW.id, NEW.company_id, NEW.source_system, NEW.channel, NEW.mode, NEW.is_rehearsal, NEW.assisted,
+      NEW.created_by, NEW.created_at)
+     IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.company_id, OLD.source_system, OLD.channel, OLD.mode, OLD.is_rehearsal, OLD.assisted,
+      OLD.created_by, OLD.created_at) THEN
+    PERFORM migration.raise_error('HK_MIG_JOB_IMMUTABLE', 'company, source, channel, mode, rehearsal and assisted flags are fixed at creation');
   END IF;
   IF OLD.status IN ('live','rolled_back','cancelled') THEN
-    IF (NEW.status, NEW.cutover_date, NEW.fiscal_year_id, NEW.amount_unit, NEW.inputs_hash, NEW.preview_dry_run_id, NEW.reconciliation_id,
-        NEW.golive_approved_by, NEW.locked_at, NEW.consent_id, NEW.support_grant_id, NEW.coding_mode, NEW.profile_code, NEW.profile_version)
-       IS DISTINCT FROM
-       (OLD.status, OLD.cutover_date, OLD.fiscal_year_id, OLD.amount_unit, OLD.inputs_hash, OLD.preview_dry_run_id, OLD.reconciliation_id,
-        OLD.golive_approved_by, OLD.locked_at, OLD.consent_id, OLD.support_grant_id, OLD.coding_mode, OLD.profile_code, OLD.profile_version) THEN
+    -- RV-MG-12: فهرست سفید. در کار پایانی جز مهلت نگهداری هیچ ستونی (از جمله شواهد زنده شدن، پذیرش و تأیید واحد) تغییر نمی‌کند.
+    IF (to_jsonb(NEW) - 'raw_retain_until' - 'updated_at' - 'row_version')
+       IS DISTINCT FROM (to_jsonb(OLD) - 'raw_retain_until' - 'updated_at' - 'row_version') THEN
       PERFORM migration.raise_error('HK_MIG_JOB_TERMINAL', format('job is %s; only retention metadata may change', OLD.status));
     END IF;
     RETURN NEW;
   END IF;
+  -- زمان‌های وضعیت را فقط گیت‌ها می‌نویسند
+  IF (NEW.status_changed_at, NEW.locked_at, NEW.rolled_back_at, NEW.cancelled_at)
+     IS DISTINCT FROM (OLD.status_changed_at, OLD.locked_at, OLD.rolled_back_at, OLD.cancelled_at) THEN
+    PERFORM migration.raise_error('HK_MIG_JOB_IMMUTABLE', 'status timestamps are written by the transition gates only');
+  END IF;
 
-  -- INV-MIG-13: ورودی‌ها پس از پیش‌نمایش منجمدند
-  IF NEW.status IN ('previewed','committing','committed','reconciled','live','rolling_back','rolled_back')
+  -- INV-MIG-13 (RV-MG-05): تنظیمات کار و تأیید واحد از validated به بعد منجمدند؛ هر اصلاح یعنی بازگشت به mapping
+  IF NOT (OLD.status = ANY (c_open))
      AND (NEW.cutover_date, NEW.fiscal_year_id, NEW.amount_unit, NEW.coding_mode, NEW.profile_code, NEW.profile_version,
-          NEW.inputs_hash, NEW.coa_template_code, NEW.coa_template_version)
+          NEW.coa_template_code, NEW.coa_template_version, NEW.amount_unit_confirmed_by, NEW.amount_unit_confirmed_at)
          IS DISTINCT FROM
          (OLD.cutover_date, OLD.fiscal_year_id, OLD.amount_unit, OLD.coding_mode, OLD.profile_code, OLD.profile_version,
-          OLD.inputs_hash, OLD.coa_template_code, OLD.coa_template_version) THEN
+          OLD.coa_template_code, OLD.coa_template_version, OLD.amount_unit_confirmed_by, OLD.amount_unit_confirmed_at) THEN
+    PERFORM migration.raise_error('HK_MIG_INPUTS_FROZEN', 'job settings are frozen from validation on; move the job back to mapping first');
+  END IF;
+  IF NEW.inputs_hash IS DISTINCT FROM OLD.inputs_hash
+     AND NOT (OLD.status = ANY (c_open || ARRAY['validated']) AND NEW.status = ANY (c_open || ARRAY['validated','cancelled'])) THEN
     PERFORM migration.raise_error('HK_MIG_INPUTS_FROZEN', 'inputs are frozen after preview; move the job back to mapping first');
   END IF;
-  IF NEW.amount_unit IS DISTINCT FROM OLD.amount_unit AND NEW.amount_unit_confirmed_at IS NOT DISTINCT FROM OLD.amount_unit_confirmed_at THEN
-    NEW.amount_unit_confirmed_by := NULL;     -- تغییر واحد، تأیید قبلی را باطل می‌کند
+  IF NEW.preview_dry_run_id IS DISTINCT FROM OLD.preview_dry_run_id
+     AND NOT (OLD.status IN ('validated','previewed') AND NEW.status = 'previewed')
+     AND NOT (NEW.status = 'mapping' AND OLD.status <> 'mapping') THEN
+    PERFORM migration.raise_error('HK_MIG_INPUTS_FROZEN', 'the previewed dry-run is chosen only while the job is previewed');
+  END IF;
+  -- D-MG15: تغییر واحد، تأیید قبلی را باطل می‌کند؛ تأیید تازه کنش خود کاربر است (RV-MG-13) و زمانش زمان سرور
+  IF NEW.amount_unit IS DISTINCT FROM OLD.amount_unit
+     AND (NEW.amount_unit_confirmed_by, NEW.amount_unit_confirmed_at) IS NOT DISTINCT FROM (OLD.amount_unit_confirmed_by, OLD.amount_unit_confirmed_at) THEN
+    NEW.amount_unit_confirmed_by := NULL;
     NEW.amount_unit_confirmed_at := NULL;
+  ELSIF NEW.amount_unit_confirmed_by IS NOT NULL
+        AND (NEW.amount_unit_confirmed_by, NEW.amount_unit_confirmed_at) IS DISTINCT FROM (OLD.amount_unit_confirmed_by, OLD.amount_unit_confirmed_at) THEN
+    PERFORM migration.assert_human_act(NEW.amount_unit_confirmed_by, 'confirming the amount unit');
+    NEW.amount_unit_confirmed_at := now();
   END IF;
-  IF NEW.preview_accepted_by IS DISTINCT FROM OLD.preview_accepted_by AND NEW.preview_accepted_by IS NOT NULL
-     AND NOT (OLD.status = 'previewed' AND NEW.status IN ('previewed','committing')) THEN
-    PERFORM migration.raise_error('HK_MIG_PREVIEW_STATE', 'the preview can be accepted only while the job is previewed');
+  -- پذیرش پیش‌نمایش: یک‌بار، در previewed، کنش خود کاربر (RV-MG-12، RV-MG-13). گذار به mapping آن را پاک می‌کند.
+  IF (NEW.preview_accepted_by, NEW.preview_accepted_at) IS DISTINCT FROM (OLD.preview_accepted_by, OLD.preview_accepted_at)
+     AND NOT (NEW.status = 'mapping' AND OLD.status <> 'mapping') THEN
+    IF OLD.preview_accepted_by IS NOT NULL OR NEW.preview_accepted_by IS NULL
+       OR NOT (OLD.status = 'previewed' AND NEW.status IN ('previewed','committing')) THEN
+      PERFORM migration.raise_error('HK_MIG_PREVIEW_STATE', 'the preview can be accepted only once, while the job is previewed');
+    END IF;
+    PERFORM migration.assert_human_act(NEW.preview_accepted_by, 'accepting the preview');
+    NEW.preview_accepted_at := now();
   END IF;
-  IF NEW.golive_approved_by IS DISTINCT FROM OLD.golive_approved_by AND NEW.golive_approved_by IS NOT NULL
+  -- INV-MIG-24: تأیید زنده شدن (کنشگر، زمان، IP) فقط با گذار reconciled → live ثبت می‌شود
+  IF (NEW.golive_approved_by, NEW.golive_approved_at, NEW.golive_client_ip)
+     IS DISTINCT FROM (OLD.golive_approved_by, OLD.golive_approved_at, OLD.golive_client_ip)
      AND NOT (OLD.status = 'reconciled' AND NEW.status = 'live') THEN
     PERFORM migration.raise_error('HK_MIG_GOLIVE_STATE', 'go-live approval is recorded only with the reconciled → live transition');
   END IF;
-  IF NEW.consent_id IS DISTINCT FROM OLD.consent_id AND OLD.status NOT IN ('draft','awaiting_source') THEN
-    PERFORM migration.raise_error('HK_MIG_CONSENT_FIXED', 'the consent of a running job cannot be swapped');
+  IF NEW.reconciliation_id IS DISTINCT FROM OLD.reconciliation_id AND OLD.status <> 'committed' THEN
+    PERFORM migration.raise_error('HK_MIG_NOT_RECONCILED', 'move the job back to committed before switching reconciliations');
+  END IF;
+  -- RV-MG-16: رضایت را می‌توان در هر وضعیت غیرپایانی با رضایت مالک دادهٔ تازه و فعال همین کار عوض کرد (در job_event ثبت می‌شود)
+  IF NEW.consent_id IS DISTINCT FROM OLD.consent_id AND OLD.status <> 'draft'
+     AND (NEW.consent_id IS NULL OR NOT EXISTS (
+            SELECT 1 FROM migration.consent c
+             WHERE c.tenant_id = NEW.tenant_id AND c.id = NEW.consent_id AND c.job_id = NEW.id
+               AND c.kind = 'data_owner_migration' AND c.revoked_at IS NULL AND c.valid_until > now())) THEN
+    PERFORM migration.raise_error('HK_MIG_CONSENT_FIXED', 'a running job can switch only to another active data-owner consent of the same job');
+  END IF;
+  -- RV-MG-17: تمدید رضایت پشتیبانی (حداکثر ۷ روزه) با رضایت معتبر دیگر
+  IF NEW.support_grant_id IS DISTINCT FROM OLD.support_grant_id AND NOT migration.support_grant_ok(NEW.tenant_id, NEW.support_grant_id) THEN
+    PERFORM migration.raise_error('HK_MIG_SUPPORT_GRANT', 'an assisted job needs a valid, unrevoked read_write support grant');
   END IF;
 
   IF NEW.status IS DISTINCT FROM OLD.status THEN
@@ -1114,6 +1285,10 @@ BEGIN
           PERFORM migration.raise_error('HK_MIG_CONSENT_REQUIRED', format('an active %s consent is required', v_kind));
         END IF;
       END LOOP;
+      -- RV-MG-17: هر گام رو به جلوی کار همراه‌با‌کارشناس رضایت پشتیبانی نوشتنی و معتبر می‌خواهد
+      IF NEW.assisted AND NOT migration.support_grant_ok(NEW.tenant_id, NEW.support_grant_id) THEN
+        PERFORM migration.raise_error('HK_MIG_SUPPORT_GRANT', 'an assisted job needs a valid, unrevoked read_write support grant');
+      END IF;
     END IF;
 
     CASE NEW.status
@@ -1144,13 +1319,32 @@ BEGIN
                           AND p.partition_class = s.partition_class)) THEN
           PERFORM migration.raise_error('HK_MIG_PARTITION_POLICY', 'every voucher class needs a disposition policy');
         END IF;
+        -- RV-MG-06: بازسنجی مجموعه‌ای در گیت؛ سند «معتبری» که سطرش بعداً حذف شده هرگز نمی‌گذرد (INV-MIG-15).
+        -- (سطر pending یا blocked را بررسی HK_MIG_UNRESOLVED_RECORDS بالا پیش‌تر گرفته است.)
+        IF EXISTS (SELECT 1 FROM migration.staged_record v
+                     LEFT JOIN LATERAL (SELECT coalesce(sum(c.debit), 0) AS dr, coalesce(sum(c.credit), 0) AS cr
+                                          FROM migration.staged_record c
+                                         WHERE c.tenant_id = v.tenant_id AND c.job_id = v.job_id AND c.parent_id = v.id
+                                           AND c.status <> 'excluded') t ON true
+                    WHERE v.tenant_id = NEW.tenant_id AND v.job_id = NEW.id AND v.entity = 'voucher'
+                      AND v.status IN ('valid','warning') AND (t.dr <> t.cr OR t.dr = 0)) THEN
+          PERFORM migration.raise_error('HK_MIG_VOUCHER_UNBALANCED', 'a valid voucher is unbalanced or empty');
+        END IF;
       WHEN 'previewed' THEN
+        IF NEW.amount_unit_confirmed_at IS NULL THEN
+          PERFORM migration.raise_error('HK_MIG_UNIT_UNCONFIRMED', 'the amount unit must be explicitly confirmed (IRR/IRT/IRR_NEW)');
+        END IF;
         SELECT * INTO v_dr FROM migration.dry_run d WHERE d.tenant_id = NEW.tenant_id AND d.id = NEW.preview_dry_run_id AND d.job_id = NEW.id;
+        -- RV-MG-06: dry-run باید آخرین، موفق، روی همین hash و ثبت‌شده پس از آخرین ورود به validated باشد
         IF NOT FOUND OR v_dr.outcome <> 'ok' OR NEW.inputs_hash IS NULL OR v_dr.inputs_hash <> NEW.inputs_hash
-           OR v_dr.seq <> (SELECT max(seq) FROM migration.dry_run d2 WHERE d2.tenant_id = NEW.tenant_id AND d2.job_id = NEW.id) THEN
+           OR v_dr.seq <> (SELECT max(seq) FROM migration.dry_run d2 WHERE d2.tenant_id = NEW.tenant_id AND d2.job_id = NEW.id)
+           OR v_dr.finished_at < OLD.status_changed_at THEN
           PERFORM migration.raise_error('HK_MIG_DRY_RUN_REQUIRED', 'preview needs the latest successful dry-run over the current inputs');
         END IF;
       WHEN 'committing' THEN
+        IF NEW.amount_unit_confirmed_at IS NULL THEN
+          PERFORM migration.raise_error('HK_MIG_UNIT_UNCONFIRMED', 'the amount unit must be explicitly confirmed (IRR/IRT/IRR_NEW)');
+        END IF;
         IF NEW.preview_accepted_by IS NULL THEN
           PERFORM migration.raise_error('HK_MIG_PREVIEW_NOT_ACCEPTED', 'a user must accept the preview before commit');
         END IF;
@@ -1158,40 +1352,56 @@ BEGIN
         IF NOT FOUND OR v_dr.inputs_hash <> NEW.inputs_hash THEN
           PERFORM migration.raise_error('HK_MIG_DRY_RUN_REQUIRED', 'inputs changed since the accepted dry-run');
         END IF;
+        -- RV-MG-15: برنامهٔ ثبت پیش از commit و هم‌زمان با آن ساخته می‌شود و پس از آن ثابت است
+        IF NOT EXISTS (SELECT 1 FROM migration.commit_chunk c WHERE c.tenant_id = NEW.tenant_id AND c.job_id = NEW.id) THEN
+          PERFORM migration.raise_error('HK_MIG_CHUNKS_PENDING', 'plan the commit chunks before committing');
+        END IF;
       WHEN 'committed' THEN
         IF NOT EXISTS (SELECT 1 FROM migration.commit_chunk c WHERE c.tenant_id = NEW.tenant_id AND c.job_id = NEW.id)
            OR EXISTS (SELECT 1 FROM migration.commit_chunk c WHERE c.tenant_id = NEW.tenant_id AND c.job_id = NEW.id AND c.status <> 'done') THEN
           PERFORM migration.raise_error('HK_MIG_CHUNKS_PENDING', 'all commit chunks must be done');
         END IF;
-      WHEN 'reconciled' THEN
-        SELECT r.id INTO v_latest FROM migration.reconciliation r WHERE r.tenant_id = NEW.tenant_id AND r.job_id = NEW.id
-         ORDER BY r.seq DESC LIMIT 1;
-        SELECT * INTO v_rec FROM migration.reconciliation r WHERE r.tenant_id = NEW.tenant_id AND r.id = NEW.reconciliation_id;
-        IF NOT FOUND OR v_rec.id <> v_latest OR v_rec.status <> 'balanced' THEN
-          PERFORM migration.raise_error('HK_MIG_NOT_RECONCILED', 'the latest reconciliation must be balanced (zero unexplained difference)');
-        END IF;
-      WHEN 'live' THEN
-        IF NEW.golive_approved_by IS NULL THEN
-          PERFORM migration.raise_error('HK_MIG_GOLIVE_APPROVAL', 'go-live needs the responsible accountant''s approval');
+      WHEN 'reconciled', 'live' THEN
+        IF NEW.status = 'live' THEN
+          IF NEW.golive_approved_by IS NULL THEN
+            PERFORM migration.raise_error('HK_MIG_GOLIVE_APPROVAL', 'go-live needs the responsible accountant''s approval');
+          END IF;
+          -- RV-MG-13 / D-MG20: تأیید زنده شدن کنش خود حسابدار است (نه سیستم، نه دستیار، نه ورود به‌جای کاربر)
+          PERFORM migration.assert_human_act(NEW.golive_approved_by, 'go-live approval', true);
+          NEW.golive_approved_at := now();
         END IF;
         SELECT r.id INTO v_latest FROM migration.reconciliation r WHERE r.tenant_id = NEW.tenant_id AND r.job_id = NEW.id
          ORDER BY r.seq DESC LIMIT 1;
         SELECT * INTO v_rec FROM migration.reconciliation r WHERE r.tenant_id = NEW.tenant_id AND r.id = NEW.reconciliation_id;
         IF NOT FOUND OR v_rec.id <> v_latest OR v_rec.status <> 'balanced' THEN
-          PERFORM migration.raise_error('HK_MIG_NOT_RECONCILED', 'go-live requires the latest reconciliation to be balanced');
+          PERFORM migration.raise_error('HK_MIG_NOT_RECONCILED',
+            CASE NEW.status WHEN 'live' THEN 'go-live requires the latest reconciliation to be balanced'
+                            ELSE 'the latest reconciliation must be balanced (zero unexplained difference)' END);
         END IF;
-        NEW.locked_at := now();
+        -- RV-MG-03: توضیحی که سطر تطبیق به آن تکیه دارد هنوز تأییدشده است (پس‌گرفتن توضیح، تطبیق تازه می‌خواهد)
+        IF EXISTS (SELECT 1 FROM migration.reconciliation_line l
+                     JOIN migration.explanation e ON e.tenant_id = l.tenant_id AND e.id = l.explanation_id
+                    WHERE l.tenant_id = NEW.tenant_id AND l.reconciliation_id = NEW.reconciliation_id
+                      AND l.line_status = 'explained' AND e.status <> 'approved') THEN
+          PERFORM migration.raise_error('HK_MIG_NOT_RECONCILED', 'an explanation used by the reconciliation is no longer approved; reconcile again');
+        END IF;
+        IF NEW.status = 'live' THEN
+          NEW.locked_at := now();
+        END IF;
       WHEN 'rolled_back' THEN
         IF EXISTS (SELECT 1 FROM migration.posting p WHERE p.tenant_id = NEW.tenant_id AND p.job_id = NEW.id AND p.state = 'live') THEN
           PERFORM migration.raise_error('HK_MIG_ROLLBACK_INCOMPLETE', 'live postings remain; compensate them first');
+        END IF;
+        -- RV-MG-15 / INV-MIG-14: ردیف مرحله‌ای و تداوم ثبت‌شده باید rolled_back شده باشند
+        IF EXISTS (SELECT 1 FROM migration.staged_record s WHERE s.tenant_id = NEW.tenant_id AND s.job_id = NEW.id AND s.status = 'committed')
+           OR EXISTS (SELECT 1 FROM migration.moadian_continuity m WHERE m.tenant_id = NEW.tenant_id AND m.job_id = NEW.id AND m.status = 'committed') THEN
+          PERFORM migration.raise_error('HK_MIG_ROLLBACK_INCOMPLETE', 'committed staged or continuity rows remain; mark them rolled back first');
         END IF;
         NEW.rolled_back_at := now();
       WHEN 'cancelled' THEN
         NEW.cancelled_at := now();
       ELSE NULL;
     END CASE;
-  ELSIF NEW.reconciliation_id IS DISTINCT FROM OLD.reconciliation_id AND OLD.status = 'reconciled' THEN
-    PERFORM migration.raise_error('HK_MIG_NOT_RECONCILED', 'move the job back to committed before switching reconciliations');
   END IF;
   RETURN NEW;
 END $$;
@@ -1202,19 +1412,38 @@ CREATE TRIGGER trg_job_guard BEFORE INSERT OR UPDATE OR DELETE ON migration.job
 DROP TRIGGER IF EXISTS trg_touch ON migration.job;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON migration.job FOR EACH ROW EXECUTE FUNCTION core.touch_row();
 
+-- RV-MG-27: ساخت کار (— → draft)، هر گذار و هر تعویض رضایت (RV-MG-16) با کنشگر در job_event ثبت می‌شود
 CREATE OR REPLACE FUNCTION migration.job_log_event() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE v_actor uuid := (SELECT m.user_id FROM core.tenant_membership m WHERE m.tenant_id = NEW.tenant_id AND m.user_id = core.current_user_id());
 BEGIN
-  IF NEW.status IS DISTINCT FROM OLD.status THEN
+  IF TG_OP = 'INSERT' THEN
     INSERT INTO migration.job_event (tenant_id, job_id, from_status, to_status, actor_id, note)
-    VALUES (NEW.tenant_id, NEW.id, OLD.status, NEW.status,
-            (SELECT m.user_id FROM core.tenant_membership m WHERE m.tenant_id = NEW.tenant_id AND m.user_id = core.current_user_id()),
-            NEW.failure_code);
+    VALUES (NEW.tenant_id, NEW.id, '—', NEW.status, v_actor, NULL);
+  ELSIF NEW.status IS DISTINCT FROM OLD.status THEN
+    INSERT INTO migration.job_event (tenant_id, job_id, from_status, to_status, actor_id, note)
+    VALUES (NEW.tenant_id, NEW.id, OLD.status, NEW.status, v_actor, NEW.failure_code);
+  ELSIF NEW.consent_id IS DISTINCT FROM OLD.consent_id THEN
+    INSERT INTO migration.job_event (tenant_id, job_id, from_status, to_status, actor_id, note)
+    VALUES (NEW.tenant_id, NEW.id, OLD.status, NEW.status, v_actor, 'consent:' || coalesce(NEW.consent_id::text, 'none'));
+  END IF;
+  -- CR-MG05 (ruling: سازوکار عمومی core.export_blocker): در committing و rolling_back صدور .hkx مستأجر بسته است تا
+  -- بسته حالت نیمه نداشته باشد؛ با خروج از آن وضعیت مانع آزاد می‌شود
+  IF TG_OP = 'UPDATE' AND NEW.status IS DISTINCT FROM OLD.status THEN
+    IF OLD.status IN ('committing','rolling_back') THEN
+      UPDATE core.export_blocker b SET released_at = now()
+       WHERE b.tenant_id = NEW.tenant_id AND b.module = 'migration' AND b.resource_id = NEW.id
+         AND b.reason_code = 'migration.job.' || OLD.status AND b.released_at IS NULL;
+    END IF;
+    IF NEW.status IN ('committing','rolling_back') THEN
+      INSERT INTO core.export_blocker (tenant_id, module, reason_code, resource_id)
+      VALUES (NEW.tenant_id, 'migration', 'migration.job.' || NEW.status, NEW.id);
+    END IF;
   END IF;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_job_log_event ON migration.job;
-CREATE TRIGGER trg_job_log_event AFTER UPDATE OF status ON migration.job
+CREATE TRIGGER trg_job_log_event AFTER INSERT OR UPDATE OF status, consent_id ON migration.job
   FOR EACH ROW EXECUTE FUNCTION migration.job_log_event();
 
 DROP TRIGGER IF EXISTS trg_forbid_mutation ON migration.job_event;
@@ -1229,14 +1458,19 @@ BEGIN
     PERFORM migration.raise_error('HK_MIG_CONSENT_IMMUTABLE', 'consents are evidence and are never deleted');
   END IF;
   IF TG_OP = 'INSERT' THEN
-    IF NEW.revoked_at IS NOT NULL THEN
+    IF NEW.revoked_at IS NOT NULL OR NEW.revoked_by IS NOT NULL THEN
       PERFORM migration.raise_error('HK_MIG_CONSENT_IMMUTABLE', 'a consent is recorded un-revoked');
     END IF;
-    IF NEW.signer_user_id IS DISTINCT FROM core.current_user_id() AND core.current_user_id() IS NOT NULL THEN
+    -- RV-MG-13: امضا کنش خود کاربر جاری است؛ زمینهٔ سیستمی (بی app.user_id) یا دستیار نمی‌تواند به نام کسی امضا کند
+    IF core.current_user_id() IS NULL OR NEW.signer_user_id IS DISTINCT FROM core.current_user_id() THEN
       PERFORM migration.raise_error('HK_MIG_CONSENT_SIGNER', 'consent is signed by the acting user only');
     END IF;
+    PERFORM migration.assert_human_act(NEW.signer_user_id, 'signing a consent', true);
+    -- RV-MG-16: رضایت تازه در هر وضعیت غیرپایانی ثبت‌شدنی است (رضایت لغوشده یا منقضی دیگر کار را زندانی نمی‌کند)
     PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id,
-      ARRAY['draft','awaiting_source','staged','mapping','validated','previewed'], 'recording consent');
+      ARRAY['draft','awaiting_source','staged','mapping','validated','previewed','committing','committed','reconciled',
+            'rolling_back','failed'], 'recording consent');
+    NEW.accepted_at := now();                         -- زمان امضا = زمان سرور (شاهد)
     RETURN NEW;
   END IF;
   IF OLD.revoked_at IS NOT NULL
@@ -1248,6 +1482,10 @@ BEGIN
          OLD.signer_user_id, OLD.signer_full_name, OLD.signer_capacity, OLD.written_form_attachment_id, OLD.scope,
          OLD.accepted_at, OLD.valid_until, OLD.client_ip, OLD.user_agent_sha256) THEN
     PERFORM migration.raise_error('HK_MIG_CONSENT_IMMUTABLE', 'a consent can only be revoked once');
+  END IF;
+  IF NEW.revoked_by IS NOT NULL THEN
+    PERFORM migration.assert_human_act(NEW.revoked_by, 'revoking a consent');
+    NEW.revoked_at := now();
   END IF;
   RETURN NEW;
 END $$;
@@ -1295,9 +1533,25 @@ BEGIN
     -- INV-MIG-01: هیچ دادهٔ مبدأ (فایل، اعتبارنامه، عامل) پیش از رضایت وارد نمی‌شود
     PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['awaiting_source','staged','mapping','failed'],
                                         format('adding %s', TG_TABLE_NAME));
+    -- RV-MG-14: ماشین حالت از درج هم اجرا می‌شود؛ زمان ساخت = زمان سرور (پنجرهٔ ۲۴ ساعته و ۳۰ روزه از آن سنجیده می‌شود)
+    IF TG_TABLE_NAME = 'upload' THEN
+      IF NEW.status <> 'pending_upload' OR NEW.uploaded_at IS NOT NULL OR NEW.purged_at IS NOT NULL THEN
+        PERFORM migration.raise_error('HK_MIG_INTAKE_INITIAL', 'an upload starts pending_upload');
+      END IF;
+    ELSIF TG_TABLE_NAME = 'agent_session' THEN
+      IF NEW.status <> 'pending' OR NEW.agent_public_key IS NOT NULL OR NEW.token_hash IS NOT NULL
+         OR NEW.token_expires_at IS NOT NULL OR NEW.paired_at IS NOT NULL THEN
+        PERFORM migration.raise_error('HK_MIG_INTAKE_INITIAL', 'an agent session starts pending, without key or token');
+      END IF;
+    ELSIF TG_TABLE_NAME = 'source_credential' THEN
+      IF NEW.status <> 'active' OR NEW.purged_at IS NOT NULL THEN
+        PERFORM migration.raise_error('HK_MIG_INTAKE_INITIAL', 'a credential starts active');
+      END IF;
+    END IF;
+    NEW.created_at := now();
     RETURN NEW;
   END IF;
-  IF (NEW.tenant_id, NEW.id, NEW.job_id) IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.job_id) THEN
+  IF (NEW.tenant_id, NEW.id, NEW.job_id, NEW.created_at) IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.job_id, OLD.created_at) THEN
     PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'identity is immutable');
   END IF;
   IF TG_TABLE_NAME = 'upload' THEN
@@ -1319,7 +1573,7 @@ BEGIN
     IF OLD.agent_public_key IS NOT NULL AND NEW.agent_public_key IS DISTINCT FROM OLD.agent_public_key THEN
       PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'agent key is bound once');
     END IF;
-    IF NEW.pairing_code_hash IS DISTINCT FROM OLD.pairing_code_hash THEN
+    IF NEW.pairing_code_hash IS DISTINCT FROM OLD.pairing_code_hash OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
       PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'pairing code is single-use');
     END IF;
     IF NEW.status <> OLD.status AND (OLD.status, NEW.status) NOT IN (
@@ -1337,7 +1591,7 @@ BEGIN
     IF OLD.status <> 'active' THEN
       PERFORM migration.raise_error('HK_MIG_PURGED', 'a purged or revoked credential is final');
     END IF;
-    IF (NEW.kind, NEW.endpoint_base, NEW.secret_ref) IS DISTINCT FROM (OLD.kind, OLD.endpoint_base, OLD.secret_ref) THEN
+    IF (NEW.kind, NEW.endpoint_base, NEW.secret_ref, NEW.purge_after) IS DISTINCT FROM (OLD.kind, OLD.endpoint_base, OLD.secret_ref, OLD.purge_after) THEN
       PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'credential reference is immutable; create a new one');
     END IF;
   END IF;
@@ -1359,7 +1613,7 @@ CREATE TRIGGER trg_touch BEFORE UPDATE ON migration.source_credential FOR EACH R
 -- ---------- بستهٔ HIF ----------
 CREATE OR REPLACE FUNCTION migration.package_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_rows bigint; v_session record;
+DECLARE v_rows jsonb; v_session record;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     PERFORM migration.raise_error('HK_MIG_NO_DELETE', 'packages are superseded, never deleted');
@@ -1369,19 +1623,22 @@ BEGIN
     IF NEW.status <> 'received' THEN
       PERFORM migration.raise_error('HK_MIG_PACKAGE_TRANSITION', 'a package starts as received');
     END IF;
-    IF NEW.producer = 'agent' THEN
+    IF NEW.producer = 'agent' AND NEW.agent_session_id IS NOT NULL THEN
       SELECT * INTO v_session FROM migration.agent_session a WHERE a.tenant_id = NEW.tenant_id AND a.id = NEW.agent_session_id;
-      IF v_session.status <> 'paired' THEN
+      IF v_session.status IS DISTINCT FROM 'paired' THEN
         PERFORM migration.raise_error('HK_MIG_AGENT_NOT_PAIRED', 'agent packages need a paired agent session');
       END IF;
     END IF;
+    NEW.created_at := now();
     RETURN NEW;
   END IF;
   IF (NEW.tenant_id, NEW.id, NEW.job_id, NEW.upload_id, NEW.producer, NEW.agent_session_id, NEW.format_version, NEW.manifest,
-      NEW.manifest_sha256, NEW.signer_key_id, NEW.source_system, NEW.source_db, NEW.amount_unit, NEW.row_count_total, NEW.extracted_at)
+      NEW.manifest_sha256, NEW.signer_key_id, NEW.source_system, NEW.source_db, NEW.amount_unit, NEW.row_count_total, NEW.extracted_at,
+      NEW.created_at)
      IS DISTINCT FROM
      (OLD.tenant_id, OLD.id, OLD.job_id, OLD.upload_id, OLD.producer, OLD.agent_session_id, OLD.format_version, OLD.manifest,
-      OLD.manifest_sha256, OLD.signer_key_id, OLD.source_system, OLD.source_db, OLD.amount_unit, OLD.row_count_total, OLD.extracted_at) THEN
+      OLD.manifest_sha256, OLD.signer_key_id, OLD.source_system, OLD.source_db, OLD.amount_unit, OLD.row_count_total, OLD.extracted_at,
+      OLD.created_at) THEN
     PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'package manifest is immutable');
   END IF;
   IF NEW.status <> OLD.status THEN
@@ -1389,11 +1646,19 @@ BEGIN
       PERFORM migration.raise_error('HK_MIG_PACKAGE_TRANSITION', format('package %s -> %s is not allowed', OLD.status, NEW.status));
     END IF;
     IF NEW.status = 'verified' THEN
-      -- INV-MIG-04: شمار ردیف خام بارگذاری‌شده = شمار اعلام‌شده در manifest
-      SELECT count(*) INTO v_rows FROM migration.raw_record r WHERE r.tenant_id = NEW.tenant_id AND r.package_id = NEW.id;
-      IF v_rows <> NEW.row_count_total THEN
-        PERFORM migration.raise_error('HK_MIG_ROW_COUNT_MISMATCH', format('manifest declares %s rows but %s were loaded', NEW.row_count_total, v_rows));
+      -- INV-MIG-04 (RV-MG-18): شمار ردیف خام بارگذاری‌شدهٔ هر جدول = files[].rows همان جدول در manifest
+      -- (row_count_total با CHECK manifest_rows_ok برابر جمع همین‌هاست)
+      SELECT coalesce(jsonb_object_agg(x.source_table, x.n), '{}') INTO v_rows
+        FROM (SELECT r.source_table, count(*) AS n FROM migration.raw_record r
+               WHERE r.tenant_id = NEW.tenant_id AND r.package_id = NEW.id GROUP BY r.source_table) x;
+      IF v_rows IS DISTINCT FROM (SELECT coalesce(jsonb_object_agg(e.key, e.value), '{}')
+                                    FROM jsonb_each(migration.manifest_raw_counts(NEW.manifest)) e WHERE e.value <> '0'::jsonb) THEN
+        PERFORM migration.raise_error('HK_MIG_ROW_COUNT_MISMATCH',
+          format('manifest declares %s rows (%s) but %s were loaded', NEW.row_count_total, migration.manifest_raw_counts(NEW.manifest), v_rows));
       END IF;
+      NEW.verified_at := now();
+    ELSIF NEW.status = 'superseded' THEN
+      NEW.superseded_at := now();
     END IF;
   END IF;
   RETURN NEW;
@@ -1402,15 +1667,24 @@ DROP TRIGGER IF EXISTS trg_package_guard ON migration.package;
 CREATE TRIGGER trg_package_guard BEFORE INSERT OR UPDATE OR DELETE ON migration.package FOR EACH ROW EXECUTE FUNCTION migration.package_guard();
 
 -- ---------- snapshot خام: درج فقط در بارگذاری؛ بدون ویرایش؛ حذف فقط در پاک‌سازی ----------
+-- شرط پاک‌سازی نگهداری (INV-MIG-33): GUC تراکنشی hk.migration_purge، کار پایانی و مهلت نگهداری گذشته
+CREATE OR REPLACE FUNCTION migration.purge_allowed(p_tenant uuid, p_job uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT coalesce(current_setting('hk.migration_purge', true), '') = 'on'
+     AND EXISTS (SELECT 1 FROM migration.job j WHERE j.tenant_id = p_tenant AND j.id = p_job
+                   AND j.status IN ('live','rolled_back','cancelled') AND j.raw_retain_until IS NOT NULL AND j.raw_retain_until <= now())
+$$;
+
 CREATE OR REPLACE FUNCTION migration.raw_record_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_pkg text; v_job text; v_retain timestamptz;
+DECLARE v_pkg text;
 BEGIN
   IF TG_OP = 'UPDATE' THEN
     PERFORM migration.raise_error('HK_MIG_RAW_IMMUTABLE', 'raw source rows are an immutable snapshot');
   END IF;
   IF TG_OP = 'INSERT' THEN
-    SELECT p.status INTO v_pkg FROM migration.package p WHERE p.tenant_id = NEW.tenant_id AND p.id = NEW.package_id;
+    -- RV-MG-02: وضعیت بسته با FOR SHARE خوانده می‌شود تا verify هم‌زمان شمار را از دست ندهد
+    SELECT p.status INTO v_pkg FROM migration.package p WHERE p.tenant_id = NEW.tenant_id AND p.id = NEW.package_id FOR SHARE;
     IF v_pkg IS DISTINCT FROM 'received' THEN
       PERFORM migration.raise_error('HK_MIG_RAW_IMMUTABLE', 'raw rows are loaded only while the package is received');
     END IF;
@@ -1421,8 +1695,7 @@ BEGIN
     PERFORM migration.raise_error('HK_MIG_RAW_IMMUTABLE', 'raw rows are removed only by the retention purge');
   END IF;
   SELECT p.status INTO v_pkg FROM migration.package p WHERE p.tenant_id = OLD.tenant_id AND p.id = OLD.package_id;
-  SELECT j.status, j.raw_retain_until INTO v_job, v_retain FROM migration.job j WHERE j.tenant_id = OLD.tenant_id AND j.id = OLD.job_id;
-  IF NOT (v_pkg IN ('rejected','superseded') OR (v_job IN ('live','rolled_back','cancelled') AND v_retain IS NOT NULL AND v_retain <= now())) THEN
+  IF NOT (v_pkg IN ('rejected','superseded') OR migration.purge_allowed(OLD.tenant_id, OLD.job_id)) THEN
     PERFORM migration.raise_error('HK_MIG_RETENTION', 'raw rows are kept until the job ends and its retention period passes');
   END IF;
   IF EXISTS (SELECT 1 FROM migration.staged_record s WHERE s.tenant_id = OLD.tenant_id AND s.job_id = OLD.job_id
@@ -1446,22 +1719,25 @@ DECLARE
   v_content_changed boolean;
 BEGIN
   IF TG_OP = 'DELETE' THEN
-    v_job := migration.job_status_of(OLD.tenant_id, OLD.job_id);
-    IF OLD.status IN ('committed','rolled_back')
-       OR NOT (v_job IN ('staged','mapping','awaiting_source','failed','cancelled')
-               OR (coalesce(current_setting('hk.migration_purge', true), '') = 'on' AND v_job IN ('live','rolled_back','cancelled'))) THEN
-      PERFORM migration.raise_error('HK_MIG_STAGED_FROZEN', 'committed staged rows and rows of a frozen job cannot be deleted');
+    v_job := migration.lock_job_status(OLD.tenant_id, OLD.job_id);
+    -- RV-MG-08 / INV-MIG-33: پاک‌سازی نگهداری کار پایانی (پس از مهلت) ردیف ثبت‌شده را هم پاک می‌کند؛
+    -- lineage در ستون‌های posting می‌ماند و posting.staged_record_id با FK به NULL می‌رود
+    IF migration.purge_allowed(OLD.tenant_id, OLD.job_id) THEN
+      RETURN OLD;
+    END IF;
+    IF OLD.status IN ('committed','rolled_back') OR NOT (coalesce(v_job, '') IN ('staged','mapping','awaiting_source','failed','cancelled')) THEN
+      PERFORM migration.raise_error('HK_MIG_STAGED_FROZEN', 'committed staged rows and rows of a frozen job cannot be deleted (only the retention purge)');
     END IF;
     RETURN OLD;
   END IF;
 
-  v_job := migration.job_status_of(NEW.tenant_id, NEW.job_id);
+  v_job := migration.lock_job_status(NEW.tenant_id, NEW.job_id);
 
   IF TG_OP = 'INSERT' THEN
-    IF v_job NOT IN ('staged','mapping') THEN
+    IF NOT (coalesce(v_job, '') IN ('staged','mapping')) THEN
       PERFORM migration.raise_error('HK_MIG_JOB_STATE', format('staging rows is not allowed while the job is %s', v_job));
     END IF;
-    IF NEW.status NOT IN ('pending','excluded','blocked') THEN
+    IF NEW.status NOT IN ('pending','excluded','blocked') OR NEW.committed_chunk IS NOT NULL THEN
       PERFORM migration.raise_error('HK_MIG_STAGED_TRANSITION', 'staged rows start pending, excluded or blocked');
     END IF;
     v_content_changed := true;
@@ -1484,7 +1760,8 @@ BEGIN
       RETURN NEW;
     END IF;
     IF NEW.status = 'committed' THEN
-      IF v_job <> 'committing' OR v_content_changed THEN
+      -- RV-MG-22: dry-run حالت full_tx همان گام را روی کار validated اجرا می‌کند (تراکنشش هرگز commit نمی‌شود)
+      IF NOT (v_job = 'committing' OR (v_job = 'validated' AND migration.in_dry_run())) OR v_content_changed THEN
         PERFORM migration.raise_error('HK_MIG_STAGED_FROZEN', 'rows are committed only by the commit stage, without content changes');
       END IF;
       IF OLD.status NOT IN ('valid','warning') THEN
@@ -1492,9 +1769,10 @@ BEGIN
       END IF;
     ELSIF NEW.status = 'rolled_back' THEN
       PERFORM migration.raise_error('HK_MIG_STAGED_TRANSITION', 'only committed rows are rolled back');
-    ELSIF v_content_changed OR NEW.status <> OLD.status OR (NEW.target_kind, NEW.target_id) IS DISTINCT FROM (OLD.target_kind, OLD.target_id) THEN
-      -- INV-MIG-13: ویرایش فقط در مرحلهٔ نگاشت
-      IF v_job NOT IN ('staged','mapping') THEN
+    ELSIF v_content_changed OR NEW.status <> OLD.status OR (NEW.target_kind, NEW.target_id, NEW.committed_chunk)
+                                                            IS DISTINCT FROM (OLD.target_kind, OLD.target_id, OLD.committed_chunk) THEN
+      -- INV-MIG-13: ویرایش فقط در مرحلهٔ نگاشت (و failed که بازگشتش از mapping می‌گذرد)
+      IF NOT (coalesce(v_job, '') IN ('staged','mapping','failed')) THEN
         PERFORM migration.raise_error('HK_MIG_INPUTS_FROZEN', format('staged rows cannot change while the job is %s', v_job));
       END IF;
     END IF;
@@ -1549,10 +1827,18 @@ CREATE TRIGGER trg_staged_record_guard BEFORE INSERT OR UPDATE OR DELETE ON migr
 DROP TRIGGER IF EXISTS trg_touch ON migration.staged_record;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON migration.staged_record FOR EACH ROW EXECUTE FUNCTION core.touch_row();
 
--- سطر مسدود ← سند والد مسدود؛ تغییر محتوای سطر ← سند معتبر دوباره pending (اعتبارسنجی دوباره)
+-- سطر مسدود ← سند والد مسدود؛ تغییر یا حذف سطر ← سند معتبر دوباره pending (اعتبارسنجی دوباره؛ RV-MG-06)
 CREATE OR REPLACE FUNCTION migration.staged_child_cascade() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
+  IF TG_OP = 'DELETE' THEN
+    -- در وضعیت‌های ویرایش‌پذیر والد باز می‌شود؛ در بقیه (استخراج دوباره، لغو، پاک‌سازی) گیت validated مجموعه را بازمی‌سنجد
+    IF migration.job_status_of(OLD.tenant_id, OLD.job_id) IN ('staged','mapping','failed') THEN
+      UPDATE migration.staged_record p SET status = 'pending'
+       WHERE p.tenant_id = OLD.tenant_id AND p.job_id = OLD.job_id AND p.id = OLD.parent_id AND p.status IN ('valid','warning');
+    END IF;
+    RETURN NULL;
+  END IF;
   IF NEW.parent_id IS NULL THEN RETURN NULL; END IF;
   IF NEW.status = 'blocked' THEN
     UPDATE migration.staged_record p SET status = 'blocked'
@@ -1567,22 +1853,52 @@ END $$;
 DROP TRIGGER IF EXISTS trg_staged_child_cascade ON migration.staged_record;
 CREATE TRIGGER trg_staged_child_cascade AFTER INSERT OR UPDATE OF status, debit, credit, mapped ON migration.staged_record
   FOR EACH ROW WHEN (NEW.parent_id IS NOT NULL) EXECUTE FUNCTION migration.staged_child_cascade();
+DROP TRIGGER IF EXISTS trg_staged_child_delete ON migration.staged_record;
+CREATE TRIGGER trg_staged_child_delete AFTER DELETE ON migration.staged_record
+  FOR EACH ROW WHEN (OLD.parent_id IS NOT NULL) EXECUTE FUNCTION migration.staged_child_cascade();
 
 -- ---------- id_map ----------
 CREATE OR REPLACE FUNCTION migration.id_map_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE v_status text; v_rehearsal boolean;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     PERFORM migration.raise_error('HK_MIG_NO_DELETE', 'id map rows are retired, never deleted');
   END IF;
-  IF (NEW.tenant_id, NEW.id, NEW.source_system, NEW.source_db, NEW.source_table, NEW.source_key, NEW.target_kind, NEW.target_id, NEW.first_job_id, NEW.created_at)
-     IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.source_system, OLD.source_db, OLD.source_table, OLD.source_key, OLD.target_kind, OLD.target_id, OLD.first_job_id, OLD.created_at) THEN
+  IF TG_OP = 'UPDATE' AND
+     (NEW.tenant_id, NEW.id, NEW.company_id, NEW.source_system, NEW.source_db, NEW.source_table, NEW.source_key, NEW.target_kind,
+      NEW.target_id, NEW.link_method, NEW.first_job_id, NEW.created_at)
+     IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.company_id, OLD.source_system, OLD.source_db, OLD.source_table, OLD.source_key,
+      OLD.target_kind, OLD.target_id, OLD.link_method, OLD.first_job_id, OLD.created_at) THEN
     PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'a source record keeps its target forever (re-runs update, never re-point)');
+  END IF;
+  -- نگاشت شناسه را فقط مرحلهٔ commit کاری که آن را لمس می‌کند (یا dry-run آن، یا جبرانش) می‌نویسد
+  v_status := migration.lock_job_status(NEW.tenant_id, NEW.last_job_id);
+  IF NOT (v_status IN ('committing','rolling_back') OR (v_status = 'validated' AND migration.in_dry_run())) THEN
+    PERFORM migration.raise_error('HK_MIG_JOB_STATE', format('writing the id map is not allowed while the job is %s', coalesce(v_status, 'missing')));
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.first_job_id IS DISTINCT FROM NEW.last_job_id THEN
+      PERFORM migration.raise_error('HK_MIG_LINEAGE', 'a new id map row names the same first and last job');
+    END IF;
+    -- RV-MG-01: یک رکورد مبدأ یا به یک مقصد مشترک مستأجر نگاشت می‌شود یا به مقصدهای شرکتی، نه هر دو
+    IF EXISTS (SELECT 1 FROM migration.id_map m
+                WHERE m.tenant_id = NEW.tenant_id AND m.source_system = NEW.source_system AND m.source_db = NEW.source_db
+                  AND m.source_table = NEW.source_table AND m.source_key = NEW.source_key AND m.target_kind = NEW.target_kind
+                  AND (m.company_id IS NULL) <> (NEW.company_id IS NULL)) THEN
+      PERFORM migration.raise_error('HK_MIG_IDMAP_SCOPE', 'a source record maps either to one tenant-shared target or to company targets');
+    END IF;
+    -- RV-MG-01 / CR-MG14: کار تمرینی دادهٔ پایهٔ مشترک مستأجر نمی‌سازد (فقط در شرکت تمرینی)
+    SELECT j.is_rehearsal INTO v_rehearsal FROM migration.job j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.first_job_id;
+    IF v_rehearsal AND NEW.company_id IS NULL AND NEW.link_method = 'created' THEN
+      PERFORM migration.raise_error('HK_MIG_REHEARSAL_SCOPE', 'a rehearsal job creates only company-scoped targets in its rehearsal company');
+    END IF;
+    NEW.created_at := now();
   END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_id_map_guard ON migration.id_map;
-CREATE TRIGGER trg_id_map_guard BEFORE UPDATE OR DELETE ON migration.id_map FOR EACH ROW EXECUTE FUNCTION migration.id_map_guard();
+CREATE TRIGGER trg_id_map_guard BEFORE INSERT OR UPDATE OR DELETE ON migration.id_map FOR EACH ROW EXECUTE FUNCTION migration.id_map_guard();
 DROP TRIGGER IF EXISTS trg_touch ON migration.id_map;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON migration.id_map FOR EACH ROW EXECUTE FUNCTION core.touch_row();
 
@@ -1592,6 +1908,8 @@ LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN
     IF OLD.job_id IS NOT NULL THEN
+      -- RV-MG-08: نگاشت‌های کاری (با مقدار مبدأ، مثل نام شخص) در پاک‌سازی نگهداری کار پایانی پاک می‌شوند
+      IF migration.purge_allowed(OLD.tenant_id, OLD.job_id) THEN RETURN OLD; END IF;
       PERFORM migration.assert_job_status(OLD.tenant_id, OLD.job_id, ARRAY['staged','mapping'], 'changing job mappings');
     END IF;
     RETURN OLD;
@@ -1608,6 +1926,12 @@ BEGIN
   IF NEW.kind = 'column' AND NEW.source_value_norm <> migration.norm_header(NEW.source_value) THEN
     PERFORM migration.raise_error('HK_MIG_HEADER_NORM', 'column mappings are keyed by the normalized header');
   END IF;
+  -- RV-MG-13 / INV-MIG-09/10: «تأیید انسانی» کنش خود کاربر جاری است، نه کنشگری که برنامه به ستون می‌نویسد
+  IF NEW.confirmed_by IS NOT NULL
+     AND (TG_OP = 'INSERT' OR (NEW.confirmed_by, NEW.confirmed_at) IS DISTINCT FROM (OLD.confirmed_by, OLD.confirmed_at)) THEN
+    PERFORM migration.assert_human_act(NEW.confirmed_by, 'confirming a mapping');
+    NEW.confirmed_at := now();
+  END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_mapping_guard ON migration.mapping;
@@ -1621,6 +1945,8 @@ LANGUAGE plpgsql AS $$
 DECLARE c record;
 BEGIN
   IF TG_OP = 'DELETE' THEN
+    -- RV-MG-08: فقط پاک‌سازی نگهداری کار پایانی (پیش از ردیف‌های مرحله‌ای و خام)
+    IF migration.purge_allowed(OLD.tenant_id, OLD.job_id) THEN RETURN OLD; END IF;
     PERFORM migration.raise_error('HK_MIG_NO_DELETE', 'issues are resolved or overridden, never deleted');
   END IF;
   SELECT * INTO c FROM migration.issue_code ic WHERE ic.code = NEW.code;
@@ -1647,6 +1973,15 @@ BEGIN
     IF NEW.status = 'overridden' AND NOT c.overridable THEN
       PERFORM migration.raise_error('HK_MIG_NOT_OVERRIDABLE', format('%s cannot be overridden', NEW.code));
     END IF;
+    IF NEW.status = 'overridden' AND NEW.overridden_by IS NOT NULL THEN
+      PERFORM migration.assert_human_act(NEW.overridden_by, 'overriding an issue');            -- RV-MG-13
+      NEW.overridden_at := now();
+    ELSIF NEW.status = 'resolved' THEN
+      NEW.resolved_at := now();
+    END IF;
+  ELSIF (NEW.overridden_by, NEW.overridden_at, NEW.override_reason, NEW.resolved_at)
+        IS DISTINCT FROM (OLD.overridden_by, OLD.overridden_at, OLD.override_reason, OLD.resolved_at) THEN
+    PERFORM migration.raise_error('HK_MIG_ISSUE_TRANSITION', 'the resolution is recorded with the status change');
   END IF;
   RETURN NEW;
 END $$;
@@ -1663,6 +1998,7 @@ BEGIN
   IF NEW.seq <> coalesce((SELECT max(seq) FROM migration.dry_run d WHERE d.tenant_id = NEW.tenant_id AND d.job_id = NEW.job_id), 0) + 1 THEN
     PERFORM migration.raise_error('HK_MIG_SEQ', 'dry-run sequence is gapless');
   END IF;
+  NEW.finished_at := now();          -- RV-MG-06: گیت previewed dry-run ثبت‌شده پیش از آخرین ورود به validated را نمی‌پذیرد
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_dry_run_guard ON migration.dry_run;
@@ -1673,14 +2009,33 @@ CREATE TRIGGER trg_forbid_mutation BEFORE UPDATE OR DELETE ON migration.dry_run 
 -- ---------- تکهٔ ثبت ----------
 CREATE OR REPLACE FUNCTION migration.commit_chunk_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE v_job record; v_status text;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     PERFORM migration.raise_error('HK_MIG_NO_DELETE', 'commit chunks are checkpoints and are never deleted');
   END IF;
   IF TG_OP = 'INSERT' THEN
-    PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['previewed','committing'], 'planning commit chunks');
-    IF NEW.status <> 'pending' OR NEW.done_count <> 0 THEN
+    v_status := migration.lock_job_status(NEW.tenant_id, NEW.job_id);
+    -- RV-MG-15: برنامهٔ ثبت فقط در previewed (و در همان تراکنشِ گذار به committing) یا در dry-run ساخته می‌شود؛ پس از آن ثابت است
+    IF NOT (v_status = 'previewed' OR (v_status = 'validated' AND migration.in_dry_run())) THEN
+      PERFORM migration.raise_error('HK_MIG_JOB_STATE', format('planning commit chunks is not allowed while the job is %s', coalesce(v_status, 'missing')));
+    END IF;
+    IF NEW.status <> 'pending' OR NEW.done_count <> 0 OR NEW.attempts <> 0 OR NEW.started_at IS NOT NULL OR NEW.finished_at IS NOT NULL THEN
       PERFORM migration.raise_error('HK_MIG_CHUNK_TRANSITION', 'chunks start pending');
+    END IF;
+    SELECT j.mode, j.is_rehearsal INTO v_job FROM migration.job j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.job_id;
+    IF (v_job.mode = 'archive') <> (NEW.stage = 'archive') THEN
+      PERFORM migration.raise_error('HK_MIG_CHUNK_STAGE', 'an archive job has only archive chunks, and only an archive job has them');
+    END IF;
+    -- RV-MG-01 / CR-MG14: تمرین هرگز حافظهٔ مؤدیان (یکتا در مستأجر) را لمس نمی‌کند
+    IF v_job.is_rehearsal AND NEW.stage = 'tax_continuity' THEN
+      PERFORM migration.raise_error('HK_MIG_REHEARSAL_SCOPE', 'a rehearsal job never registers Moadian continuity');
+    END IF;
+    -- D-MG17 / INV-MIG-18: ترتیب ثابت مرحله‌ها با شمارهٔ تکه هم‌جهت است
+    IF EXISTS (SELECT 1 FROM migration.commit_chunk c WHERE c.tenant_id = NEW.tenant_id AND c.job_id = NEW.job_id
+                 AND ((c.chunk_no < NEW.chunk_no AND migration.stage_rank(c.stage) > migration.stage_rank(NEW.stage))
+                   OR (c.chunk_no > NEW.chunk_no AND migration.stage_rank(c.stage) < migration.stage_rank(NEW.stage)))) THEN
+      PERFORM migration.raise_error('HK_MIG_CHUNK_ORDER', format('stage %s is out of the fixed stage order', NEW.stage));
     END IF;
     RETURN NEW;
   END IF;
@@ -1693,7 +2048,10 @@ BEGIN
       PERFORM migration.raise_error('HK_MIG_CHUNK_TRANSITION', format('chunk %s -> %s is not allowed', OLD.status, NEW.status));
     END IF;
     IF NEW.status = 'running' THEN
-      PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['committing'], 'running a commit chunk');
+      v_status := migration.lock_job_status(NEW.tenant_id, NEW.job_id);
+      IF NOT (v_status = 'committing' OR (v_status = 'validated' AND migration.in_dry_run())) THEN
+        PERFORM migration.raise_error('HK_MIG_JOB_STATE', format('running a commit chunk is not allowed while the job is %s', coalesce(v_status, 'missing')));
+      END IF;
       -- INV-MIG-18: ترتیب وابستگی: هیچ تکه پیش از تمام شدن تکه‌های قبلی اجرا نمی‌شود
       IF EXISTS (SELECT 1 FROM migration.commit_chunk c WHERE c.tenant_id = NEW.tenant_id AND c.job_id = NEW.job_id
                    AND c.chunk_no < NEW.chunk_no AND c.status <> 'done') THEN
@@ -1717,41 +2075,91 @@ CREATE TRIGGER trg_touch BEFORE UPDATE ON migration.commit_chunk FOR EACH ROW EX
 -- ---------- دفتر اثرهای مهاجرت ----------
 CREATE OR REPLACE FUNCTION migration.posting_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_chunk text; v_staged record;
+DECLARE v_status text; v_company uuid; v_chunk text; v_staged record; v_entity text; v_class text; v_policy text; v_jr record;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     PERFORM migration.raise_error('HK_MIG_NO_DELETE', 'postings are compensated, never deleted');
   END IF;
   IF TG_OP = 'INSERT' THEN
-    PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['committing'], 'recording a posting');
+    v_status := migration.lock_job_status(NEW.tenant_id, NEW.job_id);
+    IF NOT (v_status = 'committing' OR (v_status = 'validated' AND migration.in_dry_run())) THEN
+      PERFORM migration.raise_error('HK_MIG_JOB_STATE', format('recording a posting is not allowed while the job is %s', coalesce(v_status, 'missing')));
+    END IF;
+    SELECT j.company_id INTO v_company FROM migration.job j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.job_id;
+    NEW.company_id := coalesce(NEW.company_id, v_company);          -- FK سه‌ستونی برابری با شرکت کار را می‌سنجد
     SELECT status INTO v_chunk FROM migration.commit_chunk c WHERE c.tenant_id = NEW.tenant_id AND c.job_id = NEW.job_id AND c.chunk_no = NEW.chunk_no;
     IF v_chunk IS DISTINCT FROM 'running' THEN
       PERFORM migration.raise_error('HK_MIG_CHUNK_STATE', 'postings are recorded only inside a running chunk');
     END IF;
-    IF NEW.state <> 'live' THEN
+    IF NEW.state <> 'live' OR NEW.compensation_kind IS NOT NULL OR NEW.compensation_doc_id IS NOT NULL OR NEW.compensated_at IS NOT NULL THEN
       PERFORM migration.raise_error('HK_MIG_POSTING_TRANSITION', 'postings start live');
     END IF;
+    NEW.posted_at := now();
     IF NEW.staged_record_id IS NOT NULL THEN
-      SELECT entity, disposition, source_system, source_db, source_table, source_key INTO v_staged
-        FROM migration.staged_record s WHERE s.tenant_id = NEW.tenant_id AND s.id = NEW.staged_record_id;
+      SELECT entity, disposition, partition_class, legacy_code, source_system, source_db, source_table, source_key INTO v_staged
+        FROM migration.staged_record s WHERE s.tenant_id = NEW.tenant_id AND s.job_id = NEW.job_id AND s.id = NEW.staged_record_id;
       IF (v_staged.source_system, v_staged.source_db, v_staged.source_table, v_staged.source_key)
          IS DISTINCT FROM (NEW.source_system, NEW.source_db, NEW.source_table, NEW.source_key) THEN
         PERFORM migration.raise_error('HK_MIG_LINEAGE', 'posting lineage must equal the staged row lineage');
       END IF;
+      v_entity := v_staged.entity;
+      -- RV-MG-08 / RV-MG-19: lineage در خود posting کپی می‌شود (پس از پاک‌سازی و پس از جابه‌جایی .hkx می‌ماند)
+      NEW.staged_entity := v_staged.entity;
+      NEW.legacy_code := v_staged.legacy_code;
+      NEW.partition_class := v_staged.partition_class;
+      NEW.disposition := v_staged.disposition;
       -- INV-MIG-08: سندی که ماژول تخصصی بازسازی می‌کند (regenerate) یا کنار گذاشته شده، دوباره در دفتر کل ثبت نمی‌شود
-      IF v_staged.entity = 'voucher' AND (NEW.target_doc_type = 'ledger.journal' OR NEW.gl_effect = 'posted')
+      IF v_entity = 'voucher' AND (NEW.target_doc_type = 'ledger.journal' OR NEW.gl_effect = 'posted')
          AND v_staged.disposition NOT IN ('opening_gl','history_gl') THEN
         PERFORM migration.raise_error('HK_MIG_DOUBLE_POSTING', format('voucher %s is %s; its GL comes from the specialised module or is skipped',
                                                                        v_staged.source_key, v_staged.disposition));
       END IF;
+      -- D-MG10 / INV-MIG-38 (RV-MG-07): فقط تراز افتتاحیه، سند مبدأ و سند بازسازی‌شده اثر GL دارند؛
+      -- موقعیت زیردفترها و دادهٔ پایه همیشه بی‌GL‌اند
+      IF NEW.gl_effect = 'posted' AND v_entity NOT IN ('opening_balance_line','voucher','invoice_history','receipt_payment') THEN
+        PERFORM migration.raise_error('HK_MIG_DOUBLE_POSTING', format('%s rows never post to the GL; sub-ledger positions and master data are GL-free', v_entity));
+      END IF;
+      -- RV-MG-07: سند بازسازی‌شده با GL فقط وقتی کلاسش در این کار regenerate است؛ وگرنه سند GL مبدأ (history_gl) همان را ثبت کرده است
+      IF NEW.gl_effect = 'posted' AND v_entity IN ('invoice_history','receipt_payment') THEN
+        v_class := CASE v_entity WHEN 'invoice_history' THEN 'INVOICE' ELSE 'RECEIPT_PAYMENT' END;
+        SELECT p.disposition INTO v_policy FROM migration.job_partition_policy p
+         WHERE p.tenant_id = NEW.tenant_id AND p.job_id = NEW.job_id AND p.partition_class = v_class;
+        IF v_policy IS NOT NULL AND v_policy <> 'regenerate' THEN
+          PERFORM migration.raise_error('HK_MIG_DOUBLE_POSTING', format('class %s is %s in this job; regenerated documents carry no GL (gl_mode=none)', v_class, v_policy));
+        END IF;
+      END IF;
+    ELSIF NEW.gl_effect = 'posted'
+          AND NOT (NEW.target_module = 'migration' AND NEW.target_doc_type IN ('migration.period_summary','migration.inventory_conversion')) THEN
+      -- RV-MG-07: ثبت GL بدون رکورد مرحله‌ای فقط برای سندهای مشتق خود migration (خلاصهٔ دوره، تبدیل ادواری به دائمی)
+      PERFORM migration.raise_error('HK_MIG_LINEAGE', 'a GL posting names its staged record (only migration summary and conversion journals are derived)');
+    END IF;
+    -- RV-MG-07 / INV-MIG-36: سند دفتر کل از همان شرکت (FK سه‌ستونی) و از منشأ درست است
+    IF NEW.journal_id IS NOT NULL THEN
+      SELECT j.source_module, j.journal_type, j.source_doc_id INTO v_jr
+        FROM ledger.journal j WHERE j.tenant_id = NEW.tenant_id AND j.company_id = NEW.company_id AND j.id = NEW.journal_id;
+      IF FOUND THEN
+        IF NEW.target_module IN ('ledger','migration') THEN
+          IF v_jr.source_module <> 'migration' OR v_jr.journal_type NOT IN ('opening_import','history_import')
+             OR (NEW.target_doc_type IN ('ledger.journal','migration.period_summary','migration.inventory_conversion') AND NEW.target_doc_id <> NEW.journal_id)
+             OR (v_entity = 'voucher' AND v_jr.source_doc_id IS DISTINCT FROM NEW.staged_record_id) THEN
+            PERFORM migration.raise_error('HK_MIG_JOURNAL_SOURCE', 'a migration GL posting points at its own opening_import/history_import journal');
+          END IF;
+        ELSIF v_jr.source_module <> NEW.target_module OR v_jr.source_doc_id IS DISTINCT FROM NEW.target_doc_id THEN
+          PERFORM migration.raise_error('HK_MIG_JOURNAL_SOURCE', 'a regenerated document''s journal belongs to that document in its owning module');
+        END IF;
+      END IF;
     END IF;
     RETURN NEW;
   END IF;
-  IF (NEW.tenant_id, NEW.id, NEW.job_id, NEW.chunk_no, NEW.staged_record_id, NEW.source_system, NEW.source_db, NEW.source_table,
-      NEW.source_key, NEW.target_module, NEW.target_doc_type, NEW.target_doc_id, NEW.journal_id, NEW.gl_effect, NEW.amount_base, NEW.posted_at)
+  IF (NEW.tenant_id, NEW.id, NEW.job_id, NEW.company_id, NEW.chunk_no, NEW.source_system, NEW.source_db, NEW.source_table,
+      NEW.source_key, NEW.target_module, NEW.target_doc_type, NEW.target_doc_id, NEW.journal_id, NEW.gl_effect, NEW.amount_base, NEW.posted_at,
+      NEW.staged_entity, NEW.legacy_code, NEW.partition_class, NEW.disposition)
      IS DISTINCT FROM
-     (OLD.tenant_id, OLD.id, OLD.job_id, OLD.chunk_no, OLD.staged_record_id, OLD.source_system, OLD.source_db, OLD.source_table,
-      OLD.source_key, OLD.target_module, OLD.target_doc_type, OLD.target_doc_id, OLD.journal_id, OLD.gl_effect, OLD.amount_base, OLD.posted_at) THEN
+     (OLD.tenant_id, OLD.id, OLD.job_id, OLD.company_id, OLD.chunk_no, OLD.source_system, OLD.source_db, OLD.source_table,
+      OLD.source_key, OLD.target_module, OLD.target_doc_type, OLD.target_doc_id, OLD.journal_id, OLD.gl_effect, OLD.amount_base, OLD.posted_at,
+      OLD.staged_entity, OLD.legacy_code, OLD.partition_class, OLD.disposition)
+     OR (NEW.staged_record_id IS DISTINCT FROM OLD.staged_record_id
+         AND NOT (NEW.staged_record_id IS NULL AND coalesce(current_setting('hk.migration_purge', true), '') = 'on')) THEN
     PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'a posting record is immutable');
   END IF;
   IF NEW.state <> OLD.state THEN
@@ -1760,7 +2168,9 @@ BEGIN
       PERFORM migration.raise_error('HK_MIG_POSTING_TRANSITION', 'postings go live -> compensated only');
     END IF;
     PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['rolling_back'], 'compensating a posting');
-  ELSIF NEW.compensation_doc_id IS DISTINCT FROM OLD.compensation_doc_id THEN
+    NEW.compensated_at := now();
+  ELSIF (NEW.compensation_doc_id, NEW.compensation_kind, NEW.compensated_at)
+        IS DISTINCT FROM (OLD.compensation_doc_id, OLD.compensation_kind, OLD.compensated_at) THEN
     PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'compensation is recorded with the state change');
   END IF;
   RETURN NEW;
@@ -1771,6 +2181,7 @@ CREATE TRIGGER trg_posting_guard BEFORE INSERT OR UPDATE OR DELETE ON migration.
 -- ---------- ارقام مبدأ، تطبیق، آرشیو: فقط‌افزودنی ----------
 CREATE OR REPLACE FUNCTION migration.append_only_job_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE v_status text; v_job record;
 BEGIN
   IF TG_TABLE_NAME = 'source_balance' THEN
     PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id,
@@ -1780,10 +2191,15 @@ BEGIN
     IF NEW.seq <> coalesce((SELECT max(seq) FROM migration.reconciliation r WHERE r.tenant_id = NEW.tenant_id AND r.job_id = NEW.job_id), 0) + 1 THEN
       PERFORM migration.raise_error('HK_MIG_SEQ', 'reconciliation sequence is gapless');
     END IF;
+    NEW.created_at := now();
   ELSIF TG_TABLE_NAME = 'archive_entry' THEN
-    IF NOT EXISTS (SELECT 1 FROM migration.job j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.job_id
-                     AND j.mode = 'archive' AND j.status = 'committing') THEN
+    v_status := migration.lock_job_status(NEW.tenant_id, NEW.job_id);
+    SELECT j.mode, j.source_system INTO v_job FROM migration.job j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.job_id;
+    IF v_job.mode IS DISTINCT FROM 'archive' OR NOT (v_status = 'committing' OR (v_status = 'validated' AND migration.in_dry_run())) THEN
       PERFORM migration.raise_error('HK_MIG_ARCHIVE_ONLY', 'archive entries are written only by a committing archive job');
+    END IF;
+    IF NEW.source_system IS DISTINCT FROM v_job.source_system THEN
+      PERFORM migration.raise_error('HK_MIG_LINEAGE', 'an archive entry carries the job''s source system');
     END IF;
   END IF;
   RETURN NEW;
@@ -1803,11 +2219,22 @@ CREATE TRIGGER trg_forbid_mutation BEFORE UPDATE OR DELETE ON migration.reconcil
 DROP TRIGGER IF EXISTS trg_forbid_mutation ON migration.archive_entry;
 CREATE TRIGGER trg_forbid_mutation BEFORE UPDATE OR DELETE ON migration.archive_entry FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation();
 
--- سطر تطبیق: توضیح باید تأییدشده، هم‌کلید و دقیقاً برابر اختلاف باشد
+-- سطر تطبیق: فقط در کار committed/reconciled، فقط تا ظرفیت سرآیند؛ توضیح باید تأییدشده، هم‌کلید و دقیقاً برابر اختلاف باشد
 CREATE OR REPLACE FUNCTION migration.reconciliation_line_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE e record;
+DECLARE e record; v_count integer;
 BEGIN
+  PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['committed','reconciled'], 'adding reconciliation lines');
+  SELECT r.line_count INTO v_count FROM migration.reconciliation r WHERE r.tenant_id = NEW.tenant_id AND r.id = NEW.reconciliation_id;
+  IF NEW.line_no IS NULL THEN
+    SELECT coalesce(max(l.line_no), 0) + 1 INTO NEW.line_no
+      FROM migration.reconciliation_line l WHERE l.tenant_id = NEW.tenant_id AND l.reconciliation_id = NEW.reconciliation_id;
+  END IF;
+  -- RV-MG-04 / INV-MIG-19: سرآیند تغییرناپذیر شمار سطرها را ثابت می‌کند؛ line_no یکتا در ۱..line_count یعنی سطر دیرهنگام جا ندارد
+  IF NEW.line_no > v_count THEN
+    PERFORM migration.raise_error('HK_MIG_RECONCILIATION_TOTALS',
+      format('reconciliation already holds its %s lines; record a new reconciliation instead', v_count));
+  END IF;
   IF NEW.explanation_id IS NOT NULL THEN
     SELECT * INTO e FROM migration.explanation x WHERE x.tenant_id = NEW.tenant_id AND x.id = NEW.explanation_id;
     IF e.status <> 'approved' OR e.check_kind <> NEW.check_kind OR e.key <> NEW.key
@@ -1839,6 +2266,13 @@ BEGIN
      AND (SELECT mode FROM migration.job j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.job_id) <> 'archive' THEN
     PERFORM migration.raise_error('HK_MIG_RECONCILIATION_SCOPE', 'a ledger-affecting job is reconciled at least on the trial balance');
   END IF;
+  -- RV-MG-21 / INV-MIG-38: کاری که موقعیت زیردفتر ساخته است، حساب‌های کنترل را هم تطبیق می‌دهد (تلورانس صفر)
+  IF EXISTS (SELECT 1 FROM migration.posting p WHERE p.tenant_id = NEW.tenant_id AND p.job_id = NEW.job_id AND p.state = 'live'
+               AND p.gl_effect = 'none' AND p.target_module IN ('inventory','treasury','assets'))
+     AND NOT EXISTS (SELECT 1 FROM migration.reconciliation_line l WHERE l.tenant_id = NEW.tenant_id AND l.reconciliation_id = NEW.id
+                       AND l.check_kind = 'control_account') THEN
+    PERFORM migration.raise_error('HK_MIG_RECONCILIATION_SCOPE', 'a job with sub-ledger positions is reconciled on the control accounts');
+  END IF;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS trg_reconciliation_check ON migration.reconciliation;
@@ -1855,23 +2289,34 @@ BEGIN
   IF TG_OP = 'INSERT' THEN
     PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['validated','previewed','committing','committed','reconciled'],
                                         'explaining a difference');
-    IF NEW.status <> 'proposed' THEN
+    IF NEW.status <> 'proposed' OR NEW.approved_by IS NOT NULL THEN
       PERFORM migration.raise_error('HK_MIG_EXPLANATION_TRANSITION', 'explanations start proposed');
     END IF;
+    NEW.created_at := now();
     RETURN NEW;
   END IF;
-  IF (NEW.tenant_id, NEW.id, NEW.job_id, NEW.check_kind, NEW.key, NEW.category, NEW.amount, NEW.description, NEW.evidence, NEW.created_by)
-     IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.job_id, OLD.check_kind, OLD.key, OLD.category, OLD.amount, OLD.description, OLD.evidence, OLD.created_by) THEN
+  IF (NEW.tenant_id, NEW.id, NEW.job_id, NEW.check_kind, NEW.key, NEW.category, NEW.amount, NEW.description, NEW.evidence, NEW.created_by, NEW.created_at)
+     IS DISTINCT FROM (OLD.tenant_id, OLD.id, OLD.job_id, OLD.check_kind, OLD.key, OLD.category, OLD.amount, OLD.description, OLD.evidence, OLD.created_by, OLD.created_at) THEN
     PERFORM migration.raise_error('HK_MIG_IMMUTABLE_FIELD', 'an explanation is immutable; withdraw it and add a new one');
   END IF;
   IF NEW.status <> OLD.status THEN
     IF (OLD.status, NEW.status) NOT IN (('proposed','approved'), ('proposed','withdrawn'), ('approved','withdrawn')) THEN
       PERFORM migration.raise_error('HK_MIG_EXPLANATION_TRANSITION', format('explanation %s -> %s is not allowed', OLD.status, NEW.status));
     END IF;
-    IF NEW.status = 'withdrawn' THEN
+    IF NEW.status = 'approved' THEN
+      PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['validated','previewed','committing','committed'],
+                                          'approving an explanation (move a reconciled job back to committed first)');
+      -- RV-MG-13 / D-MG19: تأیید توضیح کنش خود حسابدار است
+      IF NEW.approved_by IS NOT NULL THEN
+        PERFORM migration.assert_human_act(NEW.approved_by, 'approving an explanation', true);
+        NEW.approved_at := now();
+      END IF;
+    ELSIF NEW.status = 'withdrawn' THEN
       PERFORM migration.assert_job_status(NEW.tenant_id, NEW.job_id, ARRAY['validated','previewed','committing','committed'],
                                           'withdrawing an explanation (move a reconciled job back to committed first)');
     END IF;
+  ELSIF (NEW.approved_by, NEW.approved_at) IS DISTINCT FROM (OLD.approved_by, OLD.approved_at) THEN
+    PERFORM migration.raise_error('HK_MIG_EXPLANATION_TRANSITION', 'approval is recorded with the status change');
   END IF;
   RETURN NEW;
 END $$;
@@ -1892,10 +2337,14 @@ BEGIN
     END IF;
     RETURN OLD;
   END IF;
-  v_job := migration.job_status_of(NEW.tenant_id, NEW.job_id);
+  v_job := migration.lock_job_status(NEW.tenant_id, NEW.job_id);
   IF TG_OP = 'INSERT' THEN
-    IF v_job NOT IN ('staged','mapping') OR NEW.status <> 'staged' THEN
+    IF NOT (coalesce(v_job, '') IN ('staged','mapping')) OR NEW.status <> 'staged' THEN
       PERFORM migration.raise_error('HK_MIG_JOB_STATE', 'continuity rows are staged during mapping');
+    END IF;
+    -- RV-MG-01 / CR-MG14: حافظهٔ مؤدیان در مستأجر یکتاست (tax.memory)؛ کار تمرینی هرگز آن را نمی‌گیرد
+    IF EXISTS (SELECT 1 FROM migration.job j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.job_id AND j.is_rehearsal) THEN
+      PERFORM migration.raise_error('HK_MIG_REHEARSAL_SCOPE', 'a rehearsal job never registers Moadian continuity');
     END IF;
     RETURN NEW;
   END IF;
@@ -1907,11 +2356,11 @@ BEGIN
     PERFORM migration.raise_error('HK_MIG_STAGED_FROZEN', 'committed continuity is frozen');
   END IF;
   IF NEW.status <> OLD.status THEN
-    IF NOT ((OLD.status, NEW.status) = ('staged','committed') AND v_job = 'committing'
+    IF NOT ((OLD.status, NEW.status) = ('staged','committed') AND (v_job = 'committing' OR (v_job = 'validated' AND migration.in_dry_run()))
             OR (OLD.status, NEW.status) = ('committed','rolled_back') AND v_job = 'rolling_back') THEN
       PERFORM migration.raise_error('HK_MIG_STAGED_TRANSITION', format('continuity %s -> %s is not allowed while the job is %s', OLD.status, NEW.status, v_job));
     END IF;
-  ELSIF OLD.status = 'staged' AND v_job NOT IN ('staged','mapping') THEN
+  ELSIF OLD.status = 'staged' AND NOT (coalesce(v_job, '') IN ('staged','mapping')) THEN
     PERFORM migration.raise_error('HK_MIG_INPUTS_FROZEN', 'continuity rows change only during mapping');
   END IF;
   RETURN NEW;
@@ -1921,6 +2370,40 @@ CREATE TRIGGER trg_moadian_continuity_guard BEFORE INSERT OR UPDATE OR DELETE ON
   FOR EACH ROW EXECUTE FUNCTION migration.moadian_continuity_guard();
 DROP TRIGGER IF EXISTS trg_touch ON migration.moadian_continuity;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON migration.moadian_continuity FOR EACH ROW EXECUTE FUNCTION core.touch_row();
+
+-- ---------- نگهبان dry-run (RV-MG-22): تراکنشی که hk.migration_dry_run='on' دارد هرگز commit نمی‌شود ----------
+-- WHEN فقط در همان تراکنش dry-run رویداد را صف می‌کند؛ COMMIT واقعی هیچ هزینه‌ای ندارد.
+CREATE OR REPLACE FUNCTION migration.dry_run_sentinel() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF migration.in_dry_run() THEN
+    PERFORM migration.raise_error('HK_MIG_DRY_RUN_COMMIT', 'a dry-run transaction (hk.migration_dry_run = on) never commits; end it with ROLLBACK');
+  END IF;
+  RETURN NULL;
+END $$;
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['commit_chunk','posting','staged_record','moadian_continuity','archive_entry','id_map'] LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS trg_dry_run_sentinel ON migration.%I', t);
+    EXECUTE format('CREATE CONSTRAINT TRIGGER trg_dry_run_sentinel AFTER INSERT OR UPDATE ON migration.%I '
+                   'DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (migration.in_dry_run()) '
+                   'EXECUTE FUNCTION migration.dry_run_sentinel()', t);
+  END LOOP;
+END $$;
+
+-- ---------- RV-MG-27 / R-APPEND: هیچ جدول مستأجری migration (شاهد، lineage یا دادهٔ کاری) TRUNCATE نمی‌شود، حتی با نقش مالک ----------
+DO $$
+DECLARE t text;
+BEGIN
+  FOR t IN SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'migration' AND c.relkind = 'r'
+              AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid = c.oid AND a.attname = 'tenant_id' AND NOT a.attisdropped)
+  LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS trg_no_truncate ON migration.%I', t);
+    EXECUTE format('CREATE TRIGGER trg_no_truncate BEFORE TRUNCATE ON migration.%I FOR EACH STATEMENT EXECUTE FUNCTION core.forbid_mutation()', t);
+  END LOOP;
+END $$;
 
 -- ---------- کاتالوگ پروفایل: منتشرشده تغییرناپذیر ----------
 CREATE OR REPLACE FUNCTION migration.profile_guard() RETURNS trigger
@@ -1974,10 +2457,12 @@ SELECT DISTINCT ON (r.tenant_id, r.job_id) r.tenant_id, r.job_id, r.id AS reconc
  ORDER BY r.tenant_id, r.job_id, r.seq DESC;
 
 -- lineage هر سند دفتر کل به رکورد مبدأ (برای drill-down «این سند از کجا آمد»)
-CREATE OR REPLACE VIEW migration.v_journal_lineage WITH (security_invoker = true) AS
-SELECT p.tenant_id, p.journal_id, p.job_id, p.source_system, p.source_db, p.source_table, p.source_key, p.target_doc_type,
-       p.state, s.legacy_code, s.partition_class, s.disposition
-  FROM migration.posting p LEFT JOIN migration.staged_record s ON s.tenant_id = p.tenant_id AND s.id = p.staged_record_id
+-- RV-MG-08/19: lineage از ستون‌های خود posting می‌آید (پس از پاک‌سازی ردیف مرحله‌ای و پس از جابه‌جایی .hkx هم می‌ماند)
+DROP VIEW IF EXISTS migration.v_journal_lineage;
+CREATE VIEW migration.v_journal_lineage WITH (security_invoker = true) AS
+SELECT p.tenant_id, p.company_id, p.journal_id, p.job_id, p.source_system, p.source_db, p.source_table, p.source_key, p.target_doc_type,
+       p.state, p.staged_entity, p.legacy_code, p.partition_class, p.disposition
+  FROM migration.posting p
  WHERE p.journal_id IS NOT NULL;
 
 -- =====================================================================
@@ -1992,7 +2477,7 @@ GRANT SELECT, INSERT, UPDATE ON migration.job, migration.consent, migration.uplo
                                 migration.explanation, migration.moadian_continuity, migration.job_partition_policy TO hk_app;
 GRANT SELECT, INSERT, UPDATE ON migration.agent_session, migration.source_credential TO hk_app;
 GRANT DELETE ON migration.staged_record, migration.mapping, migration.job_partition_policy, migration.raw_record,
-                migration.moadian_continuity TO hk_app;           -- همه با تریگر محافظت می‌شوند
+                migration.moadian_continuity, migration.issue TO hk_app;   -- همه با تریگر محافظت می‌شوند (issue فقط پاک‌سازی نگهداری)
 GRANT SELECT, INSERT ON migration.job_event, migration.raw_record, migration.dry_run, migration.source_balance,
                         migration.reconciliation, migration.reconciliation_line, migration.archive_entry TO hk_app;
 GRANT SELECT ON migration.v_job_blockers, migration.v_job_progress, migration.v_reconciliation_latest, migration.v_journal_lineage
@@ -2117,6 +2602,10 @@ INSERT INTO migration.issue_code (code, category, default_severity, overridable,
   ('MIG_SSTID_FORMAT',             'continuity',     'warning', false, NULL, 'mig.issue.sstid_format', '1.0'),
   ('MIG_INNO_NOT_HEX',             'continuity',     'error',   false, NULL, 'mig.issue.inno_not_hex', '1.0'),
   ('MIG_INVOICE_LINES_MISSING',    'continuity',     'warning', false, NULL, 'mig.issue.invoice_lines_missing', '1.0'),
+  ('MIG_SSTID_REQUIRED',           'continuity',     'error',   false, NULL, 'mig.issue.sstid_required', '1.0'),
+  ('MIG_MOADIAN_AMOUNT_MISMATCH',  'continuity',     'error',   false, NULL, 'mig.issue.moadian_amount_mismatch', '1.0'),
+  ('MIG_FX_INCOMPLETE',            'business',       'error',   false, NULL, 'mig.issue.fx_incomplete', '1.0'),
+  ('MIG_WARRANTY_DATES',           'business',       'warning', false, NULL, 'mig.issue.warranty_dates', '1.0'),
   ('MIG_UNKNOWN_COST',             'business',       'warning', false, NULL, 'mig.issue.unknown_cost', '1.0'),
   ('MIG_NEGATIVE_STOCK',           'business',       'warning', false, NULL, 'mig.issue.negative_stock', '1.0'),
   ('MIG_NEGATIVE_AMOUNT',          'business',       'error',   false, NULL, 'mig.issue.negative_amount', '1.0'),
@@ -2154,12 +2643,17 @@ INSERT INTO core.setting_def (key, module, value_type, enum_values, min_value, m
   ('migration.raw.retention_days',           'migration', 'int',     NULL, 7, 730, '{tenant}', '90',     NULL, 'migration.job.create', 'setting.migration.raw.retention_days', '1.0'),
   ('migration.commit.chunk_size',            'migration', 'int',     NULL, 100, 10000, '{tenant}', '2000', NULL, 'migration.job.create', 'setting.migration.commit.chunk_size', '1.0'),
   ('migration.dry_run.max_lines_full_tx',    'migration', 'int',     NULL, 1000, 2000000, '{tenant}', '300000', NULL, 'migration.job.create', 'setting.migration.dry_run.max_lines_full_tx', '1.0'),
-  ('migration.api.hesabfa.max_rps',          'migration', 'decimal', NULL, 0.1, 1, '{tenant}', '"1.0"',  NULL, 'migration.job.create', 'setting.migration.api.hesabfa.max_rps', '1.0'),
+  -- RV-MG-23: سقف واقعی پارامتر قاعدهٔ تاریخ‌دار migration.hesabfa.max_rps است (⚠ نامطمئن؛ بخش ۰۷). تنظیم مستأجر فقط
+  -- پایین‌تر می‌آورد: نرخ مؤثر = min(این تنظیم، پارامتر قاعده) در HesabfaClient؛ پس این‌جا سقف سخت ندارد.
+  ('migration.api.hesabfa.max_rps',          'migration', 'decimal', NULL, 0.1, NULL, '{tenant}', '"1.0"',  NULL, 'migration.job.create', 'setting.migration.api.hesabfa.max_rps', '1.0'),
   ('migration.ai_suggestions.enabled',       'migration', 'bool',    NULL, NULL, NULL, '{tenant}', 'false', NULL, 'migration.job.create', 'setting.migration.ai_suggestions.enabled', '1.0')
 ON CONFLICT (key) DO NOTHING;
 
+-- RV-MG-09 / RV-X1-06: صفحهٔ کنترل نمی‌تواند در صفحهٔ داده اشتراک ثبت کند؛ هر دو خانوادهٔ رویداد uplink را خود migration ثبت می‌کند
+-- (migration.mapping.confirmed خوراک صف نامزد فرهنگ مترادف پنل مالک است؛ §۵-۱۶)
 INSERT INTO core.event_subscription (event_type, subscriber) VALUES
-  ('migration.job.*', 'uplink')
+  ('migration.job.*', 'uplink'),
+  ('migration.mapping.confirmed', 'uplink')
 ON CONFLICT DO NOTHING;
 
 INSERT INTO core.retention_class (code, basis, default_period, rules_param_key, min_period, action, description_key) VALUES
@@ -2176,15 +2670,15 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('migration','mapping',              'migration', 'rows', 9050, '{}', '{}', 'tenant mapping memory'),
   ('migration','dry_run',              'migration', 'rows', 9060, '{}', '{}', NULL),
   ('migration','commit_chunk',         'migration', 'rows', 9070, '{}', '{}', NULL),
-  ('migration','posting',              'migration', 'rows', 9080, '{}', '{}', 'lineage of every migrated document'),
+  ('migration','posting',              'migration', 'hook', 9080, '{}', '{}', 'lineage of every migrated document; the migration export hook writes staged_record_id as NULL (staged rows are not moved; RV-MG-19) and the lineage columns travel in the row'),
   ('migration','source_balance',       'migration', 'rows', 9090, '{}', '{}', 'acceptance evidence'),
   ('migration','explanation',          'migration', 'rows', 9100, '{}', '{}', NULL),
   ('migration','reconciliation',       'migration', 'rows', 9110, '{}', '{}', 'signed acceptance report'),
   ('migration','reconciliation_line',  'migration', 'rows', 9120, '{}', '{}', NULL),
   ('migration','moadian_continuity',   'migration', 'rows', 9130, '{}', '{}', NULL),
   ('migration','archive_entry',        'migration', 'rows', 9140, '{party_name}', '{}', 'mode C archive is tenant data'),
-  ('migration','issue',                'migration', 'skip', 0, '{}', '{}', 'working state; regenerated by re-validation'),
-  ('migration','staged_record',        'migration', 'skip', 0, '{}', '{}', 'working state with personal data; purged by retention'),
+  ('migration','issue',                'migration', 'skip', 0, '{}', '{}', 'working state; regenerated by re-validation; purged by retention'),
+  ('migration','staged_record',        'migration', 'skip', 0, '{}', '{}', 'working state with personal data; purged by retention (posting keeps the lineage)'),
   ('migration','raw_record',           'migration', 'skip', 0, '{}', '{}', 'raw source snapshot; purged by retention, never moved'),
   ('migration','package',              'migration', 'skip', 0, '{}', '{}', 'describes uploads of the source placement'),
   ('migration','upload',               'migration', 'skip', 0, '{file_name}', '{}', 'objects are purged after N days'),
@@ -2192,7 +2686,9 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('migration','source_credential',    'migration', 'skip', 0, '{}', '{secret_ref}', 'secrets never leave the placement')
 ON CONFLICT DO NOTHING;
 
--- قالب جامع v1: ستون‌های کلیدی هر شیت (فهرست کامل عنوان‌ها در کلیدهای i18n؛ ستون اجباری = *)
+-- قالب جامع v1: ستون‌های کلیدی هر شیت (فهرست کامل عنوان‌ها در کلیدهای i18n؛ ستون اجباری = *).
+-- RV-MG-20: T15 سرآیند و T15b سطرهای فاکتور تاریخی سال جاری با همهٔ فیلدهای tax.invoice/tax.invoice_issue_line؛
+-- RV-MG-26: گارانتی کالا در T04 و سریال‌های فروخته‌شده در T12b.
 INSERT INTO migration.template_column (template_version, sheet_code, sheet_entity, column_key, ordinal, is_required, data_type, enum_values, title_key) VALUES
   (1,'T00','file_settings','source_system',1,true,'code',NULL,'mig.t00.source_system'),
   (1,'T00','file_settings','source_version',2,false,'text',NULL,'mig.t00.source_version'),
@@ -2256,6 +2752,9 @@ INSERT INTO migration.template_column (template_version, sheet_code, sheet_entit
   (1,'T04','item','track_serial',18,false,'bool',NULL,'mig.t04.track_serial'),
   (1,'T04','item','track_batch',19,false,'bool',NULL,'mig.t04.track_batch'),
   (1,'T04','item','is_active',20,false,'bool',NULL,'mig.t04.is_active'),
+  (1,'T04','item','warranty_days',21,false,'int',NULL,'mig.t04.warranty_days'),
+  (1,'T04','item','warranty_basis',22,false,'enum','{sale_date,activation}','mig.t04.warranty_basis'),
+  (1,'T04','item','warranty_provider',23,false,'code',NULL,'mig.t04.warranty_provider'),
   (1,'T05','warehouse','code',1,true,'code',NULL,'mig.t05.code'),
   (1,'T05','warehouse','name',2,true,'text',NULL,'mig.t05.name'),
   (1,'T05','warehouse','branch',3,false,'code',NULL,'mig.t05.branch'),
@@ -2287,6 +2786,15 @@ INSERT INTO migration.template_column (template_version, sheet_code, sheet_entit
   (1,'T09','open_document','total_amount',6,false,'amount',NULL,'mig.t09.total_amount'),
   (1,'T09','open_document','outstanding_amount',7,true,'amount',NULL,'mig.t09.outstanding_amount'),
   (1,'T09','open_document','moadian_taxid',8,false,'code',NULL,'mig.t09.moadian_taxid'),
+  (1,'T09','open_document','currency',9,false,'code',NULL,'mig.t09.currency'),
+  (1,'T09','open_document','fx_amount',10,false,'amount',NULL,'mig.t09.fx_amount'),
+  (1,'T09','open_document','fx_rate',11,false,'rate',NULL,'mig.t09.fx_rate'),
+  (1,'T09','open_document','control_account',12,false,'code',NULL,'mig.t09.control_account'),
+  (1,'T09','open_document','cost_center',13,false,'code',NULL,'mig.t09.cost_center'),
+  (1,'T09','open_document','project',14,false,'code',NULL,'mig.t09.project'),
+  (1,'T09','open_document','description',15,false,'text',NULL,'mig.t09.description'),
+  (1,'T09','open_document','moadian_inno',16,false,'code',NULL,'mig.t09.moadian_inno'),
+  (1,'T09','open_document','moadian_status',17,false,'enum','{not_sent,sent,accepted,rejected,cancelled}','mig.t09.moadian_status'),
   (1,'T10','cheque','direction',1,true,'enum','{received,issued}','mig.t10.direction'),
   (1,'T10','cheque','sayad_id',2,false,'code',NULL,'mig.t10.sayad_id'),
   (1,'T10','cheque','cheque_no',3,true,'code',NULL,'mig.t10.cheque_no'),
@@ -2296,6 +2804,10 @@ INSERT INTO migration.template_column (template_version, sheet_code, sheet_entit
   (1,'T10','cheque','due_date',7,true,'date',NULL,'mig.t10.due_date'),
   (1,'T10','cheque','status',8,true,'enum','{in_hand,in_collection,deposited,endorsed,bounced,guarantee,issued_unpaid}','mig.t10.status'),
   (1,'T10','cheque','deposit_bank_account',9,false,'code',NULL,'mig.t10.deposit_bank_account'),
+  (1,'T10','cheque','currency',10,false,'code',NULL,'mig.t10.currency'),
+  (1,'T10','cheque','fx_amount',11,false,'amount',NULL,'mig.t10.fx_amount'),
+  (1,'T10','cheque','fx_rate',12,false,'rate',NULL,'mig.t10.fx_rate'),
+  (1,'T10','cheque','description',13,false,'text',NULL,'mig.t10.description'),
   (1,'T11','bank_account','code',1,true,'code',NULL,'mig.t11.code'),
   (1,'T11','bank_account','type',2,true,'enum','{bank,cash_box,petty_cash,card_terminal}','mig.t11.type'),
   (1,'T11','bank_account','bank',3,false,'code',NULL,'mig.t11.bank'),
@@ -2318,6 +2830,14 @@ INSERT INTO migration.template_column (template_version, sheet_code, sheet_entit
   (1,'T12','stock_opening','batch_no',8,false,'code',NULL,'mig.t12.batch_no'),
   (1,'T12','stock_opening','expiry_date',9,false,'date',NULL,'mig.t12.expiry_date'),
   (1,'T12','stock_opening','serial_no',10,false,'code',NULL,'mig.t12.serial_no'),
+  (1,'T12b','serial_history','item_code',1,true,'code',NULL,'mig.t12b.item_code'),
+  (1,'T12b','serial_history','serial_no',2,true,'code',NULL,'mig.t12b.serial_no'),
+  (1,'T12b','serial_history','sale_date',3,true,'date',NULL,'mig.t12b.sale_date'),
+  (1,'T12b','serial_history','party_code',4,false,'code',NULL,'mig.t12b.party_code'),
+  (1,'T12b','serial_history','legacy_invoice_no',5,false,'code',NULL,'mig.t12b.legacy_invoice_no'),
+  (1,'T12b','serial_history','warranty_start',6,false,'date',NULL,'mig.t12b.warranty_start'),
+  (1,'T12b','serial_history','warranty_end',7,false,'date',NULL,'mig.t12b.warranty_end'),
+  (1,'T12b','serial_history','warranty_provider',8,false,'code',NULL,'mig.t12b.warranty_provider'),
   (1,'T13','fixed_asset','asset_code',1,true,'code',NULL,'mig.t13.asset_code'),
   (1,'T13','fixed_asset','name',2,true,'text',NULL,'mig.t13.name'),
   (1,'T13','fixed_asset','asset_class',3,true,'code',NULL,'mig.t13.asset_class'),
@@ -2342,13 +2862,47 @@ INSERT INTO migration.template_column (template_version, sheet_code, sheet_entit
   (1,'T15','invoice_history','date',3,true,'date',NULL,'mig.t15.date'),
   (1,'T15','invoice_history','party_code',4,true,'code',NULL,'mig.t15.party_code'),
   (1,'T15','invoice_history','moadian_taxid',5,false,'code',NULL,'mig.t15.moadian_taxid'),
-  (1,'T15','invoice_history','moadian_status',6,false,'enum','{not_sent,sent,accepted,rejected,cancelled}','mig.t15.moadian_status'),
-  (1,'T15','invoice_history','item_code',7,true,'code',NULL,'mig.t15.item_code'),
-  (1,'T15','invoice_history','moadian_product_id',8,false,'code',NULL,'mig.t15.moadian_product_id'),
-  (1,'T15','invoice_history','qty',9,true,'qty',NULL,'mig.t15.qty'),
-  (1,'T15','invoice_history','unit_price',10,true,'amount',NULL,'mig.t15.unit_price'),
-  (1,'T15','invoice_history','discount',11,false,'amount',NULL,'mig.t15.discount'),
-  (1,'T15','invoice_history','vat_rate',12,false,'decimal',NULL,'mig.t15.vat_rate'),
+  (1,'T15','invoice_history','moadian_inno',6,false,'code',NULL,'mig.t15.moadian_inno'),
+  (1,'T15','invoice_history','moadian_status',7,false,'enum','{not_sent,sent,accepted,rejected,cancelled}','mig.t15.moadian_status'),
+  (1,'T15','invoice_history','inv_type',8,false,'enum','{1,2,3}','mig.t15.inv_type'),
+  (1,'T15','invoice_history','inv_pattern',9,false,'enum','{1,2,3,4,5,6,7,8,9,11,13,14}','mig.t15.inv_pattern'),
+  (1,'T15','invoice_history','inv_subject',10,false,'enum','{1,2,3,4}','mig.t15.inv_subject'),
+  (1,'T15','invoice_history','ref_taxid',11,false,'code',NULL,'mig.t15.ref_taxid'),
+  (1,'T15','invoice_history','settlement_method',12,false,'enum','{1,2,3}','mig.t15.settlement_method'),
+  (1,'T15','invoice_history','buyer_type',13,false,'enum','{1,2,3,4}','mig.t15.buyer_type'),
+  (1,'T15','invoice_history','buyer_national_id',14,false,'code',NULL,'mig.t15.buyer_national_id'),
+  (1,'T15','invoice_history','buyer_economic_code',15,false,'code',NULL,'mig.t15.buyer_economic_code'),
+  (1,'T15','invoice_history','buyer_postal_code',16,false,'code',NULL,'mig.t15.buyer_postal_code'),
+  (1,'T15','invoice_history','buyer_branch_code',17,false,'code',NULL,'mig.t15.buyer_branch_code'),
+  (1,'T15','invoice_history','seller_branch_code',18,false,'code',NULL,'mig.t15.seller_branch_code'),
+  (1,'T15','invoice_history','total_before_discount',19,false,'amount',NULL,'mig.t15.total_before_discount'),
+  (1,'T15','invoice_history','total_discount',20,false,'amount',NULL,'mig.t15.total_discount'),
+  (1,'T15','invoice_history','total_vat',21,false,'amount',NULL,'mig.t15.total_vat'),
+  (1,'T15','invoice_history','total_other_duties',22,false,'amount',NULL,'mig.t15.total_other_duties'),
+  (1,'T15','invoice_history','total_other_levies',23,false,'amount',NULL,'mig.t15.total_other_levies'),
+  (1,'T15','invoice_history','total_amount',24,false,'amount',NULL,'mig.t15.total_amount'),
+  (1,'T15','invoice_history','cash_amount',25,false,'amount',NULL,'mig.t15.cash_amount'),
+  (1,'T15','invoice_history','credit_amount',26,false,'amount',NULL,'mig.t15.credit_amount'),
+  (1,'T15','invoice_history','currency',27,false,'code',NULL,'mig.t15.currency'),
+  (1,'T15','invoice_history','fx_rate',28,false,'rate',NULL,'mig.t15.fx_rate'),
+  (1,'T15b','invoice_line_history','legacy_no',1,true,'code',NULL,'mig.t15b.legacy_no'),
+  (1,'T15b','invoice_line_history','line_no',2,true,'int',NULL,'mig.t15b.line_no'),
+  (1,'T15b','invoice_line_history','item_code',3,true,'code',NULL,'mig.t15b.item_code'),
+  (1,'T15b','invoice_line_history','moadian_product_id',4,false,'code',NULL,'mig.t15b.moadian_product_id'),
+  (1,'T15b','invoice_line_history','item_description',5,false,'text',NULL,'mig.t15b.item_description'),
+  (1,'T15b','invoice_line_history','moadian_unit',6,false,'code',NULL,'mig.t15b.moadian_unit'),
+  (1,'T15b','invoice_line_history','qty',7,true,'qty',NULL,'mig.t15b.qty'),
+  (1,'T15b','invoice_line_history','unit_price',8,true,'amount',NULL,'mig.t15b.unit_price'),
+  (1,'T15b','invoice_line_history','discount',9,false,'amount',NULL,'mig.t15b.discount'),
+  (1,'T15b','invoice_line_history','vat_rate',10,false,'decimal',NULL,'mig.t15b.vat_rate'),
+  (1,'T15b','invoice_line_history','vat_amount',11,false,'amount',NULL,'mig.t15b.vat_amount'),
+  (1,'T15b','invoice_line_history','other_duty_code',12,false,'code',NULL,'mig.t15b.other_duty_code'),
+  (1,'T15b','invoice_line_history','other_duty_rate',13,false,'decimal',NULL,'mig.t15b.other_duty_rate'),
+  (1,'T15b','invoice_line_history','other_duty_amount',14,false,'amount',NULL,'mig.t15b.other_duty_amount'),
+  (1,'T15b','invoice_line_history','other_levy_code',15,false,'code',NULL,'mig.t15b.other_levy_code'),
+  (1,'T15b','invoice_line_history','other_levy_rate',16,false,'decimal',NULL,'mig.t15b.other_levy_rate'),
+  (1,'T15b','invoice_line_history','other_levy_amount',17,false,'amount',NULL,'mig.t15b.other_levy_amount'),
+  (1,'T15b','invoice_line_history','line_total',18,false,'amount',NULL,'mig.t15b.line_total'),
   (1,'T16','employee','personnel_no',1,true,'code',NULL,'mig.t16.personnel_no'),
   (1,'T16','employee','national_code',2,true,'code',NULL,'mig.t16.national_code'),
   (1,'T16','employee','name',3,true,'text',NULL,'mig.t16.name'),
@@ -2367,6 +2921,17 @@ INSERT INTO migration.template_column (template_version, sheet_code, sheet_entit
   (1,'T17','tax_continuity','last_taxid',3,true,'code',NULL,'mig.t17.last_taxid'),
   (1,'T17','tax_continuity','connection_mode',4,true,'enum','{direct,trusted_company}','mig.t17.connection_mode')
 ON CONFLICT DO NOTHING;
+
+-- اجبار شرطی قالب v1 (RV-MG-20): فاکتوری که شمارهٔ مالیاتی دارد بی این ستون‌ها قابل بازسازی برای اصلاحی/برگشتی نیست؛
+-- سند ارزی بی نرخ و مبلغ ارزی تطبیق‌پذیر نیست
+UPDATE migration.template_column t SET required_if = x.cond
+  FROM (VALUES ('T15','inv_type','T15.moadian_taxid'), ('T15','inv_pattern','T15.moadian_taxid'), ('T15','inv_subject','T15.moadian_taxid'),
+               ('T15','settlement_method','T15.moadian_taxid'), ('T15','moadian_inno','T15.moadian_taxid'),
+               ('T15b','moadian_product_id','T15.moadian_taxid'), ('T15b','moadian_unit','T15.moadian_taxid'),
+               ('T15b','vat_amount','T15.moadian_taxid'), ('T15b','line_total','T15.moadian_taxid'),
+               ('T09','fx_amount','T09.currency'), ('T09','fx_rate','T09.currency'),
+               ('T10','fx_amount','T10.currency'), ('T10','fx_rate','T10.currency')) AS x(sheet, col, cond)
+ WHERE t.template_version = 1 AND t.sheet_code = x.sheet AND t.column_key = x.col AND t.required_if IS DISTINCT FROM x.cond;
 
 -- فرهنگ مترادف (نمونهٔ seed؛ نسخهٔ ۱). مترادف به شکل نرمال‌شده ذخیره می‌شود.
 INSERT INTO migration.header_synonym (field_key, entity, source_system, synonym_norm, dict_version, origin)

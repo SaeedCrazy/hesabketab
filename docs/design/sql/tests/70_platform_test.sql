@@ -18,7 +18,9 @@
 --   بخش ۵ (SET ROLE hk_platform_readonly): T27 ستون‌های راز.
 --   بخش ۶ (postgres): T28 lint امنیتی، تغییرناپذیری حتی برای مالک، تشخیص دستکاری زنجیرهٔ ممیزی، بی‌فاصلگی شماره‌ها.
 --          T32: حذف ممنوع حتی برای مالک، و شاخه‌های دفاع در عمق (فقط با دور زدن آگاهانه؛ همه در تراکنش rollback‌شده).
--- آزمون جهش (سند §۹-۱): هر PERFORM platform.fail با NULL جایگزین شد؛ ۳۷۰ از ۳۷۰ با همین فایل کشته می‌شوند.
+-- آزمون جهش (سند §۹-۱): هر PERFORM platform.fail با NULL جایگزین شد (دور پیش: ۳۷۰ از ۳۷۰ کشته)؛ در دور بازبینی ۳۰ جهش
+-- شرطی روی اصلاح‌ها (شرط ← true/false، حذف قفل یا تریگر) اجرا شد و هر ۳۰ کشته شدند. سه آزمون هم‌روندی با دو نشست واقعی
+-- (dblink در اسکیمای plt_t): T02c آخرین owner، T05b idempotency در جریان، T16b تسویهٔ هم‌زمان.
 -- هر ادعای منفی الگوی دقیق پیام خطا (کد HK_PLT_* یا نام قید) را بررسی می‌کند (plt_t.fails).
 -- خروجی موفق با «ALL 70_platform TESTS PASSED» پایان می‌یابد؛ هر شکست «TEST FAILED [...]» می‌دهد و psql با کد ≠ ۰ خارج می‌شود.
 -- =====================================================================
@@ -36,6 +38,8 @@ DROP SCHEMA IF EXISTS plt_t CASCADE;
 CREATE SCHEMA plt_t;
 GRANT USAGE ON SCHEMA plt_t TO hk_platform_app, hk_platform_ingest, hk_partner_app, hk_platform_readonly;
 
+-- dblink فقط برای آزمون‌های هم‌روندی با دو نشست واقعی (در اسکیمای آزمون؛ با DROP SCHEMA حذف می‌شود)
+CREATE EXTENSION IF NOT EXISTS dblink SCHEMA plt_t;
 CREATE TABLE plt_t.ids (name text PRIMARY KEY, id uuid NOT NULL UNIQUE);
 CREATE TABLE plt_t.sess (staff_id uuid PRIMARY KEY, session_id uuid NOT NULL);
 GRANT SELECT ON plt_t.ids, plt_t.sess TO hk_platform_app, hk_platform_ingest, hk_partner_app, hk_platform_readonly;
@@ -61,7 +65,7 @@ SELECT n, ('70000000-0000-7000-8000-' || lpad(h, 12, '0'))::uuid FROM (VALUES
   ('IMP1','7101'),('IMP2','7102'),('IMP3','7103'),
   ('TK1','7201'),('TK2','7202'),('AN1','7301'),('AN2','7302'),
   ('SO1','7401'),('C1','7501'),('DR1','7601'),('DR2','7602'),
-  ('UB1','8001'),('UB2','8002'),('PO1','8101'),('PO2','8102'),('RF1','8201'),('RF2','8202'),
+  ('UB1','8001'),('UB2','8002'),('UB3','8003'),('UB4','8004'),('UB5','8005'),('PO1','8101'),('PO2','8102'),('RF1','8201'),('RF2','8202'),
   ('U1','9001'),('ACT1','9101'),('ACT2','9102')
 ) v(n, h);
 
@@ -96,22 +100,29 @@ BEGIN
   END IF;
 END $$;
 
--- درخواست تأیید چهارچشمی و تصمیم آن (کنشگر جاری را برمی‌گرداند)
-CREATE FUNCTION plt_t.approve(p_action text, p_subject_type text, p_subject uuid, p_requester uuid, p_approver uuid) RETURNS uuid
+-- درخواست تأیید چهارچشمی و تصمیم آن (کنشگر جاری را برمی‌گرداند). p_op: سطر عملیاتی که اجرا خواهد شد (jsonb)؛
+-- payload = platform.approval_binding(کنش، p_op) همان‌طور که سرویس می‌سازد (RV-PLT-04)
+CREATE FUNCTION plt_t.approve(p_action text, p_subject_type text, p_subject uuid, p_requester uuid, p_approver uuid,
+                              p_op jsonb DEFAULT '{}'::jsonb) RETURNS uuid
 LANGUAGE plpgsql AS $$
 DECLARE
   v uuid;
   v_prev text := current_setting('app.staff_id', true);
 BEGIN
   PERFORM plt_t.as_staff(p_requester);
-  INSERT INTO platform.approval_request (action, subject_type, subject_id, requested_by, reason)
-  VALUES (p_action, p_subject_type, p_subject, p_requester, 'test approval reason') RETURNING id INTO v;
+  INSERT INTO platform.approval_request (action, subject_type, subject_id, payload, requested_by, reason)
+  VALUES (p_action, p_subject_type, p_subject, platform.approval_binding(p_action, p_op), p_requester, 'test approval reason') RETURNING id INTO v;
   PERFORM plt_t.as_staff(p_approver);
   UPDATE platform.approval_request SET status = 'approved', decided_by = p_approver WHERE id = v;
   PERFORM plt_t.as_staff(NULLIF(v_prev, '')::uuid);
   RETURN v;
 END $$;
 
+-- ارجاع نرخ مالیات بر ارزش افزوده به مقدار منتشرشدهٔ موتور قواعد (RV-PLT-11)
+CREATE FUNCTION plt_t.vat_ref() RETURNS text LANGUAGE sql STABLE AS $$ SELECT 'ir.tax@1405.0#tax.vat.standard_rate' $$;
+-- سال جلالی امروزِ تهران (سری شماره‌ها؛ RV-PLT-14) — آزمون به سال اجرا وابسته نیست
+CREATE FUNCTION plt_t.yy() RETURNS text LANGUAGE sql STABLE AS $$ SELECT platform.jalali_year(platform.tehran_today())::text $$;
+CREATE FUNCTION plt_t.jy() RETURNS text LANGUAGE sql STABLE AS $$ SELECT 'jy:' || plt_t.yy() $$;
 CREATE FUNCTION plt_t.sig() RETURNS bytea LANGUAGE sql IMMUTABLE AS $$ SELECT decode(repeat('ab', 64), 'hex') $$;
 CREATE FUNCTION plt_t.h(p text) RETURNS bytea LANGUAGE sql IMMUTABLE AS $$ SELECT sha256(convert_to(p, 'UTF8')) $$;
 CREATE FUNCTION plt_t.fp(p text) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
@@ -166,6 +177,17 @@ INSERT INTO platform.rules_param_catalog (key, value_type, unit, package_code, q
   ('tax.threshold.article6', 'money', 'IRR', 'ir.tax', 'none', NULL, '2026.11.0'),
   ('tax.vat.rounding', 'enum', NULL, 'ir.tax', 'none', ARRAY['trunc','round'], '2026.11.0'),
   ('payroll.wage.min_daily', 'money', 'IRR', 'ir.payroll', 'none', NULL, '2026.11.0');
+-- بستهٔ قواعد منتشرشدهٔ نرخ ارزش افزوده برای صدور صورتحساب (RV-PLT-11). در تولید این بسته از جریان تألیف و انتشار T21
+-- می‌آید؛ این‌جا همان داده مانند بار اولیهٔ migration با session_replication_role=replica (بدون نگهبان‌ها) بار می‌شود.
+SET LOCAL session_replication_role = replica;
+INSERT INTO platform.rules_package (id, code, version, seq, covers_from, min_engine_version, changelog_fa, status, authored_by,
+                                    payload_sha256, hksb_sha256, signer_kid, published_at, published_by)
+VALUES ('70000000-0000-7000-8000-000000006000', 'ir.tax', '1405.0', 1, '2025-03-21', '2026.11.0', 'نرخ ارزش افزوده (بار اولیه)', 'published',
+        plt_t.u('T'), plt_t.h('rp0'), plt_t.h('rh0'), 'rules-2026a', now(), plt_t.u('A'));
+INSERT INTO platform.rules_value (package_id, key, effective_from, value, source_ref, confidence) VALUES
+  ('70000000-0000-7000-8000-000000006000', 'tax.vat.standard_rate', '2025-03-21', '"10"', 'قانون مالیات بر ارزش افزوده', 'medium'),
+  ('70000000-0000-7000-8000-000000006000', 'tax.threshold.article6', '2025-03-21', '{"amount": "10000000000", "unit": "IRR"}', 'ماده ۶', 'low');
+SET LOCAL session_replication_role = origin;
 COMMIT;
 
 -- =====================================================================
@@ -227,7 +249,7 @@ BEGIN
   PERFORM plt_t.fails('T02 admin cannot approve privileged grant',
     format($q$SELECT plt_t.approve('staff.grant_privileged_role', 'staff', %L, %L, %L)$q$, plt_t.u('S'), plt_t.u('F'), plt_t.u('A')),
     'HK_PLT_APPROVER_NOT_ELIGIBLE%');
-  v_appr := plt_t.approve('staff.grant_privileged_role', 'staff', plt_t.u('S'), plt_t.u('A'), plt_t.u('O'));
+  v_appr := plt_t.approve('staff.grant_privileged_role', 'staff', plt_t.u('S'), plt_t.u('A'), plt_t.u('O'), '{"role_code": "admin"}');
   INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by, approval_id) VALUES (plt_t.u('S'), 'admin', plt_t.u('A'), v_appr);
   PERFORM plt_t.ok('T02 approval consumed', (SELECT status = 'consumed' FROM platform.approval_request WHERE id = v_appr));
   PERFORM plt_t.fails('T02 approval reuse',
@@ -260,6 +282,69 @@ BEGIN
     'HK_PLT_IMMUTABLE_FIELD%');
   PERFORM plt_t.fails('T02 delete assignment', $q$DELETE FROM platform.staff_role_assignment$q$, '%permission denied%');
 END $$;
+
+-- T02b (RV-PLT-18) هر نقش دارای مجوز critical ممتاز است: admin بی‌تأیید دوم نمی‌تواند نقش finance/release_manager/
+-- reseller_manager را (مثلاً به حساب دوم خودش) بدهد. (RV-PLT-08) غیرفعال‌کردن آخرین مالک فعال ممنوع است.
+DO $$
+DECLARE
+  v uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.ok('T02b approver roles are privileged',
+    platform.role_is_privileged('finance') AND platform.role_is_privileged('release_manager') AND platform.role_is_privileged('reseller_manager')
+    AND platform.role_is_privileged('owner') AND NOT platform.role_is_privileged('support') AND NOT platform.role_is_privileged('read_only'));
+  PERFORM plt_t.fails('T02b granting finance needs four-eyes',
+    format($q$INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by) VALUES (%L, 'finance', %L)$q$, plt_t.u('R'), plt_t.u('A')),
+    'HK_PLT_APPROVAL_REQUIRED%');
+  PERFORM plt_t.fails('T02b granting release_manager needs four-eyes',
+    format($q$INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by) VALUES (%L, 'release_manager', %L)$q$, plt_t.u('R'), plt_t.u('A')),
+    'HK_PLT_APPROVAL_REQUIRED%');
+  PERFORM plt_t.fails('T02b granting reseller_manager needs four-eyes',
+    format($q$INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by) VALUES (%L, 'reseller_manager', %L)$q$, plt_t.u('R'), plt_t.u('A')),
+    'HK_PLT_APPROVAL_REQUIRED%');
+  v := plt_t.approve('staff.grant_privileged_role', 'staff', plt_t.u('R'), plt_t.u('A'), plt_t.u('O'), '{"role_code": "finance"}');
+  INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by, approval_id) VALUES (plt_t.u('R'), 'finance', plt_t.u('A'), v);
+  UPDATE platform.staff_role_assignment SET revoked_at = now(), revoked_by = plt_t.u('A'), revoke_reason = 'test grant only'
+   WHERE staff_id = plt_t.u('R') AND role_code = 'finance' AND revoked_at IS NULL;
+  PERFORM plt_t.fails('T02b last active owner cannot be disabled',
+    format($q$UPDATE platform.staff SET status = 'disabled' WHERE id = %L$q$, plt_t.u('O')), 'HK_PLT_LAST_OWNER: the last active owner cannot be disabled%');
+  PERFORM plt_t.fails('T02b last active owner cannot be suspended',
+    format($q$UPDATE platform.staff SET status = 'suspended' WHERE id = %L$q$, plt_t.u('O')), 'HK_PLT_LAST_OWNER: the last active owner cannot be disabled%');
+END $$;
+
+-- T02c (RV-PLT-08) دو لغو هم‌زمان دو مالک آخر: دومی پشت قفل مجموعهٔ مالکان منتظر می‌ماند و پس از commit اولی رد می‌شود.
+-- دو نشست واقعی با dblink؛ مالک دوم O2 با راه‌اندازی (نقش مالک پایگاه داده) ساخته می‌شود.
+RESET ROLE;
+INSERT INTO plt_t.ids (name, id) VALUES ('O2', '70000000-0000-7000-8000-00000000a0aa');
+INSERT INTO platform.staff (id, oidc_subject, email, display_name, status, mfa_methods, mfa_enrolled_at)
+VALUES (plt_t.u('O2'), 'kc-o2', 'o2@hk.test', 'مالک دوم', 'active', '{webauthn}', now());
+INSERT INTO platform.staff_role_assignment (staff_id, role_code) VALUES (plt_t.u('O2'), 'owner');
+SELECT plt_t.dblink_connect('own1', format('dbname=%s port=%s user=postgres', current_database(), current_setting('port'))) \gset
+SELECT plt_t.dblink_connect('own2', format('dbname=%s port=%s user=postgres', current_database(), current_setting('port'))) \gset
+SELECT plt_t.dblink_exec('own1', 'BEGIN') \gset
+SELECT plt_t.dblink_exec('own1', 'SET LOCAL ROLE hk_platform_app') \gset
+SELECT plt_t.dblink_exec('own1', format('SET LOCAL app.staff_id = %L', plt_t.u('O'))) \gset
+SELECT plt_t.dblink_exec('own1', format($q$UPDATE platform.staff_role_assignment SET revoked_at = now(), revoked_by = %L, revoke_reason = 'concurrent revoke one'
+                                          WHERE staff_id = %L AND role_code = 'owner' AND revoked_at IS NULL$q$, plt_t.u('O'), plt_t.u('O2'))) \gset
+SELECT plt_t.dblink_exec('own2', 'BEGIN') \gset
+SELECT plt_t.dblink_exec('own2', 'SET LOCAL ROLE hk_platform_app') \gset
+SELECT plt_t.dblink_exec('own2', format('SET LOCAL app.staff_id = %L', plt_t.u('O2'))) \gset
+SELECT plt_t.dblink_send_query('own2', format($q$UPDATE platform.staff_role_assignment SET revoked_at = now(), revoked_by = %L, revoke_reason = 'concurrent revoke two'
+                                                WHERE staff_id = %L AND role_code = 'owner' AND revoked_at IS NULL$q$, plt_t.u('O2'), plt_t.u('O'))) \gset
+SELECT pg_sleep(0.5) \gset
+SELECT plt_t.ok('T02c second owner revocation waits for the first', plt_t.dblink_is_busy('own2') = 1) \gset
+SELECT plt_t.dblink_exec('own1', 'COMMIT') \gset
+SELECT count(*) AS own2_rows FROM plt_t.dblink_get_result('own2', false) AS t(x text) \gset
+SELECT plt_t.ok('T02c concurrent revocation of the last owner is rejected after the first commits',
+                plt_t.dblink_error_message('own2') LIKE '%HK_PLT_LAST_OWNER%') \gset
+SELECT count(*) AS own2_drain FROM plt_t.dblink_get_result('own2', false) AS t(x text) \gset
+SELECT plt_t.dblink_exec('own2', 'ROLLBACK') \gset
+SELECT plt_t.dblink_disconnect('own1') \gset
+SELECT plt_t.dblink_disconnect('own2') \gset
+SELECT plt_t.ok('T02c exactly one live owner remains',
+  (SELECT count(*) = 1 FROM platform.staff_role_assignment a JOIN platform.staff s ON s.id = a.staff_id
+    WHERE a.role_code = 'owner' AND a.revoked_at IS NULL AND s.status = 'active' AND a.staff_id = plt_t.u('O'))) \gset
+SET ROLE hk_platform_app;
 
 -- T03 تأیید چهارچشمی
 DO $$
@@ -330,6 +415,32 @@ BEGIN
   UPDATE platform.approval_request SET status = 'cancelled' WHERE id = v;
 END $$;
 
+-- T03b (RV-PLT-04) تأیید به عملیات اجراشده پیوند دارد، نه فقط به موضوع: payload تأییدشده باید با سطر اجراشده بخواند
+DO $$
+DECLARE
+  v uuid;
+  v_w uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  v := plt_t.approve('staff.grant_privileged_role', 'staff', plt_t.u('R'), plt_t.u('A'), plt_t.u('O'), '{"role_code": "admin"}');
+  PERFORM plt_t.fails('T03b approval for admin cannot grant owner',
+    format($q$INSERT INTO platform.staff_role_assignment (staff_id, role_code, granted_by, approval_id) VALUES (%L, 'owner', %L, %L)$q$,
+           plt_t.u('R'), plt_t.u('A'), v),
+    'HK_PLT_APPROVAL_MISMATCH: approved role_code differs from the executed operation%');
+  PERFORM plt_t.ok('T03b mismatched approval stays approved (not consumed)', (SELECT status = 'approved' FROM platform.approval_request WHERE id = v));
+  SELECT platform.wallet_for('tenant', plt_t.u('TH')) INTO v_w;
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  v := plt_t.approve('wallet.manual_adjustment', 'wallet', v_w, plt_t.u('F'), plt_t.u('F2'), '{"amount": 10000}');
+  PERFORM plt_t.fails('T03b wallet adjustment of another amount',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id) VALUES (%L, 0, 'adjustment', 999999999999, 0, 't03b-adj-0001', %L)$q$,
+           v_w, v),
+    'HK_PLT_APPROVAL_MISMATCH: approved amount differs from the executed operation%');
+  PERFORM plt_t.ok('T03b approval payload is the binding of the operation',
+    platform.approval_binding('wallet.manual_adjustment', '{"amount": 10000, "memo": "x"}') = '{"amount": "10000"}'::jsonb
+    AND platform.approval_binding('staff.grant_privileged_role', '{"role_code": "admin", "staff_id": "z"}') = '{"role_code": "admin"}'::jsonb
+    AND platform.approval_binding('invoice.void', '{"id": "z"}') = '{}'::jsonb);
+END $$;
+
 -- T04 ممیزی پلتفرم: فقط‌افزودنی، زنجیرهٔ hash، کنشگر = کنشگر جاری
 DO $$
 DECLARE
@@ -392,6 +503,40 @@ BEGIN
     '%idempotency_key_key_check%');
 END $$;
 
+-- T05b idempotency هم‌زمان (R-IDEM؛ RV-PLT-20): درخواست دوم با همان کلید منتظر نمی‌ماند و «در جریان» می‌گیرد؛
+-- پس از commit اولی پاسخ بازپخش می‌شود و همان کلید با بدنهٔ دیگر key_reused است. دو نشست واقعی با dblink.
+RESET ROLE;
+SELECT plt_t.dblink_connect('idem2', format('dbname=%s port=%s user=postgres', current_database(), current_setting('port'))) \gset
+SELECT plt_t.dblink_exec('idem2', 'BEGIN') \gset
+SELECT plt_t.dblink_exec('idem2', 'SET LOCAL ROLE hk_platform_app') \gset
+SELECT o AS idem_first FROM plt_t.dblink('idem2', format($q$SELECT outcome FROM platform.idempotency_begin('staff', %L, 'key-concurrent-00001', 'POST', '/platform/v1/refunds', plt_t.h('body-1'))$q$, plt_t.u('F'))) AS t(o text) \gset
+SET ROLE hk_platform_app;
+SELECT plt_t.ok('T05b first request claims the key', :'idem_first' = 'new') \gset
+DO $$
+DECLARE r record;
+BEGIN
+  SELECT * INTO r FROM platform.idempotency_begin('staff', plt_t.u('F'), 'key-concurrent-00001', 'POST', '/platform/v1/refunds', plt_t.h('body-1'));
+  PERFORM plt_t.ok('T05b concurrent duplicate gets in_progress at once (409 + Retry-After)', r.outcome = 'in_progress');
+  SELECT * INTO r FROM platform.idempotency_begin('staff', plt_t.u('F'), 'bad key', 'POST', '/platform/v1/refunds', plt_t.h('body-1'));
+  PERFORM plt_t.ok('T05b malformed key is key_invalid (400)', r.outcome = 'key_invalid');
+END $$;
+RESET ROLE;
+SELECT plt_t.dblink_exec('idem2', format($q$INSERT INTO platform.idempotency_key (principal_kind, principal_id, key, method, path, request_sha256, expires_at, response_status, response_body)
+  VALUES ('staff', %L, 'key-concurrent-00001', 'POST', '/platform/v1/refunds', plt_t.h('body-1'), now() + interval '1 day', 201, '{"id": 7}')$q$, plt_t.u('F'))) \gset
+SELECT plt_t.dblink_exec('idem2', 'COMMIT') \gset
+SELECT plt_t.dblink_disconnect('idem2') \gset
+SET ROLE hk_platform_app;
+DO $$
+DECLARE r record;
+BEGIN
+  SELECT * INTO r FROM platform.idempotency_begin('staff', plt_t.u('F'), 'key-concurrent-00001', 'POST', '/platform/v1/refunds', plt_t.h('body-1'));
+  PERFORM plt_t.ok('T05b after commit the stored response is replayed', r.outcome = 'replay' AND r.response_status = 201 AND r.response_body = '{"id": 7}');
+  SELECT * INTO r FROM platform.idempotency_begin('staff', plt_t.u('F'), 'key-concurrent-00001', 'POST', '/platform/v1/refunds', plt_t.h('body-2'));
+  PERFORM plt_t.ok('T05b same key with another body is key_reused (422)', r.outcome = 'key_reused');
+  SELECT * INTO r FROM platform.idempotency_begin('staff', plt_t.u('F'), 'key-concurrent-00002', 'POST', '/platform/v1/refunds', plt_t.h('body-1'));
+  PERFORM plt_t.ok('T05b unknown key is new', r.outcome = 'new');
+END $$;
+
 -- T06 سلول، مستأجر، جای‌گذاری، چرخهٔ عمر
 DO $$
 DECLARE
@@ -416,6 +561,19 @@ BEGIN
                                                        AND tenant_id IN (SELECT id FROM plt_t.ids WHERE name IN ('TA','TB','TC','TD','TE','TF'))));
   PERFORM plt_t.ok('T06 creation enqueues desired-state build', (SELECT count(*) = 6 FROM platform.job WHERE kind = 'control.desired_state.build'
                                                                   AND dedupe_key LIKE 'lifecycle:%:1' AND (payload->>'tenant_id')::uuid <> plt_t.u('TH')));
+  -- RV-ARCH-21: برچسب‌های میزبان پلتفرم و پیشوندهای رزرو slug مستأجر نمی‌شوند
+  PERFORM plt_t.fails('T06 reserved slug billing', $q$INSERT INTO platform.tenant (slug, display_name, deployment) VALUES ('billing', 'x', 'saas_shared')$q$,
+    '%tenant_slug_not_reserved%');
+  PERFORM plt_t.fails('T06 reserved slug activate', $q$INSERT INTO platform.tenant (slug, display_name, deployment) VALUES ('activate', 'x', 'saas_shared')$q$,
+    '%tenant_slug_not_reserved%');
+  PERFORM plt_t.fails('T06 reserved slug partner', $q$INSERT INTO platform.tenant (slug, display_name, deployment) VALUES ('partner', 'x', 'saas_shared')$q$,
+    '%tenant_slug_not_reserved%');
+  PERFORM plt_t.fails('T06 reserved slug prefix hk-', $q$INSERT INTO platform.tenant (slug, display_name, deployment) VALUES ('hk-internal', 'x', 'saas_shared')$q$,
+    '%tenant_slug_not_reserved%');
+  PERFORM plt_t.fails('T06 reserved slug punycode prefix', $q$INSERT INTO platform.tenant (slug, display_name, deployment) VALUES ('xn--mgba3a4f16a', 'x', 'saas_shared')$q$,
+    '%tenant_slug_not_reserved%');
+  PERFORM plt_t.fails('T06 rename to a reserved slug', format($q$UPDATE platform.tenant SET slug = 'api' WHERE id = %L$q$, plt_t.u('TA')),
+    '%tenant_slug_not_reserved%');
   PERFORM plt_t.fails('T06 tenant created active', $q$INSERT INTO platform.tenant (slug, display_name, deployment, status) VALUES ('x-active', 'x', 'saas_shared', 'active')$q$,
     'HK_PLT_INVALID_TRANSITION%');
   PERFORM plt_t.fails('T06 app cannot create the house tenant', $q$INSERT INTO platform.tenant (slug, display_name, deployment, is_internal, is_house) VALUES ('x-house', 'x', 'saas_shared', true, true)$q$,
@@ -599,7 +757,18 @@ BEGIN
    AND platform.data_plane_status('cancelled', 'active') = 'read_only' AND platform.data_plane_status('read_only', 'active') = 'read_only'
    AND platform.data_plane_status('suspended', 'active') = 'suspended' AND platform.data_plane_status('archived', 'active') = 'archived'
    AND platform.data_plane_status('active', 'moving') = 'exporting' AND platform.data_plane_status('provisioning', 'pending') = 'provisioning'
-   AND platform.data_plane_status('purging', 'active') = 'purge');
+   AND platform.data_plane_status('purging', 'active') = 'archived' AND platform.data_plane_status('purged', 'retired') = 'archived');
+  -- RV-PLT-17: نگاشت کامل است و خروجی همیشه یکی از وضعیت‌های core.tenant.status (= CHECK ستون tenant_runtime.data_plane_status)
+  PERFORM plt_t.ok('T07 data-plane status mapping is total and within core.tenant.status',
+    NOT EXISTS (SELECT 1 FROM unnest(ARRAY['provisioning','trial','active','past_due','read_only','suspended','cancelled','archived','purging','purged']) st
+                CROSS JOIN unnest(ARRAY['pending','active','moving','frozen','retired']) ps
+                WHERE platform.data_plane_status(st, ps) IS NULL
+                   OR platform.data_plane_status(st, ps) NOT IN ('provisioning','active','read_only','suspended','exporting','archived')));
+  PERFORM plt_t.fails('T07 purge is not a desired data-plane status (RV-PLT-17)',
+    format($q$INSERT INTO platform.desired_state (tenant_id, version, document, document_sha256, signature, kid, cause)
+              VALUES (%L, 2, jsonb_build_object('format','hkstate/1','version',2,'tenant_id',%L,'status','purge','entitlements','{}'::jsonb), plt_t.h('x'), plt_t.sig(), 'k', 'manual')$q$,
+           plt_t.u('TA'), plt_t.u('TA')),
+    'HK_PLT_DOCUMENT_MISMATCH%');
   -- نمای مسیریابی
   INSERT INTO platform.routing_snapshot (version, entries, document, sha256, signature, kid)
   VALUES (1, 1, jsonb_build_object('format','hkroute/1','version',1,'entries', jsonb_build_object('cafe-a', jsonb_build_object('cell','cell-02'))),
@@ -662,6 +831,20 @@ BEGIN
   INSERT INTO platform.tenant_lifecycle_event (tenant_id, seq, to_status, actor_kind, reason_code) VALUES (plt_t.u('TD'), 0, 'purged', 'system', 'purge_confirmed');
   UPDATE platform.tenant_placement SET state = 'retired' WHERE tenant_id = plt_t.u('TD');
   PERFORM plt_t.fails('T08 purged tenant frozen', format($q$UPDATE platform.tenant SET display_name = 'x' WHERE id = %L$q$, plt_t.u('TD')), 'HK_PLT_TENANT_PURGED%');
+  -- RV-PLT-17: purged سند حالت مطلوب ندارد (نه در صف و نه در جدول)
+  PERFORM plt_t.ok('T08 purged lifecycle event enqueues no desired-state build',
+    NOT EXISTS (SELECT 1 FROM platform.job j WHERE j.kind = 'control.desired_state.build' AND j.payload->>'tenant_id' = plt_t.u('TD')::text
+                  AND (j.payload->>'event_seq')::int = (SELECT max(seq) FROM platform.tenant_lifecycle_event WHERE tenant_id = plt_t.u('TD'))));
+  PERFORM plt_t.ok('T08 purging lifecycle event did enqueue a build with the per-tenant concurrency key',
+    EXISTS (SELECT 1 FROM platform.job j WHERE j.kind = 'control.desired_state.build' AND j.payload->>'tenant_id' = plt_t.u('TD')::text
+              AND j.concurrency_key = 'ds:' || plt_t.u('TD')::text));
+  PERFORM plt_t.fails('T08 no desired state for a purged tenant',
+    format($q$INSERT INTO platform.desired_state (tenant_id, version, document, document_sha256, signature, kid, cause)
+              VALUES (%L, (SELECT desired_version + 1 FROM platform.tenant_runtime WHERE tenant_id = %L),
+                      jsonb_build_object('format','hkstate/1','version',(SELECT desired_version + 1 FROM platform.tenant_runtime WHERE tenant_id = %L),
+                                         'tenant_id',%L,'status','archived','entitlements','{}'::jsonb), plt_t.h('x'), plt_t.sig(), 'k', 'lifecycle')$q$,
+           plt_t.u('TD'), plt_t.u('TD'), plt_t.u('TD'), plt_t.u('TD')),
+    'HK_PLT_TENANT_PURGED%');
 END $$;
 
 -- T09 انتشار، rollout، نسخهٔ کلاینت
@@ -791,7 +974,9 @@ BEGIN
     'HK_PLT_ENTITLEMENT_SHAPE%');
   INSERT INTO platform.price (product_version_id, billing_period) VALUES (plt_t.u('PV3'), 'ONCE') RETURNING id INTO v_price;
   INSERT INTO platform.price_component (price_id, line_no, kind, unit_amount) VALUES (v_price, 1, 'flat', 500000000);
-  INSERT INTO platform.product_entitlement (product_version_id, feature_key, limit_value) VALUES (plt_t.u('PV3'), 'limit.users', 10);
+  INSERT INTO platform.product_entitlement (product_version_id, feature_key, limit_value) VALUES (plt_t.u('PV3'), 'limit.users', 10),
+    (plt_t.u('PV3'), 'limit.companies', 2), (plt_t.u('PV3'), 'limit.pos_devices', 3);
+  INSERT INTO platform.product_entitlement (product_version_id, feature_key, enabled) VALUES (plt_t.u('PV3'), 'module.accounting', true), (plt_t.u('PV3'), 'module.pos', true);
   INSERT INTO platform.price (product_version_id, billing_period) VALUES (plt_t.u('PV4'), 'ONCE') RETURNING id INTO v_price;
   INSERT INTO platform.price_component (price_id, line_no, kind, unit_amount) VALUES (v_price, 1, 'flat', 30000000);
 
@@ -820,6 +1005,46 @@ BEGIN
     'HK_PLT_IMMUTABLE%');
   PERFORM plt_t.fails('T10 published -> draft', format($q$UPDATE platform.product_version SET status = 'draft' WHERE id = %L$q$, plt_t.u('PV1')),
     'HK_PLT_INVALID_TRANSITION%');
+END $$;
+
+-- T10b (RV-PLT-04) تأیید «انتشار قیمت» به محتوای منجمد همان بازبینی گره خورده است: درخواست روی پیش‌نویس رد می‌شود، و تأییدی
+-- که پیش از آخرین ورود به بازبینی ثبت شده (محتوا پس از آن عوض شده) مصرف نمی‌شود. دو تراکنش جدا (now() متفاوت).
+DO $$
+DECLARE
+  v_pv uuid := uuidv7();
+  v_price uuid;
+  v_ap uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('SL'));
+  INSERT INTO platform.product_version (id, product_code, version, available_from, created_by) VALUES (v_pv, 'assisted_migration', 7, current_date, plt_t.u('SL'));
+  INSERT INTO platform.price (product_version_id, billing_period) VALUES (v_pv, 'ONCE') RETURNING id INTO v_price;
+  INSERT INTO platform.price_component (price_id, line_no, kind, unit_amount) VALUES (v_price, 1, 'flat', 30000000);
+  PERFORM plt_t.fails('T10b price approval only for a version in review',
+    format($q$SELECT plt_t.approve('price.publish', 'product_version', %L, %L, %L)$q$, v_pv, plt_t.u('SL'), plt_t.u('A')),
+    'HK_PLT_APPROVAL_MISMATCH: price approvals are requested only for a version in review%');
+  UPDATE platform.product_version SET status = 'in_review' WHERE id = v_pv;
+  v_ap := plt_t.approve('price.publish', 'product_version', v_pv, plt_t.u('SL'), plt_t.u('A'));
+  PERFORM plt_t.as_staff(plt_t.u('SL'));
+  UPDATE platform.product_version SET status = 'draft' WHERE id = v_pv;
+  PERFORM set_config('plt.t10b_pv', v_pv::text, false);
+  PERFORM set_config('plt.t10b_ap', v_ap::text, false);
+END $$;
+DO $$
+DECLARE
+  v_pv uuid := current_setting('plt.t10b_pv')::uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('SL'));
+  -- محتوا پس از تأیید عوض می‌شود (قیمت ده برابر) و دوباره به بازبینی می‌رود
+  UPDATE platform.price_component SET unit_amount = 300000000 WHERE price_id IN (SELECT id FROM platform.price WHERE product_version_id = v_pv);
+  UPDATE platform.product_version SET status = 'in_review' WHERE id = v_pv;
+  PERFORM plt_t.fails('T10b approval predating the current review is not consumed',
+    format($q$UPDATE platform.product_version SET status = 'published', published_by = %L, approval_id = %L WHERE id = %L$q$,
+           plt_t.u('SL'), current_setting('plt.t10b_ap'), v_pv),
+    'HK_PLT_APPROVAL_MISMATCH: price approval predates the current review%');
+  UPDATE platform.product_version SET status = 'published', published_by = plt_t.u('SL'),
+         approval_id = plt_t.approve('price.publish', 'product_version', v_pv, plt_t.u('SL'), plt_t.u('A'))
+   WHERE id = v_pv;
+  PERFORM plt_t.ok('T10b fresh approval of the frozen content publishes', (SELECT status = 'published' FROM platform.product_version WHERE id = v_pv));
 END $$;
 
 -- T11 حساب صورتحساب، اشتراک، دورهٔ آزمایشی، اقلام
@@ -891,6 +1116,15 @@ BEGIN
   PERFORM plt_t.fails('T11 items change only by closing',
     format($q$UPDATE platform.subscription_item SET quantity = 9 WHERE subscription_id = %L AND metric_key IS NULL$q$, plt_t.u('SUB_A')),
     'HK_PLT_IMMUTABLE_FIELD%');
+  -- RV-PLT-19: افزودن قلم و دوره در همان تراکنش بازسازی حالت مطلوب را با کلید هم‌روندی مستأجر صف می‌کند
+  PERFORM plt_t.ok('T11 subscription item enqueues desired-state build',
+    EXISTS (SELECT 1 FROM platform.job j JOIN platform.subscription_item i ON j.dedupe_key = 'subscription_item:' || i.id::text || ':open'
+             WHERE i.subscription_id = plt_t.u('SUB_A') AND j.kind = 'control.desired_state.build'
+               AND j.concurrency_key = 'ds:' || plt_t.u('TA')::text AND j.payload->>'cause' = 'subscription'));
+  PERFORM plt_t.ok('T11 subscription term enqueues desired-state build',
+    EXISTS (SELECT 1 FROM platform.job j JOIN platform.subscription_term t ON j.dedupe_key = 'subscription_term:' || t.id::text || ':active'
+             WHERE t.subscription_id = plt_t.u('SUB_A') AND t.kind = 'trial' AND j.kind = 'control.desired_state.build'
+               AND j.concurrency_key = 'ds:' || plt_t.u('TA')::text));
 END $$;
 
 -- T12 صورتحساب، شماره‌گذاری بی‌فاصله، پیش‌پرداخت، پرداخت درگاه (زرین‌پال، ملت ۴۸، دیرهنگام، بانکی)، ابطال، یادداشت اعتباری
@@ -909,12 +1143,12 @@ BEGIN
     $q$INSERT INTO platform.gateway_account (provider, role, merchant_secret_ref, callback_base_url, api_amount_unit) VALUES ('zibal', 'fallback', 'merchant-xyz-secret', 'https://pay.hk.test/cb', 'IRR')$q$,
     '%gateway_account_merchant_secret_ref_check%');
 
-  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, due_date) VALUES
-    (plt_t.u('INV1'), plt_t.u('BA_A'), plt_t.u('TA'), 'jy:1405', current_date + 3),
-    (plt_t.u('INV2'), plt_t.u('BA_A'), plt_t.u('TA'), NULL, current_date + 3),
-    (plt_t.u('INV8'), plt_t.u('BA_B'), plt_t.u('TB'), 'jy:1405', current_date + 3),
-    (plt_t.u('INV6'), plt_t.u('BA_B'), plt_t.u('TB'), 'jy:1405', current_date + 3),
-    (plt_t.u('INV9'), plt_t.u('BA_A'), plt_t.u('TA'), 'jy:1405', current_date + 3);
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, due_date, vat_rule_ref) VALUES
+    (plt_t.u('INV1'), plt_t.u('BA_A'), plt_t.u('TA'), plt_t.jy(), current_date + 3, plt_t.vat_ref()),
+    (plt_t.u('INV2'), plt_t.u('BA_A'), plt_t.u('TA'), NULL, current_date + 3, plt_t.vat_ref()),
+    (plt_t.u('INV8'), plt_t.u('BA_B'), plt_t.u('TB'), plt_t.jy(), current_date + 3, plt_t.vat_ref()),
+    (plt_t.u('INV6'), plt_t.u('BA_B'), plt_t.u('TB'), plt_t.jy(), current_date + 3, plt_t.vat_ref()),
+    (plt_t.u('INV9'), plt_t.u('BA_A'), plt_t.u('TA'), plt_t.jy(), current_date + 3, plt_t.vat_ref());
   PERFORM plt_t.fails('T12 invoice billing account must match tenant',
     format($q$INSERT INTO platform.invoice (billing_account_id, tenant_id) VALUES (%L, %L)$q$, plt_t.u('BA_B'), plt_t.u('TA')),
     'HK_PLT_BILLING_ACCOUNT_MISMATCH%');
@@ -941,7 +1175,7 @@ BEGIN
                                      quantity, unit_amount, amount, discount, vat_rate_pct, vat_amount, total) VALUES
     (plt_t.u('L1'), plt_t.u('INV1'), 1, 'subscription', plt_t.u('PV1'), 'اشتراک ماهانهٔ پلن حرفه‌ای', '2710000138624', current_date, current_date + 30,
      1, 10000000, 10000000, 0, 10, 1000000, 11000000),
-    (plt_t.u('L2'), plt_t.u('INV2'), 1, 'adjustment', NULL, 'تعدیل', NULL, NULL, NULL, 1, 1000000, 1000000, 0, 10, 100000, 1100000);
+    (plt_t.u('L2'), plt_t.u('INV2'), 1, 'adjustment', NULL, 'تعدیل', '2710000138624', NULL, NULL, 1, 1000000, 1000000, 0, 10, 100000, 1100000);
   PERFORM plt_t.fails('T12 header totals equal lines',
     format($q$UPDATE platform.invoice SET status = 'issued', issued_by = %L WHERE id = %L$q$, plt_t.u('F'), plt_t.u('INV1')),
     'HK_PLT_INVOICE_TOTALS%');
@@ -951,12 +1185,38 @@ BEGIN
   UPDATE platform.invoice SET subtotal = 10000000, vat_total = 1000000, total = 11000000 WHERE id = plt_t.u('INV1');
   UPDATE platform.invoice SET subtotal = 1000000, vat_total = 100000, total = 1100000 WHERE id = plt_t.u('INV2');
   PERFORM plt_t.fails('T12 empty invoice', format($q$UPDATE platform.invoice SET status = 'issued' WHERE id = %L$q$, plt_t.u('INV9')), 'HK_PLT_INVOICE_EMPTY%');
-  PERFORM plt_t.fails('T12 numbering needs period', format($q$UPDATE platform.invoice SET status = 'issued' WHERE id = %L$q$, plt_t.u('INV2')), 'HK_PLT_INVOICE_PERIOD%');
+  -- RV-PLT-14: سال سری = سال جلالی تاریخ صدور؛ تاریخ صدور = امروزِ تهران (بدون پس/پیش‌تاریخ)
+  PERFORM plt_t.fails('T12 period must be the Jalali year of the issue date',
+    format($q$UPDATE platform.invoice SET status = 'issued', period_key = 'jy:1399' WHERE id = %L$q$, plt_t.u('INV2')),
+    'HK_PLT_INVOICE_PERIOD: period_key must be jy:' || plt_t.yy() || ', the Jalali year of the issue date%');
+  PERFORM plt_t.fails('T12 backdated invoice rejected',
+    format($q$UPDATE platform.invoice SET status = 'issued', issue_date = '2020-01-01' WHERE id = %L$q$, plt_t.u('INV2')),
+    'HK_PLT_INVOICE_DATE%');
+  PERFORM plt_t.fails('T12 future-dated invoice rejected',
+    format($q$UPDATE platform.invoice SET status = 'issued', issue_date = platform.tehran_today() + 10 WHERE id = %L$q$, plt_t.u('INV2')),
+    'HK_PLT_INVOICE_DATE%');
+  -- RV-PLT-11: نرخ هر سطر از مقدار منتشرشدهٔ موتور قواعد؛ شناسهٔ کالا/خدمت برای مستأجر خانه اجباری
+  PERFORM plt_t.fails('T12 VAT rule reference required',
+    format($q$UPDATE platform.invoice SET status = 'issued', vat_rule_ref = NULL WHERE id = %L$q$, plt_t.u('INV2')), 'HK_PLT_VAT_RULE%');
+  PERFORM plt_t.fails('T12 VAT rule must be published',
+    format($q$UPDATE platform.invoice SET status = 'issued', vat_rule_ref = 'ir.tax@1405.9#tax.vat.standard_rate' WHERE id = %L$q$, plt_t.u('INV2')), 'HK_PLT_VAT_RULE%');
+  PERFORM plt_t.fails('T12 VAT rule must name a percent key',
+    format($q$UPDATE platform.invoice SET status = 'issued', vat_rule_ref = 'ir.tax@1405.0#tax.threshold.article6' WHERE id = %L$q$, plt_t.u('INV2')), 'HK_PLT_VAT_RULE%');
+  UPDATE platform.invoice_line SET vat_rate_pct = 3.7, vat_amount = 37000, total = 1037000 WHERE id = plt_t.u('L2');
+  UPDATE platform.invoice SET vat_total = 37000, total = 1037000 WHERE id = plt_t.u('INV2');
+  PERFORM plt_t.fails('T12 line VAT rate must equal the rules value',
+    format($q$UPDATE platform.invoice SET status = 'issued' WHERE id = %L$q$, plt_t.u('INV2')), 'HK_PLT_VAT_RULE: each line VAT rate must equal%');
+  UPDATE platform.invoice_line SET vat_rate_pct = 10, vat_amount = 100000, total = 1100000, sstid = NULL WHERE id = plt_t.u('L2');
+  UPDATE platform.invoice SET vat_total = 100000, total = 1100000 WHERE id = plt_t.u('INV2');
+  PERFORM plt_t.fails('T12 house-tenant invoice lines need sstid',
+    format($q$UPDATE platform.invoice SET status = 'issued' WHERE id = %L$q$, plt_t.u('INV2')), 'HK_PLT_INVOICE_SSTID%');
+  UPDATE platform.invoice_line SET sstid = '2710000138624' WHERE id = plt_t.u('L2');
   PERFORM plt_t.fails('T12 issued_by must be actor', format($q$UPDATE platform.invoice SET status = 'issued', issued_by = %L WHERE id = %L$q$, plt_t.u('O'), plt_t.u('INV1')),
     'HK_PLT_ACTOR_MISMATCH%');
-  PERFORM plt_t.fails('T12 direct number draw', $q$SELECT platform.number_next('invoice', 'jy:1405', 'INV-1405-')$q$, 'HK_PLT_NUMBER_DIRECT%');
+  PERFORM plt_t.fails('T12 direct number draw', $q$SELECT platform.number_next('invoice', plt_t.jy(), 'INV-' || plt_t.yy() || '-')$q$, 'HK_PLT_NUMBER_DIRECT%');
   UPDATE platform.invoice SET status = 'issued', issued_by = plt_t.u('F') WHERE id = plt_t.u('INV1');
-  PERFORM plt_t.ok('T12 issued fields', (SELECT number = 'INV-1405-000001' AND issued_at IS NOT NULL AND issue_date = current_date
+  PERFORM plt_t.ok('T12 issued fields', (SELECT number = 'INV-' || plt_t.yy() || '-000001' AND issued_at IS NOT NULL AND issue_date = platform.tehran_today()
+                                           AND period_key = plt_t.jy()
                                            AND reseller_id = plt_t.u('R1') AND buyer_snapshot->>'legal_name' = 'کافه الف'
                                            FROM platform.invoice WHERE id = plt_t.u('INV1')));
   PERFORM plt_t.ok('T12 issue creates house sync + job', EXISTS (SELECT 1 FROM platform.house_sync WHERE doc_type = 'invoice' AND doc_id = plt_t.u('INV1')
@@ -964,7 +1224,7 @@ BEGIN
                                                         AND EXISTS (SELECT 1 FROM platform.job WHERE kind = 'billing.house_sync' AND dedupe_key = 'house:' || plt_t.u('INV1')));
   PERFORM plt_t.fails('T12 direct counter move', $q$UPDATE platform.number_counter SET next_value = next_value + 1$q$, 'HK_PLT_NUMBER_DIRECT%');
   -- یک صدور که rollback می‌شود شماره را نمی‌سوزاند
-  UPDATE platform.invoice SET period_key = 'jy:1405' WHERE id = plt_t.u('INV2');
+  UPDATE platform.invoice SET period_key = plt_t.jy() WHERE id = plt_t.u('INV2');
   BEGIN
     UPDATE platform.invoice SET status = 'issued' WHERE id = plt_t.u('INV2');
     RAISE EXCEPTION 'rollback-probe';
@@ -972,7 +1232,7 @@ BEGIN
     IF SQLERRM <> 'rollback-probe' THEN RAISE; END IF;
   END;
   UPDATE platform.invoice SET status = 'issued' WHERE id = plt_t.u('INV2');
-  PERFORM plt_t.ok('T12 gapless after rollback', (SELECT number = 'INV-1405-000002' FROM platform.invoice WHERE id = plt_t.u('INV2')));
+  PERFORM plt_t.ok('T12 gapless after rollback', (SELECT number = 'INV-' || plt_t.yy() || '-000002' FROM platform.invoice WHERE id = plt_t.u('INV2')));
   PERFORM plt_t.fails('T12 issued line frozen', format($q$UPDATE platform.invoice_line SET description = 'x' WHERE id = %L$q$, plt_t.u('L1')), 'HK_PLT_INVOICE_FROZEN%');
   PERFORM plt_t.fails('T12 issued header frozen', format($q$UPDATE platform.invoice SET due_date = current_date + 30 WHERE id = %L$q$, plt_t.u('INV1')), 'HK_PLT_INVOICE_FROZEN%');
   PERFORM plt_t.fails('T12 paid_amount derived', format($q$UPDATE platform.invoice SET paid_amount = 11000000 WHERE id = %L$q$, plt_t.u('INV1')), 'HK_PLT_DERIVED_COLUMN%');
@@ -1042,10 +1302,10 @@ BEGIN
   PERFORM plt_t.fails('T12 payment amount immutable', format($q$UPDATE platform.payment SET amount = 1, api_amount = 1 WHERE id = %L$q$, plt_t.u('PAY1')), 'HK_PLT_IMMUTABLE_FIELD%');
 
   -- INV4 (افزونه): ملت ۴۸، تکراری، دیرهنگام، واریز بانکی
-  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, vat_total, total) VALUES
-    (plt_t.u('INV4'), plt_t.u('BA_A'), plt_t.u('TA'), 'jy:1405', 6000000, 600000, 6600000);
-  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
-  VALUES (plt_t.u('L4'), plt_t.u('INV4'), 1, 'addon', plt_t.u('PV2'), 'سه صندوق اضافه', 3, 2000000, 6000000, 10, 600000, 6600000);
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, vat_total, total, vat_rule_ref) VALUES
+    (plt_t.u('INV4'), plt_t.u('BA_A'), plt_t.u('TA'), plt_t.jy(), 6000000, 600000, 6600000, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (plt_t.u('L4'), plt_t.u('INV4'), 1, 'addon', plt_t.u('PV2'), 'سه صندوق اضافه', '2710000138624', 3, 2000000, 6000000, 10, 600000, 6600000);
   UPDATE platform.invoice SET status = 'issued', issued_by = plt_t.u('F') WHERE id = plt_t.u('INV4');
   INSERT INTO platform.payment (id, payer_kind, billing_account_id, tenant_id, purpose, invoice_id, method, gateway_account_id, provider, order_id, amount, api_amount, api_amount_unit, expires_at) VALUES
     (plt_t.u('PAY2'), 'tenant', plt_t.u('BA_A'), plt_t.u('TA'), 'invoice', plt_t.u('INV4'), 'gateway', plt_t.u('GW1'), 'zarinpal', 'ORD-000002', 6600000, 660000, 'IRT', now() + interval '30 minutes'),
@@ -1056,10 +1316,27 @@ BEGIN
   UPDATE platform.payment SET state = 'redirected', provider_ref = 'A00000000000000000000000000000000002' WHERE id = plt_t.u('PAY2');
   UPDATE platform.payment SET state = 'redirected', provider_ref = 'MELLAT-REF-1' WHERE id = plt_t.u('PAY3');
   UPDATE platform.payment SET state = 'callback_received' WHERE id = plt_t.u('PAY3');
+  -- RV-PLT-05: ملت پس از verify باید settle شود؛ verify بدون settle «پرداخت‌شده» نیست
+  PERFORM plt_t.fails('T12 Mellat verify without settle is not paid',
+    format($q$UPDATE platform.payment SET state = 'verified', verified_amount = 6600000, provider_txn_ref = 'M48' WHERE id = %L$q$, plt_t.u('PAY3')),
+    'HK_PLT_SETTLE_REQUIRED%');
+  PERFORM plt_t.fails('T12 settling needs a verify of the exact amount',
+    format($q$UPDATE platform.payment SET state = 'settling', verified_amount = 6500000, provider_txn_ref = 'M48' WHERE id = %L$q$, plt_t.u('PAY3')),
+    'HK_PLT_AMOUNT_MISMATCH%');
+  PERFORM plt_t.fails('T12 only settle-requiring gateways settle',
+    format($q$UPDATE platform.payment SET state = 'settling', verified_amount = 6600000, provider_txn_ref = 'ZP-X' WHERE id = %L$q$, plt_t.u('PAY2')),
+    'HK_PLT_INVALID_TRANSITION: provider zarinpal has no settle step%');
+  UPDATE platform.payment SET state = 'settling', verified_amount = 6600000, provider_txn_ref = 'M48' WHERE id = plt_t.u('PAY3');
+  PERFORM plt_t.ok('T12 settling does not settle the invoice', (SELECT status = 'issued' AND paid_amount = 0 FROM platform.invoice WHERE id = plt_t.u('INV4')));
   PERFORM plt_t.fails('T12 Mellat 48 is never paid',
-    format($q$UPDATE platform.payment SET state = 'verified', verified_amount = 6600000, provider_txn_ref = 'M48', last_response_code = '48' WHERE id = %L$q$, plt_t.u('PAY3')),
+    format($q$UPDATE platform.payment SET state = 'verified', last_response_code = '48' WHERE id = %L$q$, plt_t.u('PAY3')),
     '%payment_mellat_48%');
+  -- کد ۴۸ در settle: برگشت، بدون اعتبار اشتراک و بدون شارژ کیف پول
   UPDATE platform.payment SET state = 'reversed', last_response_code = '48' WHERE id = plt_t.u('PAY3');
+  PERFORM plt_t.ok('T12 Mellat 48 at settle leaves the invoice unpaid',
+    (SELECT status = 'issued' AND paid_amount = 0 FROM platform.invoice WHERE id = plt_t.u('INV4'))
+    AND NOT EXISTS (SELECT 1 FROM platform.invoice_settlement WHERE payment_id = plt_t.u('PAY3'))
+    AND NOT EXISTS (SELECT 1 FROM platform.wallet_entry WHERE payment_id = plt_t.u('PAY3')));
   UPDATE platform.payment SET state = 'expired' WHERE id = plt_t.u('PAY2');
   INSERT INTO platform.payment (id, payer_kind, billing_account_id, tenant_id, purpose, invoice_id, method, order_id, amount, api_amount, api_amount_unit, expires_at)
   VALUES (plt_t.u('PAY5'), 'tenant', plt_t.u('BA_A'), plt_t.u('TA'), 'invoice', plt_t.u('INV4'), 'bank_transfer', 'ORD-000005', 6600000, 6600000, 'IRR', now() + interval '7 days');
@@ -1080,9 +1357,10 @@ BEGIN
   PERFORM plt_t.ok('T12 late money goes to wallet', (SELECT balance = 6600000 FROM platform.wallet WHERE tenant_id = plt_t.u('TA'))
                                                    AND NOT EXISTS (SELECT 1 FROM platform.invoice_settlement WHERE payment_id = plt_t.u('PAY2'))
                                                    AND EXISTS (SELECT 1 FROM platform.wallet_entry WHERE payment_id = plt_t.u('PAY2') AND kind = 'overpayment'));
-  PERFORM plt_t.fails('T12 settlement over outstanding',
+  -- تسویه فقط از جریان پرداخت/کیف پول/یادداشت اعتباری؛ برنامه نمی‌تواند با پرداخت برگشت‌خورده (PAY3) صورتحساب ببندد
+  PERFORM plt_t.fails('T12 settlements only from their owning flows',
     format($q$INSERT INTO platform.invoice_settlement (invoice_id, source_kind, payment_id, amount) VALUES (%L, 'payment', %L, 2000000)$q$, plt_t.u('INV2'), plt_t.u('PAY3')),
-    'HK_PLT_OVERPAYMENT%');
+    'HK_PLT_DERIVED_COLUMN: settlements are written by payment, wallet and credit-note flows only%');
   PERFORM plt_t.fails('T12 settlement of a draft',
     format($q$INSERT INTO platform.invoice_settlement (invoice_id, source_kind, payment_id, amount) VALUES (%L, 'payment', %L, 1)$q$, plt_t.u('INV8'), plt_t.u('PAY3')),
     'HK_PLT_SETTLEMENT_STATE%');
@@ -1094,14 +1372,18 @@ BEGIN
            plt_t.approve('invoice.void', 'invoice', plt_t.u('INV1'), plt_t.u('F'), plt_t.u('F2')), plt_t.u('INV1')),
     'HK_PLT_INVALID_TRANSITION%');
   -- صورتحساب بخشی پرداخت‌شده هم باطل نمی‌شود (یادداشت اعتباری لازم است)
-  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, vat_total, total)
-  VALUES (plt_t.u('INV5'), plt_t.u('BA_A'), plt_t.u('TA'), 'jy:1405', 1000000, 100000, 1100000);
-  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
-  VALUES (plt_t.u('INV5'), 1, 'service', 'آموزش', 1, 1000000, 1000000, 10, 100000, 1100000);
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, vat_total, total, vat_rule_ref)
+  VALUES (plt_t.u('INV5'), plt_t.u('BA_A'), plt_t.u('TA'), plt_t.jy(), 1000000, 100000, 1100000, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (plt_t.u('INV5'), 1, 'service', 'آموزش', '2710000138624', 1, 1000000, 1000000, 10, 100000, 1100000);
   UPDATE platform.invoice SET status = 'issued' WHERE id = plt_t.u('INV5');
   INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key)
   SELECT id, 0, 'invoice_payment', -100000, 0, plt_t.u('INV5'), 'partial-inv5' FROM platform.wallet WHERE tenant_id = plt_t.u('TA');
   PERFORM plt_t.ok('T12 partial settlement', (SELECT status = 'issued' AND paid_amount = 100000 FROM platform.invoice WHERE id = plt_t.u('INV5')));
+  PERFORM plt_t.fails('T12 settlement over outstanding',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key)
+              SELECT id, 0, 'invoice_payment', -2000000, 0, %L, 'over-inv5-01' FROM platform.wallet WHERE tenant_id = %L$q$, plt_t.u('INV5'), plt_t.u('TA')),
+    'HK_PLT_OVERPAYMENT%');
   PERFORM plt_t.fails('T12 partially paid invoice cannot be voided',
     format($q$UPDATE platform.invoice SET status = 'void', void_reason = 'mistake', void_approval_id = %L WHERE id = %L$q$,
            plt_t.approve('invoice.void', 'invoice', plt_t.u('INV5'), plt_t.u('F'), plt_t.u('F2')), plt_t.u('INV5')),
@@ -1115,7 +1397,7 @@ BEGIN
 
   -- یادداشت اعتباری
   INSERT INTO platform.invoice (id, kind, billing_account_id, tenant_id, period_key, original_invoice_id, subtotal, vat_total, total)
-  VALUES (plt_t.u('CN1'), 'credit_note', plt_t.u('BA_A'), plt_t.u('TA'), 'jy:1405', plt_t.u('INV1'), 5000000, 500000, 5500000);
+  VALUES (plt_t.u('CN1'), 'credit_note', plt_t.u('BA_A'), plt_t.u('TA'), plt_t.jy(), plt_t.u('INV1'), 5000000, 500000, 5500000);
   PERFORM plt_t.fails('T12 credit line from original invoice',
     format($q$INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
               VALUES (%L, 1, 'addon', %L, 'x', 1, 1000, 1000, 10, 100, 1100)$q$, plt_t.u('CN1'), plt_t.u('L4')),
@@ -1132,17 +1414,21 @@ BEGIN
     format($q$INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
               VALUES (%L, 1, 'subscription', %L, 'x', 1, 1000, 1000, 10, 100, 1100)$q$, plt_t.u('INV9'), plt_t.u('L1')),
     'HK_PLT_CREDIT_NOTE_LINE%');
-  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, original_line_id, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
-  VALUES (plt_t.u('CL1'), plt_t.u('CN1'), 1, 'subscription', plt_t.u('PV1'), plt_t.u('L1'), 'برگشت بخشی اشتراک', 1, 5000000, 5000000, 10, 500000, 5500000);
+  PERFORM plt_t.fails('T12 credit note line keeps the original sstid',
+    format($q$INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+              VALUES (%L, 1, 'subscription', %L, 'x', '1111111111111', 1, 1000, 1000, 10, 100, 1100)$q$, plt_t.u('CN1'), plt_t.u('L1')),
+    'HK_PLT_CREDIT_NOTE_LINE: credit note line keeps the original sstid%');
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, original_line_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (plt_t.u('CL1'), plt_t.u('CN1'), 1, 'subscription', plt_t.u('PV1'), plt_t.u('L1'), 'برگشت بخشی اشتراک', '2710000138624', 1, 5000000, 5000000, 10, 500000, 5500000);
   UPDATE platform.invoice SET status = 'issued', issued_by = plt_t.u('F') WHERE id = plt_t.u('CN1');
   PERFORM plt_t.ok('T12 credit note numbered and credited to wallet',
-    (SELECT number = 'CN-1405-000001' FROM platform.invoice WHERE id = plt_t.u('CN1'))
+    (SELECT number = 'CN-' || plt_t.yy() || '-000001' FROM platform.invoice WHERE id = plt_t.u('CN1'))
     AND (SELECT balance = 12000000 FROM platform.wallet WHERE tenant_id = plt_t.u('TA'))
     AND EXISTS (SELECT 1 FROM platform.house_sync WHERE doc_type = 'credit_note' AND doc_id = plt_t.u('CN1')));
   INSERT INTO platform.invoice (id, kind, billing_account_id, tenant_id, period_key, original_invoice_id, subtotal, vat_total, total)
-  VALUES (plt_t.u('INVR'), 'credit_note', plt_t.u('BA_A'), plt_t.u('TA'), 'jy:1405', plt_t.u('INV2'), 1000, 100, 1100);
-  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
-  VALUES (plt_t.u('INVR'), 1, 'adjustment', plt_t.u('L2'), 'x', 1, 1000, 1000, 10, 100, 1100);
+  VALUES (plt_t.u('INVR'), 'credit_note', plt_t.u('BA_A'), plt_t.u('TA'), plt_t.jy(), plt_t.u('INV2'), 1000, 100, 1100);
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (plt_t.u('INVR'), 1, 'adjustment', plt_t.u('L2'), 'x', '2710000138624', 1, 1000, 1000, 10, 100, 1100);
   PERFORM plt_t.fails('T12 credit note of a void invoice',
     format($q$UPDATE platform.invoice SET status = 'issued' WHERE id = %L$q$, plt_t.u('INVR')), 'HK_PLT_CREDIT_NOTE_ORIGINAL%');
   DELETE FROM platform.invoice_line WHERE invoice_id = plt_t.u('INVR');
@@ -1151,14 +1437,14 @@ BEGIN
   PERFORM plt_t.ok('T12 voiding the term recomputes coverage', (SELECT covered_through = current_date FROM platform.subscription WHERE id = plt_t.u('SUB_A')));
 
   -- صورتحساب صفر (تخفیف کامل) بلافاصله پرداخت‌شده
-  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, discount_total, vat_total, total)
-  VALUES (plt_t.u('INV0'), plt_t.u('BA_B'), plt_t.u('TB'), 'jy:1405', 1000000, 1000000, 0, 0);
-  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, quantity, unit_amount, amount, discount, vat_rate_pct, vat_amount, total)
-  VALUES (plt_t.u('L0'), plt_t.u('INV0'), 1, 'service', plt_t.u('PV4'), 'مشاورهٔ رایگان', 1, 1000000, 1000000, 1000000, 10, 0, 0);
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, discount_total, vat_total, total, vat_rule_ref)
+  VALUES (plt_t.u('INV0'), plt_t.u('BA_B'), plt_t.u('TB'), plt_t.jy(), 1000000, 1000000, 0, 0, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, sstid, quantity, unit_amount, amount, discount, vat_rate_pct, vat_amount, total)
+  VALUES (plt_t.u('L0'), plt_t.u('INV0'), 1, 'service', plt_t.u('PV4'), 'مشاورهٔ رایگان', '2710000138624', 1, 1000000, 1000000, 1000000, 10, 0, 0);
   UPDATE platform.invoice SET status = 'issued', issued_by = plt_t.u('F') WHERE id = plt_t.u('INV0');
-  PERFORM plt_t.ok('T12 zero invoice paid on issue', (SELECT status = 'paid' AND number = 'INV-1405-000005' FROM platform.invoice WHERE id = plt_t.u('INV0')));
+  PERFORM plt_t.ok('T12 zero invoice paid on issue', (SELECT status = 'paid' AND number = 'INV-' || plt_t.yy() || '-000005' FROM platform.invoice WHERE id = plt_t.u('INV0')));
   PERFORM plt_t.ok('T12 invoice numbers contiguous',
-    (SELECT array_agg(number ORDER BY number) = ARRAY['INV-1405-000001','INV-1405-000002','INV-1405-000003','INV-1405-000004','INV-1405-000005']
+    (SELECT array_agg(number ORDER BY number) = ARRAY['INV-' || plt_t.yy() || '-000001','INV-' || plt_t.yy() || '-000002','INV-' || plt_t.yy() || '-000003','INV-' || plt_t.yy() || '-000004','INV-' || plt_t.yy() || '-000005']
        FROM platform.invoice WHERE kind = 'invoice' AND number IS NOT NULL));
 END $$;
 
@@ -1194,6 +1480,10 @@ BEGIN
     (plt_t.u('TA'), 'limit.users', 'add', 1, now() - interval '1 day', now() + interval '30 days', 'one extra seat for the accountant', plt_t.u('SL'));
   INSERT INTO platform.tenant_entitlement_override (tenant_id, feature_key, mode, enabled, valid_from, valid_to, reason, granted_by) VALUES
     (plt_t.u('TA'), 'module.pos', 'set', false, now() - interval '1 day', now() + interval '30 days', 'pos disabled during dispute', plt_t.u('SL'));
+  PERFORM plt_t.ok('T13 entitlement override enqueues desired-state build (RV-PLT-19)',
+    (SELECT count(*) = 3 FROM platform.job j JOIN platform.tenant_entitlement_override o ON j.dedupe_key = 'ent_override:' || o.id::text || ':set'
+      WHERE o.tenant_id = plt_t.u('TA') AND j.kind = 'control.desired_state.build' AND j.concurrency_key = 'ds:' || plt_t.u('TA')::text
+        AND j.payload->>'cause' = 'override'));
   PERFORM plt_t.fails('T13 overrides do not overlap',
     format($q$INSERT INTO platform.tenant_entitlement_override (tenant_id, feature_key, mode, limit_value, valid_to, reason, granted_by)
               VALUES (%L, 'limit.companies', 'add', 1, now() + interval '10 days', 'another overlapping gift', %L)$q$, plt_t.u('TA'), plt_t.u('SL')),
@@ -1241,26 +1531,57 @@ BEGIN
   PERFORM plt_t.fails('T14 balance only via entries', format($q$UPDATE platform.wallet SET balance = 999999999 WHERE id = %L$q$, v_wa), 'HK_PLT_DERIVED_COLUMN%');
   PERFORM plt_t.fails('T14 wallets start empty',
     format($q$INSERT INTO platform.wallet (owner_kind, tenant_id, balance) VALUES ('tenant', %L, 100)$q$, plt_t.u('TE')), 'HK_PLT_DERIVED_COLUMN%');
-  PERFORM plt_t.fails('T14 entry sign by kind',
-    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'credit_reservation', 100, 0, 'bad-sign-0001')$q$, v_wa),
-    '%wallet_entry_sign%');
+  -- RV-PLT-02: هر نوع ردیف فقط از جریان مالکش؛ برنامه مستقیم فقط invoice_payment و adjustment می‌نویسد
+  PERFORM plt_t.fails('T14 reservation entries only from credit_reservation',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'credit_reservation', -100, 0, 'direct-res-001')$q$, v_wa),
+    'HK_PLT_WALLET_ENTRY_SOURCE: credit_reservation entries are written only by their owning flow%');
+  PERFORM plt_t.fails('T14 commission cannot be minted into a wallet',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'commission', 1000000000000, 0, 'direct-com-001')$q$, v_wa),
+    'HK_PLT_WALLET_ENTRY_SOURCE: commission entries are written only by their owning flow%');
+  PERFORM plt_t.fails('T14 release without reservation',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'reservation_release', 5000000, 0, 'direct-rel-001')$q$, v_wa),
+    'HK_PLT_WALLET_ENTRY_SOURCE%');
+  PERFORM plt_t.fails('T14 credit-note entry only from the credit note',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key) VALUES (%L, 0, 'credit_note', 50000000, 0, %L, 'direct-cn-0001')$q$, v_wa, plt_t.u('INV1')),
+    'HK_PLT_WALLET_ENTRY_SOURCE%');
+  PERFORM plt_t.fails('T14 refund entry only from the refund',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'refund_out', -1, 0, 'direct-rfd-001')$q$, v_wa),
+    'HK_PLT_WALLET_ENTRY_SOURCE%');
+  PERFORM plt_t.fails('T14 top-up only from a verified payment',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, payment_id, idempotency_key) VALUES (%L, 0, 'topup', 1000, 0, %L, 'direct-top-001')$q$, v_wa, plt_t.u('PAY1')),
+    'HK_PLT_WALLET_ENTRY_SOURCE%');
   PERFORM plt_t.fails('T14 adjustment needs approval',
     format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'adjustment', 1000, 0, 'adj-0000001')$q$, v_wa),
     'HK_PLT_APPROVAL_REQUIRED%');
   INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id, memo, created_by_staff)
-  VALUES (v_wa, 0, 'adjustment', 1000, 0, 'adj-0000001', plt_t.approve('wallet.manual_adjustment', 'wallet', v_wa, plt_t.u('F'), plt_t.u('F2')), 'goodwill', plt_t.u('F'));
+  VALUES (v_wa, 0, 'adjustment', 1000, 0, 'adj-0000001', plt_t.approve('wallet.manual_adjustment', 'wallet', v_wa, plt_t.u('F'), plt_t.u('F2'), '{"amount": 1000}'), 'goodwill', plt_t.u('F'));
   PERFORM plt_t.fails('T14 idempotent entry key',
-    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'refund_out', -1, 0, 'adj-0000001')$q$, v_wa),
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id) VALUES (%L, 0, 'adjustment', 5, 0, 'adj-0000001', %L)$q$,
+           v_wa, plt_t.approve('wallet.manual_adjustment', 'wallet', v_wa, plt_t.u('F'), plt_t.u('F2'), '{"amount": 5}')),
     '%wallet_entry_wallet_id_idempotency_key_key%');
+  PERFORM plt_t.as_staff(plt_t.u('F'));
   PERFORM plt_t.fails('T14 insufficient balance',
-    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'refund_out', -100000000, 0, 'big-out-001')$q$, v_wa),
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id) VALUES (%L, 0, 'adjustment', -100000000, 0, 'big-out-001', %L)$q$,
+           v_wa, plt_t.approve('wallet.manual_adjustment', 'wallet', v_wa, plt_t.u('F'), plt_t.u('F2'), '{"amount": -100000000}')),
     'HK_PLT_INSUFFICIENT_BALANCE%');
+  PERFORM plt_t.as_staff(plt_t.u('F'));
   -- پرداخت صورتحساب از کیف پول
-  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, vat_total, total)
-  VALUES (plt_t.u('INV7'), plt_t.u('BA_A'), plt_t.u('TA'), 'jy:1405', 1000000, 100000, 1100000);
-  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
-  VALUES (plt_t.u('L7'), plt_t.u('INV7'), 1, 'credit_pack', 'بستهٔ پیامک', 1, 1000000, 1000000, 10, 100000, 1100000);
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, period_key, subtotal, vat_total, total, vat_rule_ref)
+  VALUES (plt_t.u('INV7'), plt_t.u('BA_A'), plt_t.u('TA'), plt_t.jy(), 1000000, 100000, 1100000, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (plt_t.u('L7'), plt_t.u('INV7'), 1, 'credit_pack', 'بستهٔ پیامک', '2710000138624', 1, 1000000, 1000000, 10, 100000, 1100000);
   UPDATE platform.invoice SET status = 'issued' WHERE id = plt_t.u('INV7');
+  PERFORM plt_t.fails('T14 entry sign by kind',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key) VALUES (%L, 0, 'invoice_payment', 100, 0, %L, 'bad-sign-0001')$q$, v_wa, plt_t.u('INV7')),
+    '%wallet_entry_sign%');
+  -- RV-PLT-03: کیف پول فقط صورتحساب صادرشدهٔ پرداخت‌نشدهٔ همان مالک را می‌پردازد
+  PERFORM plt_t.fails('T14 wallet cannot pay another tenant''s invoice',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key)
+              VALUES (platform.wallet_for('tenant', %L), 0, 'invoice_payment', -1100000, 0, %L, 'pay-inv7-by-tc')$q$, plt_t.u('TC'), plt_t.u('INV7')),
+    'HK_PLT_PAYMENT_TARGET%');
+  PERFORM plt_t.fails('T14 wallet cannot pay a credit note',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key) VALUES (%L, 0, 'invoice_payment', -1, 0, %L, 'pay-cn1-00001')$q$, v_wa, plt_t.u('CN1')),
+    'HK_PLT_PAYMENT_TARGET%');
   INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key) VALUES (v_wa, 0, 'invoice_payment', -1100000, 0, plt_t.u('INV7'), 'pay-inv7-0001');
   PERFORM plt_t.ok('T14 wallet pays invoice', (SELECT status = 'paid' FROM platform.invoice WHERE id = plt_t.u('INV7')));
   PERFORM plt_t.ok('T14 wallet ledger consistent', NOT EXISTS (SELECT 1 FROM platform.v_wallet_integrity)
@@ -1270,7 +1591,7 @@ BEGIN
   PERFORM plt_t.fails('T14 entries append-only', $q$UPDATE platform.wallet_entry SET memo = 'x'$q$, '%permission denied%');
   INSERT INTO platform.wallet (owner_kind, tenant_id, status) VALUES ('tenant', plt_t.u('TB'), 'frozen') RETURNING id INTO v_wb;
   PERFORM plt_t.fails('T14 frozen wallet cannot pay out',
-    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'refund_out', -1, 0, 'frozen-out-01')$q$, v_wb),
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key) VALUES (%L, 0, 'adjustment', -1, 0, 'frozen-out-01')$q$, v_wb),
     'HK_PLT_WALLET_NOT_ACTIVE%');
   PERFORM plt_t.fails('T14 tenant credit limit', format($q$UPDATE platform.wallet SET credit_limit = -1 WHERE id = %L$q$, v_wb), '%wallet_credit_limit%');
 
@@ -1300,6 +1621,20 @@ BEGIN
     AND (SELECT state = 'partially_refunded' AND refunded_amount = 2000000 FROM platform.payment WHERE id = plt_t.u('PAY1')));
   PERFORM plt_t.fails('T14 refunded_amount derived', format($q$UPDATE platform.payment SET refunded_amount = 11000000 WHERE id = %L$q$, plt_t.u('PAY1')), 'HK_PLT_DERIVED_COLUMN%');
   PERFORM plt_t.fails('T14 completed refund final', format($q$UPDATE platform.refund SET status = 'cancelled' WHERE id = %L$q$, plt_t.u('RF1')), 'HK_PLT_INVALID_TRANSITION%');
+  -- RV-PLT-10: بازپرداخت هنگام درخواست وجه را در تعهد می‌گیرد؛ همان مانده دو بار بازپرداخت یا خرج نمی‌شود
+  INSERT INTO platform.refund (id, wallet_id, amount, method, destination_sheba, requested_by)
+  SELECT uuidv7(), v_wa, balance, 'paya', 'IR000000000000000000000009', plt_t.u('F') FROM platform.wallet WHERE id = v_wa;
+  PERFORM plt_t.fails('T14 second refund of the same balance rejected at request',
+    format($q$INSERT INTO platform.refund (wallet_id, amount, method, destination_sheba, requested_by) VALUES (%L, 1, 'paya', 'IR000000000000000000000009', %L)$q$, v_wa, plt_t.u('F')),
+    'HK_PLT_INSUFFICIENT_BALANCE: refund 1 exceeds the available wallet balance 0%');
+  PERFORM plt_t.fails('T14 encumbered balance cannot be spent',
+    format($q$INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, idempotency_key, approval_id) VALUES (%L, 0, 'adjustment', -1, 0, 't14-enc-adj-1', %L)$q$,
+           v_wa, plt_t.approve('wallet.manual_adjustment', 'wallet', v_wa, plt_t.u('F'), plt_t.u('F2'), '{"amount": -1}')),
+    'HK_PLT_INSUFFICIENT_BALANCE%');
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  PERFORM plt_t.ok('T14 encumbrance = open refunds', platform.wallet_encumbered(v_wa) = (SELECT balance FROM platform.wallet WHERE id = v_wa));
+  UPDATE platform.refund SET status = 'cancelled' WHERE wallet_id = v_wa AND status = 'requested';
+  PERFORM plt_t.ok('T14 cancelled refund releases the encumbrance', platform.wallet_encumbered(v_wa) = 0);
 
   -- رزرو اعتبار پیامک از کیف پول
   INSERT INTO platform.service_tariff (service_key, unit_amount, valid_from, created_by) VALUES ('meter.sms_parts', 500, now() - interval '1 day', plt_t.u('F'));
@@ -1349,6 +1684,71 @@ BEGIN
     'HK_PLT_COUPON_INVALID%');
 END $$;
 
+-- T14c (RV-PLT-15) یادداشت اعتباری نخست ماندهٔ پرداخت‌نشدهٔ صورتحساب اصلی را می‌بندد؛ فقط بخشِ پرداخت‌شده به کیف پول برمی‌گردد،
+-- و اعتبار کامل دورهٔ در انتظار را باطل می‌کند (نه فعال)
+DO $$
+DECLARE
+  v_wa uuid; v_before numeric;
+  v_i1 uuid := uuidv7(); v_l1 uuid := uuidv7(); v_c1 uuid := uuidv7();
+  v_i2 uuid := uuidv7(); v_l2 uuid := uuidv7(); v_c2 uuid := uuidv7();
+  v_term uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  SELECT id, balance INTO v_wa, v_before FROM platform.wallet WHERE tenant_id = plt_t.u('TA');
+  -- ۱) صورتحساب پرداخت‌نشده با دورهٔ در انتظار، اعتبار کامل
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, subtotal, vat_total, total, vat_rule_ref)
+  VALUES (v_i1, plt_t.u('BA_A'), plt_t.u('TA'), 1000000, 100000, 1100000, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_l1, v_i1, 1, 'subscription', plt_t.u('PV1'), 'اشتراک', '2710000138624', 1, 1000000, 1000000, 10, 100000, 1100000);
+  UPDATE platform.invoice SET status = 'issued' WHERE id = v_i1;
+  INSERT INTO platform.subscription_term (subscription_id, kind, period_start, period_end, invoice_id)
+  VALUES (plt_t.u('SUB_A'), 'paid', current_date + 600, current_date + 630, v_i1) RETURNING id INTO v_term;
+  INSERT INTO platform.invoice (id, kind, billing_account_id, tenant_id, original_invoice_id, subtotal, vat_total, total)
+  VALUES (v_c1, 'credit_note', plt_t.u('BA_A'), plt_t.u('TA'), v_i1, 1000000, 100000, 1100000);
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_c1, 1, 'subscription', v_l1, 'ابطال اشتراک', '2710000138624', 1, 1000000, 1000000, 10, 100000, 1100000);
+  UPDATE platform.invoice SET status = 'issued' WHERE id = v_c1;
+  PERFORM plt_t.ok('T14c credit note closes the unpaid original, not the wallet',
+    (SELECT paid_amount = total FROM platform.invoice WHERE id = v_i1)
+    AND NOT EXISTS (SELECT 1 FROM platform.v_invoice_outstanding o WHERE o.invoice_id = v_i1)
+    AND (SELECT balance = v_before FROM platform.wallet WHERE id = v_wa)
+    AND NOT EXISTS (SELECT 1 FROM platform.wallet_entry WHERE invoice_id = v_c1)
+    AND EXISTS (SELECT 1 FROM platform.invoice_settlement WHERE credit_note_id = v_c1 AND invoice_id = v_i1 AND amount = 1100000));
+  PERFORM plt_t.ok('T14c fully credited invoice never activates its pending term', (SELECT status = 'void' FROM platform.subscription_term WHERE id = v_term));
+  -- ۲) صورتحساب بخشی پرداخت‌شده، اعتبار کامل: مانده بسته و فقط بخش پرداخت‌شده به کیف پول
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, subtotal, vat_total, total, vat_rule_ref)
+  VALUES (v_i2, plt_t.u('BA_A'), plt_t.u('TA'), 1000000, 100000, 1100000, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_l2, v_i2, 1, 'service', plt_t.u('PV4'), 'خدمت', '2710000138624', 1, 1000000, 1000000, 10, 100000, 1100000);
+  UPDATE platform.invoice SET status = 'issued' WHERE id = v_i2;
+  INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key) VALUES (v_wa, 0, 'invoice_payment', -100000, 0, v_i2, 't14c-partial-1');
+  INSERT INTO platform.invoice (id, kind, billing_account_id, tenant_id, original_invoice_id, subtotal, vat_total, total)
+  VALUES (v_c2, 'credit_note', plt_t.u('BA_A'), plt_t.u('TA'), v_i2, 1000000, 100000, 1100000);
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_c2, 1, 'service', v_l2, 'ابطال خدمت', '2710000138624', 1, 1000000, 1000000, 10, 100000, 1100000);
+  UPDATE platform.invoice SET status = 'issued' WHERE id = v_c2;
+  PERFORM plt_t.ok('T14c only the paid part returns to the wallet',
+    (SELECT balance = v_before FROM platform.wallet WHERE id = v_wa)
+    AND (SELECT amount = 100000 FROM platform.wallet_entry WHERE invoice_id = v_c2 AND kind = 'credit_note')
+    AND (SELECT paid_amount = total FROM platform.invoice WHERE id = v_i2));
+  PERFORM plt_t.fails('T14c one settlement per credit note',
+    format($q$INSERT INTO platform.invoice_settlement (invoice_id, source_kind, credit_note_id, amount) VALUES (%L, 'credit_note', %L, 1)$q$, v_i2, v_c2),
+    '%invoice_settlement_one_per_credit_note%');
+  PERFORM plt_t.ok('T14c wallet ledger consistent', NOT EXISTS (SELECT 1 FROM platform.v_wallet_integrity));
+  -- RV-PLT-05: مسیر موفق ملت: verify ← settling (بدون اثر) ← settle موفق ← verified و شارژ کیف پول
+  SELECT balance INTO v_before FROM platform.wallet WHERE id = v_wa;
+  INSERT INTO platform.payment (id, payer_kind, billing_account_id, tenant_id, purpose, wallet_id, method, gateway_account_id, provider, order_id, amount, api_amount, api_amount_unit, expires_at)
+  VALUES (v_i1, 'tenant', plt_t.u('BA_A'), plt_t.u('TA'), 'wallet_topup', v_wa, 'gateway', plt_t.u('GW2'), 'mellat', 'ORD-MELLAT-OK', 500000, 500000, 'IRR', now() + interval '30 minutes');
+  UPDATE platform.payment SET state = 'redirected', provider_ref = 'MELLAT-REF-2' WHERE id = v_i1;
+  UPDATE platform.payment SET state = 'callback_received' WHERE id = v_i1;
+  UPDATE platform.payment SET state = 'settling', verified_amount = 500000, provider_txn_ref = 'M-SALE-2' WHERE id = v_i1;
+  PERFORM plt_t.ok('T14c Mellat top-up not credited before settle', (SELECT balance = v_before FROM platform.wallet WHERE id = v_wa));
+  UPDATE platform.payment SET state = 'verified', last_response_code = '0' WHERE id = v_i1;
+  PERFORM plt_t.ok('T14c Mellat top-up credited after settle',
+    (SELECT balance = v_before + 500000 FROM platform.wallet WHERE id = v_wa)
+    AND (SELECT settled_at IS NOT NULL AND verified_at IS NOT NULL FROM platform.payment WHERE id = v_i1));
+END $$;
+
 -- T15 همگام‌سازی با مستأجر خانه و یادآور
 DO $$
 BEGIN
@@ -1381,6 +1781,9 @@ DECLARE
   v_rule_res uuid;
   v_ce uuid;
   v_w uuid;
+  v_inv uuid := uuidv7();
+  v_line uuid := uuidv7();
+  v_pay uuid := uuidv7();
 BEGIN
   PERFORM plt_t.as_staff(plt_t.u('A'));
   PERFORM plt_t.fails('T16 active reseller needs contract',
@@ -1448,7 +1851,7 @@ BEGIN
     format($q$INSERT INTO platform.commission_entry (reseller_id, event, amount, reason) VALUES (%L, 'adjustment', 4000000, 'manual bonus for Q3 targets')$q$, plt_t.u('R1')),
     'HK_PLT_APPROVAL_REQUIRED%');
   INSERT INTO platform.commission_entry (reseller_id, event, amount, reason, approval_id)
-  VALUES (plt_t.u('R1'), 'adjustment', 4000000, 'manual bonus for Q3 targets', plt_t.approve('commission.adjustment', 'reseller', plt_t.u('R1'), plt_t.u('A'), plt_t.u('F')));
+  VALUES (plt_t.u('R1'), 'adjustment', 4000000, 'manual bonus for Q3 targets', plt_t.approve('commission.adjustment', 'reseller', plt_t.u('R1'), plt_t.u('A'), plt_t.u('F'), '{"amount": 4000000}'));
   PERFORM plt_t.ok('T16 reseller wallet = net commissions', (SELECT balance = 4000000 FROM platform.wallet WHERE id = v_w));
   PERFORM plt_t.fails('T16 commission entries append-only', $q$UPDATE platform.commission_entry SET reason = 'x'$q$, '%permission denied%');
 
@@ -1466,7 +1869,8 @@ BEGIN
     format($q$UPDATE platform.payout SET status = 'submitted', amount = 2000000 WHERE id = %L$q$, plt_t.u('PO1')), 'HK_PLT_INSUFFICIENT_BALANCE%');
   PERFORM plt_t.fails('T16 submitted payout frozen', format($q$UPDATE platform.payout SET amount = 1 WHERE id = %L$q$, plt_t.u('PO2')), 'HK_PLT_IMMUTABLE_FIELD%');
   PERFORM plt_t.fails('T16 payout approval required', format($q$UPDATE platform.payout SET status = 'approved' WHERE id = %L$q$, plt_t.u('PO2')), 'HK_PLT_APPROVAL_REQUIRED%');
-  UPDATE platform.payout SET status = 'approved', approval_id = plt_t.approve('payout.approve', 'payout', plt_t.u('PO2'), plt_t.u('A'), plt_t.u('F')) WHERE id = plt_t.u('PO2');
+  UPDATE platform.payout SET status = 'approved', approval_id = plt_t.approve('payout.approve', 'payout', plt_t.u('PO2'), plt_t.u('A'), plt_t.u('F'),
+                                                                               (SELECT to_jsonb(p) FROM platform.payout p WHERE p.id = plt_t.u('PO2'))) WHERE id = plt_t.u('PO2');
   PERFORM plt_t.fails('T16 taxpayer reseller e-invoice before paying',
     format($q$UPDATE platform.payout SET status = 'paid', bank_ref = 'SATNA-1' WHERE id = %L$q$, plt_t.u('PO2')), 'HK_PLT_PAYOUT_TAX_INVOICE%');
   UPDATE platform.payout SET status = 'paid', bank_ref = 'SATNA-1', reseller_invoice_taxid = 'B22222222222222222222B' WHERE id = plt_t.u('PO2');
@@ -1475,6 +1879,18 @@ BEGIN
   UPDATE platform.payout SET status = 'cancelled' WHERE id = plt_t.u('PO1');
   PERFORM plt_t.fails('T16 paid payout final', format($q$UPDATE platform.payout SET status = 'failed', failure_reason = 'x' WHERE id = %L$q$, plt_t.u('PO2')), 'HK_PLT_INVALID_TRANSITION%');
   -- بازپس‌گیری کمیسیون پس از تسویه می‌تواند کیف پول نماینده را منفی کند (بدهی به پلتفرم)
+  -- RV-PLT-16: رویداد از نوع سطر مشتق می‌شود؛ سطر افزونه با نرخ «نخستین فروش» تعهد نمی‌شود، بستهٔ اعتبار کمیسیون ندارد
+  PERFORM plt_t.fails('T16 commission event is derived from the line kind',
+    format($q$INSERT INTO platform.commission_entry (reseller_id, event, invoice_id, invoice_line_id, rule_id, basis_amount, rate_pct, amount) VALUES (%L, 'first_sale', %L, %L, %L, 0, 0, 1)$q$,
+           plt_t.u('R1'), plt_t.u('INV4'), plt_t.u('L4'), platform.commission_rule_for(plt_t.u('R1'), 'first_sale', 'extra_pos', current_date)),
+    'HK_PLT_COMMISSION_RULE: event for this line is addon, not first_sale%');
+  PERFORM plt_t.fails('T16 credit_pack lines earn no commission',
+    format($q$INSERT INTO platform.commission_entry (reseller_id, event, invoice_id, invoice_line_id, rule_id, basis_amount, rate_pct, amount) VALUES (%L, 'first_sale', %L, %L, %L, 0, 0, 1)$q$,
+           plt_t.u('R1'), plt_t.u('INV7'), plt_t.u('L7'), v_rule_tier),
+    'HK_PLT_COMMISSION_BASIS: credit_pack lines earn no commission%');
+  PERFORM plt_t.ok('T16 event derivation',
+    platform.commission_event_for(plt_t.u('L1')) = 'first_sale' AND platform.commission_event_for(plt_t.u('L4')) = 'addon'
+    AND platform.commission_event_for(plt_t.u('L7')) IS NULL);
   INSERT INTO platform.commission_entry (reseller_id, event, invoice_id, invoice_line_id, rule_id, basis_amount, rate_pct, amount)
   VALUES (plt_t.u('R1'), 'addon', plt_t.u('INV4'), plt_t.u('L4'), platform.commission_rule_for(plt_t.u('R1'), 'addon', 'extra_pos', current_date), 0, 0, 1)
   RETURNING id INTO v_ce;
@@ -1482,10 +1898,32 @@ BEGIN
   INSERT INTO platform.payout (id, reseller_id, wallet_id, amount, sheba, requested_by_kind, requested_by_id)
   VALUES (plt_t.u('U1'), plt_t.u('R1'), v_w, 1600000, 'IR000000000000000000000001', 'staff', plt_t.u('A'));
   UPDATE platform.payout SET status = 'submitted' WHERE id = plt_t.u('U1');
-  UPDATE platform.payout SET status = 'approved', approval_id = plt_t.approve('payout.approve', 'payout', plt_t.u('U1'), plt_t.u('A'), plt_t.u('F')) WHERE id = plt_t.u('U1');
+  UPDATE platform.payout SET status = 'approved', approval_id = plt_t.approve('payout.approve', 'payout', plt_t.u('U1'), plt_t.u('A'), plt_t.u('F'),
+                                                                               (SELECT to_jsonb(p) FROM platform.payout p WHERE p.id = plt_t.u('U1'))) WHERE id = plt_t.u('U1');
   UPDATE platform.payout SET status = 'paid', bank_ref = 'SATNA-2', reseller_invoice_taxid = 'B33333333333333333333B' WHERE id = plt_t.u('U1');
   INSERT INTO platform.commission_entry (reseller_id, event, reverses_entry_id, amount) VALUES (plt_t.u('R1'), 'reversal', v_ce, -600000);
   PERFORM plt_t.ok('T16 clawback leaves reseller debt', (SELECT balance = -600000 FROM platform.wallet WHERE id = v_w));
+  -- RV-PLT-09: کف مانده فقط برای برداشت است؛ تعهد کمیسیون تازه و شارژ تأییدشده بدهی نماینده را کم می‌کنند
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, subtotal, vat_total, total, vat_rule_ref)
+  VALUES (v_inv, plt_t.u('BA_A'), plt_t.u('TA'), 1000000, 100000, 1100000, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_line, v_inv, 1, 'addon', plt_t.u('PV2'), 'صندوق اضافه', '2710000138624', 1, 1000000, 1000000, 10, 100000, 1100000);
+  UPDATE platform.invoice SET status = 'issued' WHERE id = v_inv;
+  INSERT INTO platform.wallet_entry (wallet_id, seq, kind, amount, balance_after, invoice_id, idempotency_key)
+  SELECT id, 0, 'invoice_payment', -1100000, 0, v_inv, 't16-pay-addon-1' FROM platform.wallet WHERE tenant_id = plt_t.u('TA');
+  INSERT INTO platform.commission_entry (reseller_id, event, invoice_id, invoice_line_id, rule_id, basis_amount, rate_pct, amount)
+  VALUES (plt_t.u('R1'), 'addon', v_inv, v_line, platform.commission_rule_for(plt_t.u('R1'), 'addon', 'extra_pos', current_date), 0, 0, 1);
+  PERFORM plt_t.ok('T16 accrual after clawback reduces debt', (SELECT balance = -500000 FROM platform.wallet WHERE id = v_w));
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  INSERT INTO platform.payment (id, payer_kind, billing_account_id, reseller_id, purpose, wallet_id, method, order_id, amount, api_amount, api_amount_unit, expires_at)
+  VALUES (v_pay, 'reseller', plt_t.u('BA_R1'), plt_t.u('R1'), 'wallet_topup', v_w, 'bank_transfer', 'ORD-R1-TOPUP-1', 200000, 200000, 'IRR', now() + interval '1 day');
+  UPDATE platform.payment SET state = 'verified', verified_amount = 200000, bank_ref = 'BT-R1-1' WHERE id = v_pay;
+  PERFORM plt_t.ok('T16 reseller top-up while in debt is recorded', (SELECT balance = -300000 FROM platform.wallet WHERE id = v_w));
+  PERFORM plt_t.fails('T16 indebted reseller cannot be paid out',
+    format($q$INSERT INTO platform.payout (reseller_id, wallet_id, amount, sheba, requested_by_kind, requested_by_id, status) VALUES (%L, %L, 1, 'IR000000000000000000000001', 'staff', %L, 'draft');
+              UPDATE platform.payout SET status = 'submitted' WHERE reseller_id = %L AND status = 'draft' AND amount = 1$q$, plt_t.u('R1'), v_w, plt_t.u('A'), plt_t.u('R1')),
+    'HK_PLT_INSUFFICIENT_BALANCE%');
+  PERFORM plt_t.as_staff(plt_t.u('A'));
   PERFORM plt_t.ok('T16 reseller wallet consistent', NOT EXISTS (SELECT 1 FROM platform.v_wallet_integrity));
   -- سهمیهٔ لایسنس
   PERFORM plt_t.fails('T16 quota purchase needs paid reseller invoice',
@@ -1495,12 +1933,58 @@ BEGIN
     format($q$INSERT INTO platform.reseller_quota_entry (reseller_id, product_code, seq, kind, delta, balance_after, approval_id) VALUES (%L, 'pro', 0, 'adjustment', 5, 0, %L)$q$, plt_t.u('R1'), plt_t.u('PO2')),
     'HK_PLT_QUOTA_SHAPE%');
   INSERT INTO platform.reseller_quota_entry (reseller_id, product_code, seq, kind, delta, balance_after, approval_id)
-  VALUES (plt_t.u('R1'), 'onprem_pro', 0, 'adjustment', 2, 0, plt_t.approve('reseller.quota_adjustment', 'reseller', plt_t.u('R1'), plt_t.u('F'), plt_t.u('A')));
+  VALUES (plt_t.u('R1'), 'onprem_pro', 0, 'adjustment', 2, 0, plt_t.approve('reseller.quota_adjustment', 'reseller', plt_t.u('R1'), plt_t.u('F'), plt_t.u('A'),
+                                                                              '{"product_code": "onprem_pro", "delta": 2}'));
   PERFORM plt_t.ok('T16 quota balance', (SELECT balance_after = 2 AND seq = 1 FROM platform.reseller_quota_entry WHERE reseller_id = plt_t.u('R1')));
   PERFORM plt_t.fails('T16 quota never negative',
     format($q$INSERT INTO platform.reseller_quota_entry (reseller_id, product_code, seq, kind, delta, balance_after, approval_id) VALUES (%L, 'onprem_pro', 0, 'adjustment', -3, 0, %L)$q$,
-           plt_t.u('R1'), plt_t.approve('reseller.quota_adjustment', 'reseller', plt_t.u('R1'), plt_t.u('F'), plt_t.u('A'))),
+           plt_t.u('R1'), plt_t.approve('reseller.quota_adjustment', 'reseller', plt_t.u('R1'), plt_t.u('F'), plt_t.u('A'),
+                                        '{"product_code": "onprem_pro", "delta": -3}')),
     'HK_PLT_QUOTA_EXHAUSTED%');
+END $$;
+
+-- T16b (RV-PLT-10) دو ارسال هم‌زمان تسویه از یک مانده: دومی پشت قفل کیف پول منتظر می‌ماند و پس از commit اولی رد می‌شود
+RESET ROLE;
+INSERT INTO plt_t.ids (name, id) VALUES ('PR1', '70000000-0000-7000-8000-00000000810a'), ('PR2', '70000000-0000-7000-8000-00000000810b');
+SET ROLE hk_platform_app;
+DO $$
+DECLARE v_w uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  SELECT id INTO v_w FROM platform.wallet WHERE reseller_id = plt_t.u('R1');
+  INSERT INTO platform.commission_entry (reseller_id, event, amount, reason, approval_id)
+  VALUES (plt_t.u('R1'), 'adjustment', 2000000, 'settle Q4 bonus for the race test', plt_t.approve('commission.adjustment', 'reseller', plt_t.u('R1'), plt_t.u('A'), plt_t.u('F'), '{"amount": 2000000}'));
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  INSERT INTO platform.payout (id, reseller_id, wallet_id, amount, sheba, requested_by_kind, requested_by_id) VALUES
+    (plt_t.u('PR1'), plt_t.u('R1'), v_w, 1000000, 'IR000000000000000000000001', 'staff', plt_t.u('A')),
+    (plt_t.u('PR2'), plt_t.u('R1'), v_w, 1000000, 'IR000000000000000000000001', 'staff', plt_t.u('A'));
+  PERFORM plt_t.ok('T16b balance 1700000', (SELECT balance = 1700000 FROM platform.wallet WHERE id = v_w));
+END $$;
+RESET ROLE;
+SELECT plt_t.dblink_connect('po1', format('dbname=%s port=%s user=postgres', current_database(), current_setting('port'))) \gset
+SELECT plt_t.dblink_connect('po2', format('dbname=%s port=%s user=postgres', current_database(), current_setting('port'))) \gset
+SELECT plt_t.dblink_exec('po1', 'BEGIN') \gset
+SELECT plt_t.dblink_exec('po1', 'SET LOCAL ROLE hk_platform_app') \gset
+SELECT plt_t.dblink_exec('po1', format($q$UPDATE platform.payout SET status = 'submitted' WHERE id = %L$q$, plt_t.u('PR1'))) \gset
+SELECT plt_t.dblink_exec('po2', 'BEGIN') \gset
+SELECT plt_t.dblink_exec('po2', 'SET LOCAL ROLE hk_platform_app') \gset
+SELECT plt_t.dblink_send_query('po2', format($q$UPDATE platform.payout SET status = 'submitted' WHERE id = %L$q$, plt_t.u('PR2'))) \gset
+SELECT pg_sleep(0.5) \gset
+SELECT plt_t.ok('T16b second payout submission waits on the wallet lock', plt_t.dblink_is_busy('po2') = 1) \gset
+SELECT plt_t.dblink_exec('po1', 'COMMIT') \gset
+SELECT count(*) AS po2_rows FROM plt_t.dblink_get_result('po2', false) AS t(x text) \gset
+SELECT plt_t.ok('T16b concurrent payout over the same balance is rejected', plt_t.dblink_error_message('po2') LIKE '%HK_PLT_INSUFFICIENT_BALANCE%') \gset
+SELECT count(*) AS po2_drain FROM plt_t.dblink_get_result('po2', false) AS t(x text) \gset
+SELECT plt_t.dblink_exec('po2', 'ROLLBACK') \gset
+SELECT plt_t.dblink_disconnect('po1') \gset
+SELECT plt_t.dblink_disconnect('po2') \gset
+SET ROLE hk_platform_app;
+DO $$
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('A'));
+  PERFORM plt_t.ok('T16b one payout submitted, the other still draft',
+    (SELECT status = 'submitted' FROM platform.payout WHERE id = plt_t.u('PR1')) AND (SELECT status = 'draft' FROM platform.payout WHERE id = plt_t.u('PR2')));
+  UPDATE platform.payout SET status = 'cancelled' WHERE id IN (plt_t.u('PR1'), plt_t.u('PR2'));
 END $$;
 
 -- T17 سفارش خدمت (مهاجرت همراه، نصب On-prem)
@@ -1539,6 +2023,24 @@ BEGIN
   INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, tenant_id, kind, item_count, payload_sha256)
   VALUES (plt_t.u('UB1'), 'cell', 'cell-02', plt_t.u('TA'), 'usage', 6, plt_t.h('ub1')) ON CONFLICT (batch_id) DO NOTHING;
   PERFORM plt_t.ok('T18 duplicate batch is a no-op', (SELECT count(*) = 1 FROM platform.uplink_batch WHERE batch_id = plt_t.u('UB1')));
+  -- دستهٔ سلولی دوم (cell-01: مستأجر TB و سلامت cell-01)
+  INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, tenant_id, kind, item_count, payload_sha256)
+  VALUES (plt_t.u('UB3'), 'cell', 'cell-01', NULL, 'events', 3, plt_t.h('ub3'));
+  -- RV-X4-02: فرستنده باید مالک مستأجر اعلام‌شده باشد
+  PERFORM plt_t.fails('T18 batch tenant must be owned by the sending cell',
+    format($q$INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, tenant_id, kind, item_count, payload_sha256) VALUES (gen_random_uuid(), 'cell', 'cell-01', %L, 'usage', 1, plt_t.h('x1'))$q$, plt_t.u('TA')),
+    'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  PERFORM plt_t.fails('T18 unknown uplink source',
+    $q$INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, kind, item_count, payload_sha256) VALUES (gen_random_uuid(), 'cell', 'cell-zz', 'usage', 1, plt_t.h('x2'))$q$,
+    'HK_PLT_UPLINK_FOREIGN_SOURCE%');
+  PERFORM plt_t.fails('T18 ingest writes are bound to a batch',
+    format($q$INSERT INTO platform.moadian_tenant_stat (tenant_id, day, batch_id) VALUES (%L, current_date - 3, NULL)$q$, plt_t.u('TA')),
+    'HK_PLT_UPLINK_BATCH_REQUIRED%');
+  PERFORM plt_t.fails('T18 a cell cannot write another cell''s tenant',
+    format($q$INSERT INTO platform.usage_event (tenant_id, event_id, metric, quantity, occurred_at, day, batch_id) VALUES (%L, gen_random_uuid(), 'meter.sms_parts', 999, now(), current_date, %L)$q$,
+           plt_t.u('TA'), plt_t.u('UB3')),
+    'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  PERFORM set_config('app.uplink_batch_id', plt_t.u('UB1')::text, true);
   PERFORM plt_t.fails('T18 same batch id with other payload',
     format($q$INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, tenant_id, kind, item_count, payload_sha256) VALUES (%L, 'cell', 'cell-02', %L, 'usage', 6, plt_t.h('other')) ON CONFLICT (batch_id) DO NOTHING$q$,
            plt_t.u('UB1'), plt_t.u('TA')),
@@ -1558,6 +2060,21 @@ BEGIN
     format($q$INSERT INTO platform.usage_event (tenant_id, event_id, metric, quantity, occurred_at, day, batch_id) VALUES (%L, '70000000-0000-7000-8000-00000000e101', 'meter.sms_parts', 10, now(), current_date, %L)$q$,
            plt_t.u('TA'), plt_t.u('UB1')),
     '%usage_event_pkey%');
+  -- RV-PLT-06: یک رویداد assistant.run.metered سه meter می‌دهد؛ بازپخش همان رویداد با ON CONFLICT بی‌اثر است
+  INSERT INTO platform.usage_event (tenant_id, event_id, metric, quantity, occurred_at, day, batch_id) VALUES
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000ee01', 'ai.tokens', 12000, now(), current_date, plt_t.u('UB1')),
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000ee01', 'ai.cost', 3500, now(), current_date, plt_t.u('UB1')),
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000ee01', 'ai.runs', 1, now(), current_date, plt_t.u('UB1'));
+  INSERT INTO platform.usage_event (tenant_id, event_id, metric, quantity, occurred_at, day, batch_id) VALUES
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000ee01', 'ai.tokens', 12000, now(), current_date, plt_t.u('UB1')),
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000ee01', 'ai.cost', 3500, now(), current_date, plt_t.u('UB1')),
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000ee01', 'ai.runs', 1, now(), current_date, plt_t.u('UB1'))
+  ON CONFLICT DO NOTHING;
+  PERFORM plt_t.ok('T18 one metered event = three meters, replay is a no-op',
+    (SELECT count(*) = 3 FROM platform.usage_event WHERE event_id = '70000000-0000-7000-8000-00000000ee01')
+    AND (SELECT quantity = 12000 AND event_count = 1 FROM platform.usage_daily WHERE tenant_id = plt_t.u('TA') AND metric = 'ai.tokens')
+    AND (SELECT quantity = 3500 FROM platform.usage_daily WHERE tenant_id = plt_t.u('TA') AND metric = 'ai.cost')
+    AND (SELECT quantity = 1 FROM platform.usage_daily WHERE tenant_id = plt_t.u('TA') AND metric = 'ai.runs'));
   PERFORM plt_t.fails('T18 flags are not usage metrics',
     format($q$INSERT INTO platform.usage_event (tenant_id, event_id, metric, quantity, occurred_at, day, batch_id) VALUES (%L, gen_random_uuid(), 'module.pos', 1, now(), current_date, %L)$q$,
            plt_t.u('TA'), plt_t.u('UB1')),
@@ -1569,50 +2086,77 @@ BEGIN
   PERFORM plt_t.fails('T18 usage daily derived', format($q$UPDATE platform.usage_daily SET quantity = 0 WHERE tenant_id = %L$q$, plt_t.u('TA')), 'HK_PLT_DERIVED_COLUMN%');
   PERFORM plt_t.fails('T18 events append-only', $q$UPDATE platform.usage_event SET quantity = 0$q$, '%permission denied%');
   -- آینهٔ رضایت پشتیبانی مستأجر
-  INSERT INTO platform.support_consent (tenant_id, grant_id, grantee_kind, reseller_id, access_mode, max_session_minutes, starts_at, expires_at) VALUES
-    (plt_t.u('TA'), plt_t.u('G1'), 'platform_support', NULL, 'read_only', 60, now() - interval '1 hour', now() + interval '23 hours'),
-    (plt_t.u('TA'), plt_t.u('G2'), 'platform_support', NULL, 'read_write', 120, now() - interval '1 hour', now() + interval '23 hours'),
-    (plt_t.u('TA'), plt_t.u('G3'), 'reseller', plt_t.u('R1'), 'read_only', 60, now() - interval '1 hour', now() + interval '23 hours'),
-    (plt_t.u('TA'), plt_t.u('G4'), 'platform_support', NULL, 'read_only', 60, now() - interval '3 days', now() - interval '2 days');
+  INSERT INTO platform.support_consent (tenant_id, grant_id, grantee_kind, reseller_id, access_mode, max_session_minutes, starts_at, expires_at, batch_id) VALUES
+    (plt_t.u('TA'), plt_t.u('G1'), 'platform_support', NULL, 'read_only', 60, now() - interval '1 hour', now() + interval '23 hours', plt_t.u('UB1')),
+    (plt_t.u('TA'), plt_t.u('G2'), 'platform_support', NULL, 'read_write', 120, now() - interval '1 hour', now() + interval '23 hours', plt_t.u('UB1')),
+    (plt_t.u('TA'), plt_t.u('G3'), 'reseller', plt_t.u('R1'), 'read_only', 60, now() - interval '1 hour', now() + interval '23 hours', plt_t.u('UB1')),
+    (plt_t.u('TA'), plt_t.u('G4'), 'platform_support', NULL, 'read_only', 60, now() - interval '3 days', now() - interval '2 days', plt_t.u('UB1'));
   PERFORM plt_t.fails('T18 consent cannot be extended',
     format($q$UPDATE platform.support_consent SET expires_at = expires_at + interval '1 day' WHERE grant_id = %L$q$, plt_t.u('G1')), 'HK_PLT_CONSENT_EXTEND%');
   PERFORM plt_t.fails('T18 consent content immutable',
     format($q$UPDATE platform.support_consent SET access_mode = 'read_write' WHERE grant_id = %L$q$, plt_t.u('G1')), 'HK_PLT_IMMUTABLE_FIELD%');
   PERFORM plt_t.fails('T18 consent window at most 7 days',
-    format($q$INSERT INTO platform.support_consent (tenant_id, grant_id, grantee_kind, access_mode, max_session_minutes, starts_at, expires_at) VALUES (%L, gen_random_uuid(), 'platform_support', 'read_only', 60, now(), now() + interval '8 days')$q$, plt_t.u('TA')),
+    format($q$INSERT INTO platform.support_consent (tenant_id, grant_id, grantee_kind, access_mode, max_session_minutes, starts_at, expires_at, batch_id) VALUES (%L, gen_random_uuid(), 'platform_support', 'read_only', 60, now(), now() + interval '8 days', %L)$q$, plt_t.u('TA'), plt_t.u('UB1')),
     '%support_consent_check%');
   -- لنگر ممیزی مستأجر (T24)
-  INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at) VALUES
-    (plt_t.u('TA'), 0, 10, plt_t.h('a10'), gen_random_uuid(), now());
+  INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at, batch_id) VALUES
+    (plt_t.u('TA'), 0, 10, plt_t.h('a10'), gen_random_uuid(), now(), plt_t.u('UB1'));
   PERFORM plt_t.fails('T24 audit fork detected',
-    format($q$INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at) VALUES (%L, 0, 10, plt_t.h('forged'), gen_random_uuid(), now())$q$, plt_t.u('TA')),
+    format($q$INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at, batch_id) VALUES (%L, 0, 10, plt_t.h('forged'), gen_random_uuid(), now(), %L)$q$, plt_t.u('TA'), plt_t.u('UB1')),
     'HK_PLT_AUDIT_FORK%');
   PERFORM plt_t.fails('T24 audit rollback detected',
-    format($q$INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at) VALUES (%L, 0, 5, plt_t.h('a5'), gen_random_uuid(), now())$q$, plt_t.u('TA')),
+    format($q$INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at, batch_id) VALUES (%L, 0, 5, plt_t.h('a5'), gen_random_uuid(), now(), %L)$q$, plt_t.u('TA'), plt_t.u('UB1')),
     'HK_PLT_AUDIT_ROLLBACK%');
-  INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at) VALUES (plt_t.u('TA'), 0, 20, plt_t.h('a20'), gen_random_uuid(), now());
+  PERFORM plt_t.fails('T24 another cell cannot anchor this tenant (forged far-future seq)',
+    format($q$INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at, batch_id) VALUES (%L, 0, 9000000000000000, plt_t.h('forged'), gen_random_uuid(), now(), %L)$q$, plt_t.u('TA'), plt_t.u('UB3')),
+    'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at, batch_id) VALUES (plt_t.u('TA'), 0, 20, plt_t.h('a20'), gen_random_uuid(), now(), plt_t.u('UB1'));
   -- مرکز مهاجرت: نامزد فرهنگ و رأی مستأجرها
   INSERT INTO platform.migration_dictionary_candidate (id, source_system, dict_kind, source_text_norm, target_key)
   VALUES (plt_t.u('C1'), 'holoo', 'header_synonym', 'کد کالا', 'item.code');
-  INSERT INTO platform.migration_dictionary_vote (candidate_id, tenant_id) VALUES (plt_t.u('C1'), plt_t.u('TA')), (plt_t.u('C1'), plt_t.u('TB'));
+  INSERT INTO platform.migration_dictionary_vote (candidate_id, tenant_id, batch_id) VALUES (plt_t.u('C1'), plt_t.u('TA'), plt_t.u('UB1')), (plt_t.u('C1'), plt_t.u('TB'), plt_t.u('UB3'));
+  PERFORM plt_t.ok('T22 dict kind mapping', platform.migration_dict_kind('column') = 'header_synonym' AND platform.migration_dict_kind('value_unit') = 'value_alias'
+                                            AND platform.migration_dict_kind('row') IS NULL);
   PERFORM plt_t.ok('T22 votes counted', (SELECT distinct_tenants = 2 AND status = 'collecting' FROM platform.migration_dictionary_candidate WHERE id = plt_t.u('C1')));
   PERFORM plt_t.fails('T22 one vote per tenant',
-    format($q$INSERT INTO platform.migration_dictionary_vote (candidate_id, tenant_id) VALUES (%L, %L)$q$, plt_t.u('C1'), plt_t.u('TA')),
+    format($q$INSERT INTO platform.migration_dictionary_vote (candidate_id, tenant_id, batch_id) VALUES (%L, %L, %L)$q$, plt_t.u('C1'), plt_t.u('TA'), plt_t.u('UB1')),
     '%migration_dictionary_vote_pkey%');
-  INSERT INTO platform.migration_job_stat (tenant_id, job_id, source_system, channel, status, rows_total, issues_by_code, source_event_at)
-  VALUES (plt_t.u('TA'), plt_t.u('U1'), 'holoo', 'agent', 'running', 1000, '{"MIG_UNIT_MISSING": 3}', now());
+  -- RV-MG-10: واژگان همان migration.job سلول (بکاپ هلو، قالب اکسل، ...) و «همراه کارشناس» پرچم جدا
+  INSERT INTO platform.migration_job_stat (tenant_id, job_id, source_system, channel, assisted, status, rows_total, issues_by_code, source_event_at, batch_id) VALUES
+    (plt_t.u('TA'), plt_t.u('U1'), 'holoo', 'agent', false, 'running', 1000, '{"MIG_UNIT_MISSING": 3}', now(), plt_t.u('UB1')),
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000c0b1', 'sepidar', 'backup', true, 'staged', 50, '{}', now(), plt_t.u('UB1')),
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000c0b2', 'template', 'file', false, 'staged', 20, '{}', now(), plt_t.u('UB1')),
+    (plt_t.u('TA'), '70000000-0000-7000-8000-00000000c0b3', 'generic_tb', 'file', false, 'staged', 20, '{}', now(), plt_t.u('UB1'));
+  PERFORM plt_t.fails('T22 assisted is a flag, not a channel',
+    format($q$INSERT INTO platform.migration_job_stat (tenant_id, job_id, source_system, channel, status, source_event_at, batch_id) VALUES (%L, gen_random_uuid(), 'holoo', 'assisted', 'x', now(), %L)$q$, plt_t.u('TA'), plt_t.u('UB1')),
+    '%migration_job_stat_channel_check%');
+
   UPDATE platform.migration_job_stat SET status = 'queued', source_event_at = now() - interval '1 hour' WHERE job_id = plt_t.u('U1');
   PERFORM plt_t.ok('T22 stale job event ignored', (SELECT status = 'running' FROM platform.migration_job_stat WHERE job_id = plt_t.u('U1')));
   UPDATE platform.migration_job_stat SET status = 'committed', issues_by_code = '{"MIG_UNIT_MISSING": 4, "MIG_DUP_CODE": 1}', source_event_at = now() + interval '1 minute' WHERE job_id = plt_t.u('U1');
   -- آمار مؤدیان
-  INSERT INTO platform.moadian_tenant_stat (tenant_id, day, sent, accepted, rejected, pending, near_deadline, signer_mode, signer_online, cert_expires_on)
-  VALUES (plt_t.u('TA'), current_date, 40, 37, 1, 2, 1, 'device_agent', false, current_date + 10);
+  INSERT INTO platform.moadian_tenant_stat (tenant_id, day, sent, accepted, rejected, pending, near_deadline, signer_mode, signer_online, cert_expires_on, batch_id)
+  VALUES (plt_t.u('TA'), current_date, 40, 37, 1, 2, 1, 'device_agent', false, current_date + 10, plt_t.u('UB1'));
+  -- RV-AST-18: آینهٔ رضایت دستیار؛ رویداد کهنه‌تر بی‌اثر
+  INSERT INTO platform.ai_tenant_consent (tenant_id, action, text_code, purposes, fingerprints, source_event_at, batch_id)
+  VALUES (plt_t.u('TA'), 'granted', 'ai-consent-v1', '{chat}', '{}', now(), plt_t.u('UB1'));
+  UPDATE platform.ai_tenant_consent SET action = 'revoked', source_event_at = now() - interval '1 hour', batch_id = plt_t.u('UB1') WHERE tenant_id = plt_t.u('TA');
+  PERFORM plt_t.ok('T18 stale consent event ignored', (SELECT action = 'granted' FROM platform.ai_tenant_consent WHERE tenant_id = plt_t.u('TA')));
+  PERFORM plt_t.ok('T18 uplink event catalog uses producer names (three segments)',
+    (SELECT count(*) = 0 FROM platform.uplink_event_type WHERE event_type IN ('core.support.grant.changed','core.audit.checkpoint','core.support.ticket.opened'))
+    AND EXISTS (SELECT 1 FROM platform.uplink_event_type WHERE event_type = 'core.support_access.granted')
+    AND EXISTS (SELECT 1 FROM platform.uplink_event_type WHERE event_type = 'core.audit.checkpoint_created')
+    AND EXISTS (SELECT 1 FROM platform.uplink_event_type WHERE event_type = 'assistant.consent.changed'));
   PERFORM plt_t.fails('T26 ingest cannot read billing', $q$SELECT count(*) FROM platform.invoice$q$, '%permission denied%');
   PERFORM plt_t.fails('T26 ingest cannot write tenants', $q$UPDATE platform.tenant SET display_name = 'x'$q$, '%permission denied%');
   PERFORM plt_t.fails('T26 ingest audit actor', format($q$INSERT INTO platform.audit_log (actor_kind, actor_id, action) VALUES ('staff', %L, 'platform.x.y')$q$, plt_t.u('A')),
     'HK_PLT_AUDIT_ACTOR%');
   INSERT INTO platform.audit_log (actor_kind, actor_id, actor_label, action, tenant_id) VALUES ('cell', gen_random_uuid(), 'cell-02', 'platform.uplink.batch_received', plt_t.u('TA'));
-  -- تمرین بازیابی گزارش‌شده
+  -- تمرین بازیابی گزارش‌شده (سلامت cell-01 از دستهٔ cell-01)
+  PERFORM plt_t.fails('T09 a cell reports only its own health',
+    $q$INSERT INTO platform.backup_drill (cell_id, repo, backup_label, started_at) VALUES ('cell-01', 'repo9', 'b9', now())$q$,
+    'HK_PLT_UPLINK_FOREIGN_SOURCE%');
+  PERFORM set_config('app.uplink_batch_id', plt_t.u('UB3')::text, true);
   PERFORM plt_t.fails('T09 successful drill needs equal control totals',
     $q$INSERT INTO platform.backup_drill (cell_id, repo, backup_label, started_at, finished_at, outcome, control_totals_match) VALUES ('cell-01', 'repo1', 'b1', now() - interval '1 hour', now(), 'succeeded', false)$q$,
     '%drill_success_requires_totals%');
@@ -1645,9 +2189,49 @@ BEGIN
   PERFORM plt_t.fails('T22 tenant count derived',
     format($q$UPDATE platform.migration_dictionary_candidate SET distinct_tenants = 9 WHERE id = %L$q$, plt_t.u('C1')), 'HK_PLT_DERIVED_COLUMN%');
 END $$;
+
+-- T14b (RV-PLT-01) آزادسازی اعتبار پس از مصرف: از ردیف آخر، حداکثر «رزرو باز − مصرف»، به قیمت پرداخت‌شده؛ تکرار همان واحدها ممکن نیست
+DO $$
+DECLARE
+  v_wa uuid;
+  v_before numeric;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  SELECT id, balance INTO v_wa, v_before FROM platform.wallet WHERE tenant_id = plt_t.u('TA');
+  -- وضع: رزرو ۱۰۰۰ به ۵۰۰، آزادسازی ۱۰۰ (T14)؛ مصرف ۱۵ واحد (T18)
+  PERFORM plt_t.ok('T14b state before', (SELECT cumulative_units = 900 AND cumulative_amount = 450000 FROM platform.credit_reservation
+                                          WHERE tenant_id = plt_t.u('TA') AND service_key = 'meter.sms_parts' ORDER BY seq DESC LIMIT 1));
+  PERFORM plt_t.fails('T14b release after usage cannot exceed reserved - used',
+    format($q$INSERT INTO platform.credit_reservation (tenant_id, service_key, seq, kind, units, cumulative_units, cumulative_amount, amount) VALUES (%L, 'meter.sms_parts', 0, 'release', 886, 0, 0, 0)$q$, plt_t.u('TA')),
+    'HK_PLT_RELEASE_EXCEEDS: cannot release 886 units: open reservation 900, used 15%');
+  INSERT INTO platform.credit_reservation (tenant_id, service_key, seq, kind, units, cumulative_units, cumulative_amount, amount) VALUES (plt_t.u('TA'), 'meter.sms_parts', 0, 'release', 885, 0, 0, 0);
+  PERFORM plt_t.ok('T14b release priced at the reserved price', (SELECT unit_amount = 500 AND amount = 442500 AND cumulative_units = 15 AND cumulative_amount = 7500
+                                                                  FROM platform.credit_reservation WHERE tenant_id = plt_t.u('TA') AND seq = 3));
+  PERFORM plt_t.ok('T14b wallet credited once', (SELECT balance = v_before + 442500 FROM platform.wallet WHERE id = v_wa));
+  PERFORM plt_t.fails('T14b second release of the same units rejected',
+    format($q$INSERT INTO platform.credit_reservation (tenant_id, service_key, seq, kind, units, cumulative_units, cumulative_amount, amount) VALUES (%L, 'meter.sms_parts', 0, 'release', 885, 0, 0, 0)$q$, plt_t.u('TA')),
+    'HK_PLT_RELEASE_EXCEEDS%');
+  PERFORM plt_t.fails('T14b any further release of consumed units rejected',
+    format($q$INSERT INTO platform.credit_reservation (tenant_id, service_key, seq, kind, units, cumulative_units, cumulative_amount, amount) VALUES (%L, 'meter.sms_parts', 0, 'release', 1, 0, 0, 0)$q$, plt_t.u('TA')),
+    'HK_PLT_RELEASE_EXCEEDS%');
+  INSERT INTO platform.credit_reservation (tenant_id, service_key, seq, kind, units, unit_amount, cumulative_units, cumulative_amount, amount) VALUES (plt_t.u('TA'), 'meter.sms_parts', 0, 'reserve', 100, 500, 0, 0, 0);
+  PERFORM plt_t.fails('T14b release priced above the reservation rejected',
+    format($q$INSERT INTO platform.credit_reservation (tenant_id, service_key, seq, kind, units, unit_amount, cumulative_units, cumulative_amount, amount) VALUES (%L, 'meter.sms_parts', 0, 'release', 50, 1000000, 0, 0, 0)$q$, plt_t.u('TA')),
+    'HK_PLT_TARIFF_MISMATCH: release is priced at the reserved price 500%');
+  INSERT INTO platform.credit_reservation (tenant_id, service_key, seq, kind, units, cumulative_units, cumulative_amount, amount) VALUES (plt_t.u('TA'), 'meter.sms_parts', 0, 'release', 50, 0, 0, 0);
+  PERFORM plt_t.ok('T14b money conserved: reserved - released = open amount',
+    (SELECT sum(CASE kind WHEN 'reserve' THEN amount ELSE -amount END) FROM platform.credit_reservation WHERE tenant_id = plt_t.u('TA') AND service_key = 'meter.sms_parts')
+    = (SELECT cumulative_amount FROM platform.credit_reservation WHERE tenant_id = plt_t.u('TA') AND service_key = 'meter.sms_parts' ORDER BY seq DESC LIMIT 1)
+    AND (SELECT cumulative_units = 65 AND cumulative_amount = 32500 FROM platform.credit_reservation WHERE tenant_id = plt_t.u('TA') AND service_key = 'meter.sms_parts' ORDER BY seq DESC LIMIT 1));
+  PERFORM plt_t.ok('T14b wallet ledger consistent', NOT EXISTS (SELECT 1 FROM platform.v_wallet_integrity));
+END $$;
 RESET ROLE;
 SET ROLE hk_platform_ingest;
-INSERT INTO platform.migration_dictionary_vote (candidate_id, tenant_id) VALUES ('70000000-0000-7000-8000-000000007501', '70000000-0000-7000-8000-000000000003');
+-- رأی مستأجر سوم (TE روی سلول اختصاصی cell-ded) از دستهٔ همان سلول
+INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, tenant_id, kind, item_count, payload_sha256)
+VALUES ('70000000-0000-7000-8000-000000008004', 'cell', 'cell-ded', '70000000-0000-7000-8000-000000000006', 'events', 1, sha256('ub4'::bytea));
+INSERT INTO platform.migration_dictionary_vote (candidate_id, tenant_id, batch_id)
+VALUES ('70000000-0000-7000-8000-000000007501', '70000000-0000-7000-8000-000000000006', '70000000-0000-7000-8000-000000008004');
 RESET ROLE;
 SET ROLE hk_platform_app;
 
@@ -1669,16 +2253,23 @@ BEGIN
   INSERT INTO platform.migration_dictionary_release (version, status, entries, payload_sha256, hksb_sha256, created_by, approved_by, published_at)
   VALUES (1, 'published', 1, plt_t.h('dp'), plt_t.h('d'), plt_t.u('A'), plt_t.u('O'), now());
   PERFORM plt_t.fails('T22 profile beta needs golden dataset',
-    $q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system, status, hksb_sha256) VALUES ('holoo.sqlserver', '1.0.0', 'holoo', 'beta', plt_t.h('p'))$q$,
+    $q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system, status, hksb_sha256) VALUES ('holoo_sqlserver', 1, 'holoo', 'beta', plt_t.h('p'))$q$,
     '%profile_beta_gate%');
   PERFORM plt_t.fails('T22 real sample needs written consent',
-    $q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system, golden_dataset_passed, real_sample_passed) VALUES ('holoo.sqlserver', '1.0.0', 'holoo', true, true)$q$,
+    $q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system, golden_dataset_passed, real_sample_passed) VALUES ('holoo_sqlserver', 1, 'holoo', true, true)$q$,
     '%profile_sample_consent%');
   PERFORM plt_t.fails('T22 publish needs real sample',
-    format($q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system, status, golden_dataset_passed, hksb_sha256, published_by, published_at) VALUES ('holoo.sqlserver', '1.0.0', 'holoo', 'published', true, plt_t.h('p'), %L, now())$q$, plt_t.u('A')),
+    format($q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system, status, golden_dataset_passed, hksb_sha256, published_by, published_at) VALUES ('holoo_sqlserver', 1, 'holoo', 'published', true, plt_t.h('p'), %L, now())$q$, plt_t.u('A')),
     '%profile_published_gate%');
   INSERT INTO platform.migration_profile_release (profile_code, version, source_system, status, golden_dataset_passed, real_sample_passed, sample_consent_ref, hksb_sha256, published_by, published_at)
-  VALUES ('holoo.sqlserver', '1.0.0', 'holoo', 'published', true, true, 'CONSENT-PILOT-1', plt_t.h('p'), plt_t.u('A'), now());
+  VALUES ('holoo_sqlserver', 1, 'holoo', 'published', true, true, 'CONSENT-PILOT-1', plt_t.h('p'), plt_t.u('A'), now());
+  -- RV-MG-10: کد و نسخهٔ پروفایل همان migration.profile سلول (کد بی‌نقطه، نسخهٔ صحیح)
+  PERFORM plt_t.fails('T22 profile code follows the cell catalog',
+    $q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system) VALUES ('holoo.sqlserver', 2, 'holoo')$q$,
+    '%migration_profile_release_profile_code_check%');
+  PERFORM plt_t.fails('T22 profile source system follows the cell catalog',
+    $q$INSERT INTO platform.migration_profile_release (profile_code, version, source_system) VALUES ('holoo_sqlserver', 3, 'Holoo 2026')$q$,
+    '%migration_profile_release_source_system_check%');
 
   -- ورود به‌جای کاربر
   PERFORM plt_t.as_staff(plt_t.u('S'));
@@ -1787,7 +2378,8 @@ BEGIN
   PERFORM plt_t.fails('T19 SMS broadcast needs approval',
     format($q$UPDATE platform.announcement SET status = 'published', published_by = %L WHERE id = %L$q$, plt_t.u('A'), plt_t.u('AN2')), 'HK_PLT_APPROVAL_REQUIRED%');
   UPDATE platform.announcement SET status = 'published', published_by = plt_t.u('A'),
-         sms_approval_id = plt_t.approve('announcement.sms_broadcast', 'announcement', plt_t.u('AN2'), plt_t.u('A'), plt_t.u('O'))
+         sms_approval_id = plt_t.approve('announcement.sms_broadcast', 'announcement', plt_t.u('AN2'), plt_t.u('A'), plt_t.u('O'),
+                                         (SELECT to_jsonb(a) FROM platform.announcement a WHERE a.id = plt_t.u('AN2')))
    WHERE id = plt_t.u('AN2');
   UPDATE platform.announcement SET status = 'published', published_by = plt_t.u('A') WHERE id = plt_t.u('AN1');
   PERFORM plt_t.fails('T19 published announcement immutable', format($q$UPDATE platform.announcement SET body_fa = 'z' WHERE id = %L$q$, plt_t.u('AN1')), 'HK_PLT_IMMUTABLE_FIELD%');
@@ -1799,7 +2391,10 @@ END $$;
 
 RESET ROLE;
 SET ROLE hk_platform_ingest;
+BEGIN;
+SELECT set_config('app.uplink_batch_id', '70000000-0000-7000-8000-000000008001', true) \gset
 UPDATE platform.impersonation_request SET status = 'used', session_started_at = now() WHERE id = '70000000-0000-7000-8000-000000007101';
+COMMIT;
 DO $$
 BEGIN
   PERFORM plt_t.fails('T19 ingest cannot change request content',
@@ -1814,6 +2409,7 @@ DECLARE
   v_fp jsonb := plt_t.fp('server-1');
   v_fp2 jsonb := plt_t.fp('server-2');
   v_lic jsonb;
+  v_rinv uuid := uuidv7(); v_rline uuid := uuidv7(); v_rpay uuid := uuidv7();
 BEGIN
   PERFORM plt_t.as_staff(plt_t.u('SL'));
   PERFORM plt_t.fails('T20 installations are on-prem only',
@@ -1861,11 +2457,14 @@ BEGIN
     'HK_PLT_APPROVAL_REQUIRED%');
   PERFORM plt_t.fails('T20 signed payload equals registry',
     format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = 3, payload = %L, payload_sha256 = plt_t.h('p'), file_sha256 = plt_t.h('f'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'staff', issued_by_id = %L, approval_id = %L WHERE id = %L$q$,
-           v_fp, jsonb_set(v_lic, '{limits,users}', '50'), plt_t.u('SL'), plt_t.approve('license.issue', 'license', plt_t.u('LIC1'), plt_t.u('SL'), plt_t.u('A')), plt_t.u('LIC1')),
+           v_fp, jsonb_set(v_lic, '{limits,users}', '50'), plt_t.u('SL'),
+           plt_t.approve('license.issue', 'license', plt_t.u('LIC1'), plt_t.u('SL'), plt_t.u('A'), (SELECT to_jsonb(l) FROM platform.license l WHERE l.id = plt_t.u('LIC1'))),
+           plt_t.u('LIC1')),
     '%license_payload_matches%');
   UPDATE platform.license SET status = 'issued', binding_fingerprint = v_fp, binding_min_match = 3, payload = v_lic, payload_sha256 = plt_t.h('p1'),
          file_sha256 = plt_t.h('f1'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'staff', issued_by_id = plt_t.u('SL'),
-         approval_id = plt_t.approve('license.issue', 'license', plt_t.u('LIC1'), plt_t.u('SL'), plt_t.u('A'))
+         approval_id = plt_t.approve('license.issue', 'license', plt_t.u('LIC1'), plt_t.u('SL'), plt_t.u('A'),
+                                     (SELECT to_jsonb(l) FROM platform.license l WHERE l.id = plt_t.u('LIC1')))
    WHERE id = plt_t.u('LIC1');
   PERFORM plt_t.ok('T20 issue activates installation', (SELECT status = 'active' AND first_activated_at IS NOT NULL FROM platform.installation WHERE id = plt_t.u('INST1'))
                                                      AND (SELECT issue_seq = 1 AND issued_at IS NOT NULL FROM platform.license WHERE id = plt_t.u('LIC1')));
@@ -1873,6 +2472,19 @@ BEGIN
     'HK_PLT_LICENSE_FROZEN%');
   PERFORM plt_t.fails('T20 issued license terms frozen', format($q$UPDATE platform.license SET updates_until = current_date + 900 WHERE id = %L$q$, plt_t.u('LIC1')),
     'HK_PLT_LICENSE_FROZEN%');
+  -- تمدید پشتیبانی پرداخت‌شده: صورتحساب سطر لایسنس برای سال دوم (RV-PLT-12)
+  PERFORM plt_t.as_staff(plt_t.u('F'));
+  INSERT INTO platform.invoice (id, billing_account_id, tenant_id, subtotal, vat_total, total, vat_rule_ref)
+  VALUES (v_rinv, plt_t.u('BA_C'), plt_t.u('TC'), 100000000, 10000000, 110000000, plt_t.vat_ref());
+  INSERT INTO platform.invoice_line (id, invoice_id, line_no, line_kind, product_version_id, description, sstid, period_start, period_end,
+                                     quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_rline, v_rinv, 1, 'license', plt_t.u('PV3'), 'تمدید به‌روزرسانی و پشتیبانی سال دوم', '2710000138624', current_date + 365, current_date + 730,
+          1, 100000000, 100000000, 10, 10000000, 110000000);
+  UPDATE platform.invoice SET status = 'issued' WHERE id = v_rinv;
+  INSERT INTO platform.payment (id, payer_kind, billing_account_id, tenant_id, purpose, invoice_id, method, order_id, amount, api_amount, api_amount_unit, expires_at)
+  VALUES (v_rpay, 'tenant', plt_t.u('BA_C'), plt_t.u('TC'), 'invoice', v_rinv, 'bank_transfer', 'ORD-TC-LIC-RENEW', 110000000, 110000000, 'IRR', now() + interval '1 day');
+  UPDATE platform.payment SET state = 'verified', verified_amount = 110000000, bank_ref = 'BT-TC-1' WHERE id = v_rpay;
+  PERFORM plt_t.as_staff(plt_t.u('SL'));
   -- لایسنس دوم بدون جایگزینی
   INSERT INTO platform.license (id, tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until, issued_via, number)
   VALUES (plt_t.u('LIC2'), plt_t.u('TC'), plt_t.u('INST1'), plt_t.u('PV3'), 'perpetual', 'pro', '{accounting,pos}', '{"users": 10, "companies": 2, "pos_devices": 3}',
@@ -1882,8 +2494,17 @@ BEGIN
     format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = 3, payload = %L, payload_sha256 = plt_t.h('p'), file_sha256 = plt_t.h('f'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'system' WHERE id = %L$q$,
            v_fp, v_lic, plt_t.u('LIC2')),
     'HK_PLT_LICENSE_SUPERSEDE%');
-  -- تمدید پشتیبانی با شرایط یکسان: بدون تأیید دونفره
+  -- تمدید پشتیبانی با شرایط یکسان: بدون تأیید دونفره، فقط با سطر لایسنس پرداخت‌شده‌ای که تمدید را می‌پوشاند (RV-PLT-12)
   UPDATE platform.license SET supersedes_license_id = plt_t.u('LIC1') WHERE id = plt_t.u('LIC2');
+  PERFORM plt_t.fails('T20 renewal_auto without a paid renewal needs four-eyes',
+    format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = 3, payload = %L, payload_sha256 = plt_t.h('p'), file_sha256 = plt_t.h('f'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'system' WHERE id = %L$q$,
+           v_fp, v_lic, plt_t.u('LIC2')),
+    'HK_PLT_APPROVAL_REQUIRED%');
+  UPDATE platform.license SET renewal_invoice_line_id = v_rline WHERE id = plt_t.u('LIC2');
+  PERFORM plt_t.fails('T20 renewal_auto beyond the paid period needs four-eyes',
+    format($q$UPDATE platform.license SET status = 'issued', support_until = '2099-12-31', binding_fingerprint = %L, binding_min_match = 3, payload = %L, payload_sha256 = plt_t.h('p'), file_sha256 = plt_t.h('f'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'system' WHERE id = %L$q$,
+           v_fp, v_lic, plt_t.u('LIC2')),
+    'HK_PLT_APPROVAL_REQUIRED%');
   UPDATE platform.license SET status = 'issued', binding_fingerprint = v_fp, binding_min_match = 3, payload = v_lic, payload_sha256 = plt_t.h('p2'),
          file_sha256 = plt_t.h('f2'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'system'
    WHERE id = plt_t.u('LIC2');
@@ -1980,6 +2601,124 @@ BEGIN
   PERFORM plt_t.ok('T20 update eligibility view', (SELECT latest_allowed_version = '2026.12.0' FROM platform.v_installation_update_eligibility WHERE installation_id = plt_t.u('INST1')));
 END $$;
 
+-- T20b (RV-PLT-12/13) معافیت‌های محدود: سهمیهٔ نماینده و آزمایشی فقط تا حق استفادهٔ محصول؛ فقط نخستین آزمایشی؛
+-- rehost بی‌تأیید حداکثر دو بار در ۳۶۵ روز؛ یک سطر پرداخت‌شده فقط یک تمدید
+DO $$
+DECLARE
+  v_fp3 jsonb := plt_t.fp('server-3');
+  v_fp4 jsonb := plt_t.fp('server-4');
+  v_ff jsonb := plt_t.fp('server-f');
+  v_l6 uuid := uuidv7(); v_l7 uuid := uuidv7(); v_t2 uuid := uuidv7(); v_q uuid := uuidv7();
+  v_rline uuid;
+BEGIN
+  PERFORM plt_t.as_staff(plt_t.u('SL'));
+  SELECT renewal_invoice_line_id INTO v_rline FROM platform.license WHERE id = plt_t.u('LIC2');
+  PERFORM plt_t.fails('T20b one paid renewal line renews once',
+    format($q$INSERT INTO platform.license (tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until, issued_via, renewal_invoice_line_id, number)
+              VALUES (%L, %L, %L, 'perpetual', 'pro', '{accounting}', '{"users": 5}', current_date, current_date + 730, current_date + 730, 'renewal_auto', %L, 'x')$q$,
+           plt_t.u('TC'), plt_t.u('INST1'), plt_t.u('PV3'), v_rline),
+    '%license_renewal_invoice_line_id_key%');
+  -- سهمیهٔ نماینده بیش از حق استفاده صادر نمی‌شود (یک واحد سهمیهٔ ارزان با کاربر نامحدود)
+  INSERT INTO platform.license (id, tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until, reseller_id, issued_via, number)
+  VALUES (v_q, plt_t.u('TF'), plt_t.u('INST2'), plt_t.u('PV3'), 'perpetual', 'pro', '{accounting,payroll}', '{"users": 500}', current_date, current_date + 365, current_date + 365, plt_t.u('R1'), 'reseller_quota', 'x');
+  PERFORM plt_t.fails('T20b reseller-quota license bounded by product entitlements',
+    format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = 3,
+              payload = jsonb_build_object('format','lic/1','license_id',%L,'install_id',%L,'tenant_id',%L,'license_model','perpetual','limits','{"users": 500}'::jsonb,'updates_until',(current_date + 365)::text,'valid_until',NULL,'binding',jsonb_build_object('fingerprint',%L::jsonb)),
+              payload_sha256 = plt_t.h('pq'), file_sha256 = plt_t.h('fq'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'staff', issued_by_id = %L WHERE id = %L$q$,
+           v_ff, v_q, plt_t.u('INST2'), plt_t.u('TF'), v_ff, plt_t.u('SL'), v_q),
+    'HK_PLT_LICENSE_ENTITLEMENT%');
+  UPDATE platform.license SET status = 'cancelled' WHERE id = v_q;
+  -- آزمایشی: بیش از حق استفاده تأیید می‌خواهد؛ نخستین آزمایشی در حد حق استفاده بی‌تأیید؛ آزمایشی دوم تأیید می‌خواهد
+  INSERT INTO platform.license (id, tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, valid_until, updates_until, support_until, number)
+  VALUES (plt_t.u('LICT'), plt_t.u('TF'), plt_t.u('INST2'), plt_t.u('PV3'), 'trial', 'pro', '{accounting}', '{"users": 50}', current_date, current_date + 30, current_date + 30, current_date + 30, 'x');
+  PERFORM plt_t.fails('T20b trial above entitlements needs four-eyes',
+    format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = 3,
+              payload = jsonb_build_object('format','lic/1','license_id',%L,'install_id',%L,'tenant_id',%L,'license_model','trial','limits','{"users": 50}'::jsonb,'updates_until',(current_date + 30)::text,'valid_until',(current_date + 30)::text,'binding',jsonb_build_object('fingerprint',%L::jsonb)),
+              payload_sha256 = plt_t.h('pt'), file_sha256 = plt_t.h('ft'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'system' WHERE id = %L$q$,
+           v_ff, plt_t.u('LICT'), plt_t.u('INST2'), plt_t.u('TF'), v_ff, plt_t.u('LICT')),
+    'HK_PLT_APPROVAL_REQUIRED%');
+  UPDATE platform.license SET limits = '{"users": 5}' WHERE id = plt_t.u('LICT');
+  UPDATE platform.license SET status = 'issued', binding_fingerprint = v_ff, binding_min_match = 3,
+         payload = jsonb_build_object('format','lic/1','license_id',plt_t.u('LICT'),'install_id',plt_t.u('INST2'),'tenant_id',plt_t.u('TF'),'license_model','trial',
+                                      'limits','{"users": 5}'::jsonb,'updates_until',(current_date + 30)::text,'valid_until',(current_date + 30)::text,'binding',jsonb_build_object('fingerprint',v_ff)),
+         payload_sha256 = plt_t.h('pt1'), file_sha256 = plt_t.h('ft1'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'system'
+   WHERE id = plt_t.u('LICT');
+  PERFORM plt_t.ok('T20b first trial within entitlements issued without approval', (SELECT status = 'issued' AND approval_id IS NULL FROM platform.license WHERE id = plt_t.u('LICT')));
+  INSERT INTO platform.license (id, tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, valid_until, updates_until, support_until, supersedes_license_id, number)
+  VALUES (v_t2, plt_t.u('TF'), plt_t.u('INST2'), plt_t.u('PV3'), 'trial', 'pro', '{accounting}', '{"users": 5}', current_date, current_date + 30, current_date + 30, current_date + 30, plt_t.u('LICT'), 'x');
+  PERFORM plt_t.fails('T20b rolling trials need four-eyes',
+    format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = 3,
+              payload = jsonb_build_object('format','lic/1','license_id',%L,'install_id',%L,'tenant_id',%L,'license_model','trial','limits','{"users": 5}'::jsonb,'updates_until',(current_date + 30)::text,'valid_until',(current_date + 30)::text,'binding',jsonb_build_object('fingerprint',%L::jsonb)),
+              payload_sha256 = plt_t.h('pt2'), file_sha256 = plt_t.h('ft2'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'system' WHERE id = %L$q$,
+           v_ff, v_t2, plt_t.u('INST2'), plt_t.u('TF'), v_ff, v_t2),
+    'HK_PLT_APPROVAL_REQUIRED%');
+  UPDATE platform.license SET status = 'cancelled' WHERE id = v_t2;
+  -- rehost دوم در ۳۶۵ روز بی‌تأیید (نخستین LIC3 بود)؛ سومی تأیید می‌خواهد
+  UPDATE platform.installation SET fingerprint = v_fp3 WHERE id = plt_t.u('INST1');
+  INSERT INTO platform.license (id, tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until, supersedes_license_id, issued_via, number)
+  VALUES (v_l6, plt_t.u('TC'), plt_t.u('INST1'), plt_t.u('PV3'), 'perpetual', 'pro', '{accounting}', '{"users": 5}', current_date, current_date + 365, current_date + 365, plt_t.u('LIC4'), 'rehost', 'x');
+  UPDATE platform.license SET status = 'issued', binding_fingerprint = v_fp3, binding_min_match = 3,
+         payload = jsonb_build_object('format','lic/1','license_id',v_l6,'install_id',plt_t.u('INST1'),'tenant_id',plt_t.u('TC'),'license_model','perpetual',
+                                      'limits','{"users": 5}'::jsonb,'updates_until',(current_date + 365)::text,'valid_until',NULL,'binding',jsonb_build_object('fingerprint',v_fp3)),
+         payload_sha256 = plt_t.h('p6'), file_sha256 = plt_t.h('f6'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'staff', issued_by_id = plt_t.u('SL')
+   WHERE id = v_l6;
+  PERFORM plt_t.ok('T20b second rehost within a year issued without approval', (SELECT status = 'issued' AND approval_id IS NULL FROM platform.license WHERE id = v_l6));
+  UPDATE platform.installation SET fingerprint = v_fp4 WHERE id = plt_t.u('INST1');
+  INSERT INTO platform.license (id, tenant_id, installation_id, product_version_id, license_model, edition, modules, limits, not_before, updates_until, support_until, supersedes_license_id, issued_via, number)
+  VALUES (v_l7, plt_t.u('TC'), plt_t.u('INST1'), plt_t.u('PV3'), 'perpetual', 'pro', '{accounting}', '{"users": 5}', current_date, current_date + 365, current_date + 365, v_l6, 'rehost', 'x');
+  PERFORM plt_t.fails('T20b third rehost within 365 days needs four-eyes',
+    format($q$UPDATE platform.license SET status = 'issued', binding_fingerprint = %L, binding_min_match = 3,
+              payload = jsonb_build_object('format','lic/1','license_id',%L,'install_id',%L,'tenant_id',%L,'license_model','perpetual','limits','{"users": 5}'::jsonb,'updates_until',(current_date + 365)::text,'valid_until',NULL,'binding',jsonb_build_object('fingerprint',%L::jsonb)),
+              payload_sha256 = plt_t.h('p7'), file_sha256 = plt_t.h('f7'), signature = plt_t.sig(), kid = 'license-2026a', issued_by_kind = 'staff', issued_by_id = %L WHERE id = %L$q$,
+           v_fp4, v_l7, plt_t.u('INST1'), plt_t.u('TC'), v_fp4, plt_t.u('SL'), v_l7),
+    'HK_PLT_APPROVAL_REQUIRED%');
+  UPDATE platform.license SET status = 'cancelled' WHERE id = v_l7;
+  UPDATE platform.installation SET fingerprint = v_fp3 WHERE id = plt_t.u('INST1');
+  PERFORM plt_t.ok('T20b license entitlement bounds', platform.license_within_entitlements(plt_t.u('PV3'), '{"users": 10, "companies": 2}', '{accounting,pos}')
+                                                 AND NOT platform.license_within_entitlements(plt_t.u('PV3'), '{"users": 11}', '{accounting}')
+                                                 AND NOT platform.license_within_entitlements(plt_t.u('PV3'), '{"warehouses": 1}', '{accounting}')
+                                                 AND NOT platform.license_within_entitlements(plt_t.u('PV3'), '{}', '{payroll}'));
+END $$;
+
+-- T20c (RV-X4-02؛ INV-PCTL-13) uplink نصب On-prem فقط دادهٔ مستأجر خودش را می‌نویسد: مصرف، لنگر ممیزی و runtime مستأجر
+-- دیگر با دستهٔ امضاشدهٔ یک نصب رد می‌شود
+RESET ROLE;
+SET ROLE hk_platform_ingest;
+DO $$
+BEGIN
+  INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, tenant_id, kind, item_count, payload_sha256)
+  VALUES (plt_t.u('UB5'), 'installation', plt_t.u('INST1')::text, NULL, 'usage_report_file', 3, plt_t.h('ub5'));
+  PERFORM plt_t.fails('T20c installation batch cannot declare another tenant',
+    format($q$INSERT INTO platform.uplink_batch (batch_id, source_kind, source_id, tenant_id, kind, item_count, payload_sha256) VALUES (gen_random_uuid(), 'installation', %L, %L, 'usage', 1, plt_t.h('x5'))$q$,
+           plt_t.u('INST1')::text, plt_t.u('TE')),
+    'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  PERFORM plt_t.fails('T20c installation cannot inflate another tenant''s billed usage',
+    format($q$INSERT INTO platform.usage_event (tenant_id, event_id, metric, quantity, occurred_at, day, batch_id) VALUES (%L, gen_random_uuid(), 'limit.users', 999, now(), current_date, %L)$q$,
+           plt_t.u('TE'), plt_t.u('UB5')),
+    'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  PERFORM plt_t.fails('T20c installation cannot wedge another tenant''s audit witness',
+    format($q$INSERT INTO platform.tenant_audit_anchor (tenant_id, chain_no, seq, hash, checkpoint_id, checkpoint_at, batch_id) VALUES (%L, 0, 9000000000000000, plt_t.h('forged'), gen_random_uuid(), now(), %L)$q$,
+           plt_t.u('TA'), plt_t.u('UB5')),
+    'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  PERFORM set_config('app.uplink_batch_id', plt_t.u('UB5')::text, true);
+  PERFORM plt_t.fails('T20c installation cannot rewrite another tenant''s runtime',
+    format($q$UPDATE platform.tenant_runtime SET active_users = 1 WHERE tenant_id = %L$q$, plt_t.u('TA')), 'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  PERFORM plt_t.fails('T20c installation cannot delete another tenant''s login directory entries',
+    format($q$INSERT INTO platform.login_directory (mobile_hmac, tenant_id, batch_id) VALUES (plt_t.h('m-ta'), %L, %L)$q$, plt_t.u('TA'), plt_t.u('UB5')),
+    'HK_PLT_UPLINK_FOREIGN_TENANT%');
+  PERFORM plt_t.fails('T20c installation cannot ack a cell command',
+    $q$UPDATE platform.cell_command SET attempts = attempts + 1 WHERE cell_id = 'cell-01'$q$, 'HK_PLT_UPLINK_FOREIGN_SOURCE%');
+  INSERT INTO platform.usage_event (tenant_id, event_id, metric, quantity, occurred_at, day, batch_id)
+  VALUES (plt_t.u('TC'), gen_random_uuid(), 'limit.users', 4, now(), current_date, plt_t.u('UB5'));
+  INSERT INTO platform.login_directory (mobile_hmac, tenant_id, batch_id) VALUES (plt_t.h('m-tc'), plt_t.u('TC'), plt_t.u('UB5'));
+  UPDATE platform.tenant_runtime SET active_users = 4 WHERE tenant_id = plt_t.u('TC');
+  UPDATE platform.installation SET last_checkin_at = now() WHERE id = plt_t.u('INST1');
+  PERFORM plt_t.ok('T20c own tenant data accepted', (SELECT active_users = 4 FROM platform.tenant_runtime WHERE tenant_id = plt_t.u('TC'))
+                                                  AND EXISTS (SELECT 1 FROM platform.login_directory WHERE tenant_id = plt_t.u('TC')));
+END $$;
+RESET ROLE;
+SET ROLE hk_platform_app;
+
 -- T21 انتشار قواعد قانونی
 DO $$
 BEGIN
@@ -1989,9 +2728,9 @@ BEGIN
     'HK_PLT_PERMISSION%');
   PERFORM plt_t.as_staff(plt_t.u('T'));
   INSERT INTO platform.rules_package (id, code, version, seq, covers_from, min_engine_version, changelog_fa, authored_by)
-  VALUES (plt_t.u('RP1'), 'ir.tax', '1405.1', 1, '2026-03-21', '2026.11.0', 'نرخ استاندارد ارزش افزوده ۱۴۰۵', plt_t.u('T'));
+  VALUES (plt_t.u('RP1'), 'ir.tax', '1405.1', 2, '2026-03-21', '2026.11.0', 'نرخ استاندارد ارزش افزوده ۱۴۰۵', plt_t.u('T'));
   PERFORM plt_t.fails('T21 seq strictly increasing',
-    format($q$INSERT INTO platform.rules_package (code, version, seq, covers_from, min_engine_version, changelog_fa, authored_by) VALUES ('ir.tax', '1405.0', 1, '2026-03-21', '2026.11.0', 'x', %L)$q$, plt_t.u('T')),
+    format($q$INSERT INTO platform.rules_package (code, version, seq, covers_from, min_engine_version, changelog_fa, authored_by) VALUES ('ir.tax', '1405.9', 2, '2026-03-21', '2026.11.0', 'x', %L)$q$, plt_t.u('T')),
     'HK_PLT_RULES_SEQ%');
   PERFORM plt_t.fails('T21 key owned by package code',
     format($q$INSERT INTO platform.rules_value (package_id, key, effective_from, value, source_ref, confidence) VALUES (%L, 'payroll.wage.min_daily', '2026-03-21', '{"amount": "1000", "unit": "IRR"}', 'بخشنامه', 'high')$q$, plt_t.u('RP1')),
@@ -2276,7 +3015,11 @@ BEGIN
   PERFORM plt_t.fails('T29 enabling needs four-eyes',
     format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, tenant_monthly_tokens, reason, created_by)
               VALUES (%L, true, 5000000, 'pilot customer needs more tokens', %L)$q$, plt_t.u('TA'), plt_t.u('A')), 'HK_PLT_APPROVAL_REQUIRED%');
-  v_ap := plt_t.approve('ai.tenant_override', 'tenant', plt_t.u('TA'), plt_t.u('A'), plt_t.u('O'));
+  v_ap := plt_t.approve('ai.tenant_override', 'tenant', plt_t.u('TA'), plt_t.u('A'), plt_t.u('O'),
+                        jsonb_build_object('enabled', true, 'kill_reason', NULL, 'features', NULL, 'provider_id', NULL,
+                                           'tenant_monthly_tokens', 5000000, 'tenant_monthly_cost', NULL, 'user_monthly_tokens', NULL,
+                                           'max_concurrent_runs', NULL, 'allow_tenant_provider', NULL,
+                                           'expires_at', to_jsonb(now() + interval '30 days')));
   PERFORM plt_t.fails('T29 a pure kill takes no approval',
     format($q$INSERT INTO platform.ai_tenant_override (tenant_id, enabled, kill_reason, reason, created_by, approval_id)
               VALUES (%L, false, 'kill', 'kill with a stray approval', %L, %L)$q$, plt_t.u('TA'), plt_t.u('A'), v_ap), 'HK_PLT_APPROVAL_MISMATCH%');
@@ -2543,15 +3286,15 @@ BEGIN
     'HK_PLT_PLAN_NOT_AVAILABLE: items use published product versions%');
 
   -- دو پیش‌نویس: سطر بین صورتحساب‌ها جابه‌جا نمی‌شود
-  INSERT INTO platform.invoice (billing_account_id, tenant_id) VALUES (plt_t.u('BA_A'), plt_t.u('TA')) RETURNING id INTO v_inv;
-  INSERT INTO platform.invoice (billing_account_id, tenant_id) VALUES (plt_t.u('BA_A'), plt_t.u('TA')) RETURNING id INTO v_inv2;
-  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
-  VALUES (v_inv, 1, 'service', 'خدمت صفر', 1, 0, 0, 10, 0, 0) RETURNING id INTO v_line;
+  INSERT INTO platform.invoice (billing_account_id, tenant_id, vat_rule_ref) VALUES (plt_t.u('BA_A'), plt_t.u('TA'), plt_t.vat_ref()) RETURNING id INTO v_inv;
+  INSERT INTO platform.invoice (billing_account_id, tenant_id, vat_rule_ref) VALUES (plt_t.u('BA_A'), plt_t.u('TA'), plt_t.vat_ref()) RETURNING id INTO v_inv2;
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_inv, 1, 'service', 'خدمت صفر', '2710000138624', 1, 0, 0, 10, 0, 0) RETURNING id INTO v_line;
   PERFORM plt_t.fails('T33 line cannot move between invoices',
     format($q$UPDATE platform.invoice_line SET invoice_id = %L WHERE id = %L$q$, v_inv2, v_line), 'HK_PLT_IMMUTABLE_FIELD: line cannot move between invoices%');
   DELETE FROM platform.invoice WHERE id = v_inv2;
   -- صورتحساب صفر ← پرداخت‌شده ← دورهٔ فعال پرداخت‌شده؛ ابطال آن بدون یادداشت اعتباری ممنوع
-  UPDATE platform.invoice SET status = 'issued', period_key = 'jy:1405' WHERE id = v_inv;
+  UPDATE platform.invoice SET status = 'issued', period_key = plt_t.jy() WHERE id = v_inv;
   INSERT INTO platform.subscription_term (subscription_id, kind, period_start, period_end, invoice_id)
   VALUES (v_sub_a, 'paid', current_date + 400, current_date + 430, v_inv) RETURNING id INTO v_term;
   PERFORM plt_t.ok('T33 zero-invoice term active', (SELECT status = 'active' FROM platform.subscription_term WHERE id = v_term));
@@ -2566,10 +3309,10 @@ BEGIN
    WHERE i.kind = 'invoice' AND i.status IN ('issued','paid') AND i.billing_account_id = plt_t.u('BA_A') AND l.total > 0 LIMIT 1;
   INSERT INTO platform.invoice (kind, billing_account_id, tenant_id, original_invoice_id)
   VALUES ('credit_note', plt_t.u('BA_A'), plt_t.u('TA'), v_orig_line.invoice_id) RETURNING id INTO v_cn;
-  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
-  VALUES (v_cn, 1, 'adjustment', v_orig_line.id, 'برگشت صفر', 1, 0, 0, v_orig_line.vat_rate_pct, 0, 0);
+  INSERT INTO platform.invoice_line (invoice_id, line_no, line_kind, original_line_id, description, sstid, quantity, unit_amount, amount, vat_rate_pct, vat_amount, total)
+  VALUES (v_cn, 1, 'adjustment', v_orig_line.id, 'برگشت صفر', v_orig_line.sstid, 1, 0, 0, v_orig_line.vat_rate_pct, 0, 0);
   PERFORM plt_t.fails('T33 credit note total must be positive',
-    format($q$UPDATE platform.invoice SET status = 'issued', period_key = 'jy:1405' WHERE id = %L$q$, v_cn), 'HK_PLT_INVOICE_TOTALS: credit note total must be positive%');
+    format($q$UPDATE platform.invoice SET status = 'issued', period_key = plt_t.jy() WHERE id = %L$q$, v_cn), 'HK_PLT_INVOICE_TOTALS: credit note total must be positive%');
   DELETE FROM platform.invoice_line WHERE invoice_id = v_cn;
   DELETE FROM platform.invoice WHERE id = v_cn;
   PERFORM plt_t.fails('T33 house sync identity immutable',
@@ -2846,6 +3589,13 @@ END $$;
 -- بخش ۶: postgres — lint، تغییرناپذیری برای مالک، دستکاری زنجیره، جمع‌بندی
 -- =====================================================================
 RESET ROLE;
+-- RV-IT-14 (R-ROLE): فایل DDL صفحهٔ کنترل هرگز رمز نقش نمی‌نویسد و نقش‌ها را NOLOGIN می‌سازد (ورود فقط با ابزار استقرار
+-- یا dev_roles.sql). آزمون از ریشهٔ مخزن اجرا می‌شود (هارنس cd می‌کند).
+\set plt_pw_lines `grep -cE "PASSWORD +'" docs/design/sql/70_platform.sql`
+\set plt_nologin_lines `grep -cF "CREATE ROLE %I NOLOGIN NOSUPERUSER NOBYPASSRLS" docs/design/sql/70_platform.sql`
+SELECT plt_t.ok('T28 70_platform.sql writes no role password (RV-IT-14)', :'plt_pw_lines' = '0') \gset
+SELECT plt_t.ok('T28 70_platform.sql creates its roles NOLOGIN (RV-IT-14)', :'plt_nologin_lines' = '1') \gset
+SELECT plt_t.ok('T28 audit writer never logs in', NOT rolcanlogin) FROM pg_roles WHERE rolname = 'hk_platform_audit_writer' \gset
 DO $$
 BEGIN
   PERFORM plt_t.ok('T28 security lint clean', NOT EXISTS (SELECT 1 FROM platform.security_lint()));
@@ -2930,6 +3680,15 @@ BEGIN
   RETURN NULL;
 END $f$;
 CREATE TRIGGER poke AFTER INSERT ON plt_t.poke FOR EACH ROW EXECUTE FUNCTION plt_t.poke_fn();
+-- RV-PLT-18: نقشی که migration بعدی با مجوز critical ولی بدون پرچم بسازد باز هم ممتاز است و lint آن را گزارش می‌کند
+INSERT INTO platform.staff_role (code, name_fa, name_en, is_privileged) VALUES ('x_approver', 'تأییدکنندهٔ آزمون', 'Test approver', false);
+INSERT INTO platform.staff_role_permission (role_code, permission_code) VALUES ('x_approver', 'platform.billing.refund.approve');
+DO $$
+BEGIN
+  PERFORM plt_t.ok('T32 a role holding a critical permission is privileged even without the flag', platform.role_is_privileged('x_approver'));
+  PERFORM plt_t.ok('T32 lint flags an unmarked approver role',
+    EXISTS (SELECT 1 FROM platform.security_lint() WHERE problem = 'role with a critical permission is not marked privileged' AND object = 'platform.staff_role.x_approver'));
+END $$;
 DO $$
 BEGIN
   PERFORM plt_t.fails('T32 counter advances by exactly one even from a trigger', $q$INSERT INTO plt_t.poke VALUES (1)$q$,
@@ -2997,8 +3756,8 @@ DO $$
 DECLARE
   v_g uuid := uuidv7(); v_req uuid;
 BEGIN
-  INSERT INTO platform.support_consent (tenant_id, grant_id, grantee_kind, access_mode, max_session_minutes, starts_at, expires_at)
-  VALUES (plt_t.u('TA'), v_g, 'platform_support', 'read_only', 60, now() - interval '1 minute', now() + interval '1 day');
+  INSERT INTO platform.support_consent (tenant_id, grant_id, grantee_kind, access_mode, max_session_minutes, starts_at, expires_at, batch_id)
+  VALUES (plt_t.u('TA'), v_g, 'platform_support', 'read_only', 60, now() - interval '1 minute', now() + interval '1 day', plt_t.u('UB1'));
   PERFORM plt_t.as_staff(plt_t.u('S'));
   INSERT INTO platform.impersonation_request (tenant_id, grant_id, requester_kind, staff_id, mode, reason, ticket_ref, max_minutes)
   VALUES (plt_t.u('TA'), v_g, 'staff', plt_t.u('S'), 'read_only', 'check the closing balances', 'T-000001', 30) RETURNING id INTO v_req;

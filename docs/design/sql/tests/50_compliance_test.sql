@@ -37,16 +37,17 @@
 RESET ROLE;
 SELECT set_config('cp.vectors', :'tax_vectors', false) \gset
 
+-- p_expect: SQLSTATE، پیشوند پیام (کد HK_*)، یا «chk:<نام قید>» برای قید CHECK/UNIQUE/EXCLUDE/FK مشخص (R-QUALITY)
 CREATE OR REPLACE FUNCTION public.cp_expect_error(p_label text, p_sql text, p_expect text) RETURNS void
 LANGUAGE plpgsql AS $$
-DECLARE v_state text; v_msg text;
+DECLARE v_state text; v_msg text; v_con text;
 BEGIN
   BEGIN
     EXECUTE p_sql;
   EXCEPTION WHEN OTHERS THEN
-    GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_msg = MESSAGE_TEXT;
-    IF v_state = p_expect OR v_msg LIKE p_expect || '%' THEN RETURN; END IF;
-    RAISE EXCEPTION 'TEST FAILED [%]: expected %, got % %', p_label, p_expect, v_state, v_msg;
+    GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_msg = MESSAGE_TEXT, v_con = CONSTRAINT_NAME;
+    IF v_state = p_expect OR v_msg LIKE p_expect || '%' OR (p_expect LIKE 'chk:%' AND v_con = substr(p_expect, 5)) THEN RETURN; END IF;
+    RAISE EXCEPTION 'TEST FAILED [%]: expected %, got % % (constraint %)', p_label, p_expect, v_state, v_msg, coalesce(v_con, '-');
   END;
   RAISE EXCEPTION 'TEST FAILED [%]: statement succeeded but % was expected', p_label, p_expect;
 END $$;
@@ -124,10 +125,10 @@ BEGIN
   END LOOP;
   INSERT INTO tax.invoice_issue (tenant_id, id, company_id, invoice_id, issue_no, memory_ref, memory_id, serial, number_issued_id, allocation,
        indatim_ms, issue_date, taxid, irtaxid, subject, inv_type, pattern, setm, tprdis, tdis, tadis, tvam, todam, tolam, tbill,
-       seller_tin, buyer_type, buyer_national_id, buyer_tin, buyer_postal_code, payload, payload_sha256, rule_snapshot_id, send_deadline_at)
+       seller_tin, branch_id, seller_branch_code, buyer_type, buyer_national_id, buyer_tin, buyer_postal_code, payload, payload_sha256, rule_snapshot_id, send_deadline_at)
   VALUES (inv.tenant_id, v_id, inv.company_id, inv.id, coalesce((p->>'issue_no')::smallint, 1), m.id, m.memory_id, n.value, n.number_id, 'server',
        v_ind, (to_timestamp(v_ind / 1000.0) AT TIME ZONE 'Asia/Tehran')::date, v_taxid, p->>'irtaxid', inv.subject, inv.inv_type, inv.pattern,
-       v_setm, t_prdis, t_dis, t_adis, t_vam, 0, 0, t_tsstam, '14003778990',
+       v_setm, t_prdis, t_dis, t_adis, t_vam, 0, 0, t_tsstam, '14003778990', (p->>'branch_id')::uuid, p->>'sbc',
        (p->>'buyer_type')::smallint, p->>'buyer_nid', p->>'buyer_tin', p->>'buyer_postal',
        jsonb_build_object('header', jsonb_strip_nulls(jsonb_build_object('taxid', v_taxid, 'indatim', v_ind, 'inno', substr(v_taxid, 12, 10),
             'inty', inv.inv_type, 'inp', inv.pattern, 'ins', inv.subject, 'irtaxid', p->>'irtaxid',
@@ -230,6 +231,9 @@ INSERT INTO core.tenant_membership (tenant_id, user_id, status, joined_at, is_ow
 INSERT INTO core.device (tenant_id, id, company_id, branch_id, kind, name, public_key, status, registered_by, activated_at) VALUES
   ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000d1', 'c5a00000-0000-7000-8000-0000000000c1',
    'c5a00000-0000-7000-8000-0000000000b1', 'windows', 'امضاکنندهٔ دفتر', decode(repeat('11', 32), 'hex'), 'active',
+   'c5000000-0000-7000-8000-0000000000e1', now()),
+  ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000d2', 'c5a00000-0000-7000-8000-0000000000c1',
+   'c5a00000-0000-7000-8000-0000000000b1', 'windows', 'رایانهٔ دیگر', decode(repeat('22', 32), 'hex'), 'active',
    'c5000000-0000-7000-8000-0000000000e1', now());
 INSERT INTO ref.sstid (sstid, kind, title, snapshot_version, synced_at) VALUES
   ('2710000138624', 'general', 'کالای آزمایشی یک', 'test-v1', now()),
@@ -265,6 +269,19 @@ BEGIN
     (t, 'c5a00000-0000-7000-8000-00000000a105', 'employee');
 END $$;
 
+-- پایگاه یکپارچه (INTEGRATED_TESTS=1؛ RV-CMP-27): وقتی sales نصب است FKهای 99 (tax.invoice → sales.invoice) فاکتور فروش واقعی
+-- می‌خواهند؛ پس برای شناسه‌های فاکتور فروش این آزمون پیش‌نویس واقعی ساخته می‌شود. در زنجیرهٔ مستقل (بدون 30) این بلوک کاری نمی‌کند.
+DO $$
+DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
+BEGIN
+  IF to_regclass('sales.invoice') IS NULL THEN RETURN; END IF;
+  PERFORM set_config('app.tenant_id', t::text, true);
+  EXECUTE format($q$INSERT INTO sales.invoice (tenant_id, id, company_id, branch_id, doc_date, customer_party_id, currency, currency_minor, stock_mode)
+                    SELECT %L, ('c5a00000-0000-7000-8000-0000000b00' || lpad(n::text, 2, '0'))::uuid, %L, 'c5a00000-0000-7000-8000-0000000000b1',
+                           DATE '2026-04-10', 'c5a00000-0000-7000-8000-00000000a104', 'IRR', 0, 'none'
+                      FROM generate_series(1, 49) n$q$, t, c);
+END $$;
+
 -- ---------- بسته‌های قواعد آزمایشی (ارقام TEST-ONLY و ساختگی؛ هیچ‌کدام رقم قانونی نیست) ----------
 \set engine '2026.11.0'
 SELECT app_version AS engine FROM core.deployment_info \gset
@@ -295,6 +312,20 @@ INSERT INTO rules.param_value (id, package_id, key, qualifier, effective_from, v
    '{"amount":"3000000","unit":"IRR"}', NULL, 'TEST-ONLY', 'low'),
   ('c5000000-0000-7000-8000-00000000f107', 'c5000000-0000-7000-8000-00000000f001', 'payroll.rate.shift', 'me', '2026-03-21',
    '{"v":"0.10"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f108', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.employee_rate', '', '2026-03-21', '{"v":"0.07"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f109', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.employer_rate', '', '2026-03-21', '{"v":"0.20"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f110', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.unemployment_rate', '', '2026-03-21', '{"v":"0.03"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f111', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.hard_job_rate', '', '2026-03-21', '{"v":"0.04"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f112', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.cap_multiplier', '', '2026-03-21', '{"v":"7"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f113', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.rounding', '', '2026-03-21', '{"v":"half_up"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f114', 'c5000000-0000-7000-8000-00000000f001', 'payroll.tax.employee_ssi_deductible_fraction', '', '2026-03-21',
+   '{"v":"0.25"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f115', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.min_base_rule', '', '2026-03-21',
+   '{"v":{"applies_to":["full_time","part_time","hourly"],"multiplier":"1","part_time":"by_hours","exempt_job_codes":["999999"]}}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f116', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.list_control_totals', 'listdisk_6', '2026-03-21',
+   '{"v":"sum_of_rows"}', NULL, 'TEST-ONLY', 'high'),
+  ('c5000000-0000-7000-8000-00000000f117', 'c5000000-0000-7000-8000-00000000f001', 'payroll.ssi.list_control_totals', 'listdisk_2_7', '2026-03-21',
+   '{"v":"rate_on_total"}', NULL, 'TEST-ONLY', 'high'),
   ('c5000000-0000-7000-8000-00000000f201', 'c5000000-0000-7000-8000-00000000f002', 'tax.moadian.send_deadline_days', '', '2026-03-21',
    '{"v":7}', NULL, 'TEST-ONLY', 'high'),
   ('c5000000-0000-7000-8000-00000000f202', 'c5000000-0000-7000-8000-00000000f002', 'tax.vat.general_rate', '', '2026-03-21',
@@ -507,6 +538,99 @@ BEGIN
     '23P01');
 END $$;
 
+-- G10 قرارداد رویداد با تولیدکننده (RV-LEDGER-11، RV-X1-02، RV-X1-12): نام رویداد ledger همان 03 §۶ است و fan-out واقعاً تحویل می‌سازد
+DO $$
+DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; v_ev uuid := uuidv7();
+BEGIN
+  PERFORM public.cp_assert(NOT EXISTS (SELECT 1 FROM core.event_subscription WHERE event_type = 'ledger.year.closed'),
+                           'INV-CMP-09 no subscription to an event type nobody publishes (ledger.year.closed)');
+  INSERT INTO core.outbox_event (tenant_id, id, event_type, aggregate_type, aggregate_id, payload)
+  VALUES (t, v_ev, 'ledger.fiscal_year.closed', 'fiscal_year', uuidv7(), '{"fiscal_year_id":"x"}');
+  PERFORM public.cp_assert(EXISTS (SELECT 1 FROM core.outbox_delivery WHERE tenant_id = t AND event_id = v_ev AND subscriber = 'assets.year_close'),
+                           'INV-CMP-09 ledger.fiscal_year.closed fans out to assets.year_close');
+  v_ev := uuidv7();
+  INSERT INTO core.outbox_event (tenant_id, id, event_type, aggregate_type, aggregate_id, payload)
+  VALUES (t, v_ev, 'ledger.fiscal_year.reopened', 'fiscal_year', uuidv7(), '{"fiscal_year_id":"x"}');
+  PERFORM public.cp_assert(EXISTS (SELECT 1 FROM core.outbox_delivery WHERE tenant_id = t AND event_id = v_ev AND subscriber = 'assets.year_close'),
+                           'INV-CMP-09 ledger.fiscal_year.reopened fans out to assets.year_close');
+  -- مصرف‌کننده‌های اعلام‌شدهٔ بخش ۰۴ (04 §۶): tax مشترک identity_changed و catalog.item.updated است
+  PERFORM public.cp_assert((SELECT count(*) FROM core.event_subscription WHERE (event_type, subscriber) IN
+        (('parties.party.identity_changed','tax.party_identity_sync'),('catalog.item.updated','tax.item_sync'))) = 2,
+                           'INV-CMP-09 tax subscribes to the masterdata events 04 lists it for');
+  -- ایندکس‌های مسیر داغ نگهبان‌ها (RV-CMP-25)
+  PERFORM public.cp_assert(to_regclass('assets.depreciation_line_book_period') IS NOT NULL AND to_regclass('payroll.payslip_employee_idx') IS NOT NULL,
+                           'INV-CMP-10 guard lookups are indexed (depreciation overlap, payslip by employee)');
+END $$;
+
+
+-- G12 دورهٔ دفاتر الکترونیکی پارامتر تاریخ‌دار است، نه ثابت کاتالوگ (RV-X3-07): شش‌ماهه برای سال آغازشده در ۱۴۰۴، فصلی از ۱۴۰۵
+INSERT INTO rules.package (id, code, version, seq, covers_from, min_engine_version, payload_sha256, hksb_sha256, signer_kid,
+                           published_at, authored_by, approved_by, changelog_fa, installed_via) VALUES
+  ('c5000000-0000-7000-8000-00000000f008', 'ir.calendar', '1405.2', 2, '2025-03-21', '2026.1.0', sha256('p8'), sha256('h8'), 'rules-test-a',
+   now(), 'author@platform', '{approver@platform}', 'دورهٔ دفاتر الکترونیکی TEST-ONLY', 'test_fixture');
+INSERT INTO rules.param_value (package_id, key, effective_from, effective_to, value, source_ref, confidence) VALUES
+  ('c5000000-0000-7000-8000-00000000f008', 'tax.eledger.period', '2025-03-21', '2026-03-21', '{"v":"semiannual"}', 'TEST-ONLY', 'medium'),
+  ('c5000000-0000-7000-8000-00000000f008', 'tax.eledger.period', '2026-03-21', NULL, '{"v":"quarterly"}', 'TEST-ONLY', 'medium');
+INSERT INTO rules.golden_test (package_id, code, calculator, as_of, input, expected, signed_by) VALUES
+  ('c5000000-0000-7000-8000-00000000f008', 'eledger-1404', 'calendar.obligation_periods', '2025-03-21', '{"fy_start":"2025-03-21"}', '{"periods":2}', 'حسابدار آزمون'),
+  ('c5000000-0000-7000-8000-00000000f008', 'eledger-1405', 'calendar.obligation_periods', '2026-03-21', '{"fy_start":"2026-03-21"}', '{"periods":4}', 'حسابدار آزمون');
+UPDATE rules.package SET status = 'installed' WHERE id = 'c5000000-0000-7000-8000-00000000f008';
+INSERT INTO rules.golden_run (package_id, engine_version, runner, total, passed, failed, outcome, started_at)
+VALUES ('c5000000-0000-7000-8000-00000000f008', :'engine', 'install', 2, 2, 0, 'passed', now());
+UPDATE rules.package SET status = 'active' WHERE id = 'c5000000-0000-7000-8000-00000000f008';
+-- قالب‌های نسخه‌دار گزارش قانونی (ir.formats؛ TEST-ONLY)
+INSERT INTO rules.package (id, code, version, seq, covers_from, min_engine_version, payload_sha256, hksb_sha256, signer_kid,
+                           published_at, authored_by, approved_by, changelog_fa, installed_via) VALUES
+  ('c5000000-0000-7000-8000-00000000f00a', 'ir.formats', '1405.1', 1, '2026-03-21', '2026.1.0', sha256('pa'), sha256('ha'), 'rules-test-a',
+   now(), 'author@platform', '{approver@platform}', 'قالب‌های گزارش TEST-ONLY', 'test_fixture');
+INSERT INTO rules.param_value (id, package_id, key, qualifier, effective_from, value, source_ref, confidence) VALUES
+  ('c5000000-0000-7000-8000-00000000fa01', 'c5000000-0000-7000-8000-00000000f00a', 'tax.art169.format', 'portal-1405', '2026-03-21',
+   '{"v":{"kind":"xlsx","columns":["tin","amount"]}}', 'TEST-ONLY', 'medium'),
+  ('c5000000-0000-7000-8000-00000000fa02', 'c5000000-0000-7000-8000-00000000f00a', 'tax.vat_summary.format', 'v1', '2026-03-21',
+   '{"v":{"kind":"xlsx"}}', 'TEST-ONLY', 'medium');
+INSERT INTO rules.golden_test (package_id, code, calculator, as_of, input, expected, signed_by) VALUES
+  ('c5000000-0000-7000-8000-00000000f00a', 'art169-layout', 'tax.legal_report', '2026-06-21', '{}', '{"columns":2}', 'حسابدار آزمون');
+UPDATE rules.package SET status = 'installed' WHERE id = 'c5000000-0000-7000-8000-00000000f00a';
+INSERT INTO rules.golden_run (package_id, engine_version, runner, total, passed, failed, outcome, started_at)
+VALUES ('c5000000-0000-7000-8000-00000000f00a', :'engine', 'install', 1, 1, 0, 'passed', now());
+UPDATE rules.package SET status = 'active' WHERE id = 'c5000000-0000-7000-8000-00000000f00a';
+DO $$
+BEGIN
+  PERFORM public.cp_assert((rules.value_at('tax.eledger.period', '2025-03-21')).value ->> 'v' = 'semiannual'
+                           AND (rules.value_at('tax.eledger.period', '2026-03-21')).value ->> 'v' = 'quarterly',
+                           'INV-RUL-14 e-ledger period is read at the fiscal-year start (1404 semiannual, 1405 quarterly)');
+  PERFORM public.cp_assert((SELECT frequency = 'per_rule' AND frequency_rule_key = 'tax.eledger.period' FROM rules.obligation_def WHERE code = 'tax.eledger.periodic'),
+                           'INV-RUL-14 the e-ledger obligation takes its period from the dated rule');
+  PERFORM public.cp_expect_error('INV-RUL-14 a per-rule obligation names its rule key',
+    $q$INSERT INTO rules.obligation_def (code, domain, frequency, applies_to, title_key, introduced_in) VALUES ('tax.test.x', 'tax', 'per_rule', 'company', 'x', '1.0')$q$,
+    '23514');
+  -- تکلیف احتمالی سامانهٔ جامع تجارت/رهگیری کالا (RV-X3-12، Q-CMP-14): داده است، پیش‌فرض غیرفعال، با کلید بولی سطح شرکت
+  PERFORM public.cp_assert((SELECT o.enabled_rule_key = 'tax.trade_system.reporting_required' AND d.value_type = 'boolean'
+                                   AND d.override_policy = 'any' AND d.override_levels = '{company}'
+                                   AND NOT EXISTS (SELECT 1 FROM rules.param_value v WHERE v.key = d.key)
+                              FROM rules.obligation_def o JOIN rules.param_def d ON d.key = o.enabled_rule_key
+                             WHERE o.code = 'tax.trade_system.reporting'),
+                           'INV-RUL-14 the unverified trade-system duty is data, gated by a company-level boolean rule with no statutory value yet');
+  PERFORM public.cp_expect_error('INV-RUL-14 an obligation gate must be a boolean key overridable at company level',
+    $q$INSERT INTO rules.obligation_def (code, domain, frequency, enabled_rule_key, applies_to, title_key, introduced_in)
+       VALUES ('tax.test.gate', 'tax', 'per_event', 'tax.eledger.period', 'company', 'x', '1.0')$q$, 'HK_RULES_OBLIGATION_GATE');
+  PERFORM public.cp_expect_error('INV-RUL-14 an obligation gate must be overridable by the company',
+    $q$INSERT INTO rules.obligation_def (code, domain, frequency, enabled_rule_key, applies_to, title_key, introduced_in)
+       VALUES ('tax.test.gate', 'tax', 'per_event', 'tax.art169.exclude_moadian_registered', 'company', 'x', '1.0')$q$, 'HK_RULES_OBLIGATION_GATE');
+  -- پاسخ CR-PLT-09: بستهٔ مرجع ir.ref.* با مقدار نشانگر ref.<جدول>.snapshot؛ فقط همین شکل در حوزهٔ ref پذیرفته است
+  PERFORM public.cp_assert((SELECT count(*) FROM rules.param_def WHERE domain = 'ref' AND package_code LIKE 'ir.ref.%' AND key LIKE 'ref.%.snapshot') = 3,
+                           'G12 CR-PLT-09 reference packages carry a ref.<table>.snapshot marker key');
+  PERFORM public.cp_expect_error('G12 CR-PLT-09 a ref key is only a json snapshot marker of an ir.ref package',
+    $q$INSERT INTO rules.param_def (key, domain, package_code, value_type, override_policy, override_levels, description_key, introduced_in)
+       VALUES ('ref.iran_bank.rate', 'ref', 'ir.ref.bank', 'percent', 'none', '{}', 'x', '1.0')$q$, 'chk:param_def_ref_marker');
+  PERFORM public.cp_expect_error('G12 CR-PLT-09 a ref marker belongs to an ir.ref package',
+    $q$INSERT INTO rules.param_def (key, domain, package_code, value_type, override_policy, override_levels, description_key, introduced_in)
+       VALUES ('ref.iran_bank2.snapshot', 'ref', 'ir.tax', 'json', 'none', '{}', 'x', '1.0')$q$, 'chk:param_def_ref_marker');
+  -- پاسخ C-AS-08: مجوز گزارش تجمیعی حقوق (بدون دادهٔ فردی) حساس است، نه بحرانی
+  PERFORM public.cp_assert((SELECT risk = 'sensitive' AND module = 'payroll' FROM core.permission WHERE code = 'payroll.report.read'),
+                           'G12 C-AS-08 aggregate payroll report permission exists and is sensitive');
+END $$;
+
 -- =====================================================================
 -- بخش ۲: ادعاها با نقش برنامه (hk_app)
 -- =====================================================================
@@ -531,6 +655,8 @@ BEGIN
     $q$INSERT INTO ref.sstid_vat_rate (sstid, effective_from, vat_rate, snapshot_version, synced_at) VALUES ('2710000138625', '2026-03-21', 10, 't', now())$q$, '42501');
   PERFORM public.cp_assert((SELECT count(*) FROM rules.param_def) > 60, 'INV-RUL-11 app reads definitions');
   PERFORM public.cp_assert((SELECT count(*) FROM rules.tax_category WHERE code = 'standard') = 1, 'INV-RUL-11 app reads tax categories');
+  PERFORM public.cp_expect_error('INV-RUL-17 app cannot fan out package events (installer only)',
+    $q$SELECT rules.package_fanout(uuidv7())$q$, '42501');
   PERFORM public.cp_expect_error('INV-RUL-11 app cannot add tax categories',
     $q$INSERT INTO rules.tax_category (code, kind, title_key, introduced_in) VALUES ('luxury', 'vat', 'x', '1.0')$q$, '42501');
 END $$;
@@ -539,9 +665,15 @@ END $$;
 DO $$
 DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
         u1 uuid := 'c5000000-0000-7000-8000-0000000000e1'; u2 uuid := 'c5000000-0000-7000-8000-0000000000e2';
+        w1 uuid := 'c5a00000-0000-7000-8000-000000001001';
         w2 uuid := 'c5a00000-0000-7000-8000-000000001002'; w3 uuid := 'c5a00000-0000-7000-8000-000000001003';
 BEGIN
   PERFORM set_config('app.tenant_id', t::text, true);
+  -- کارگاه‌های واقعی پیش از جایگزین کارگاهی (روی پایگاه یکپارچه FK fk_param_override__payroll_workshop هست؛ RV-CMP-27)
+  INSERT INTO payroll.workshop (tenant_id, id, company_id, code, name, employer_name, address, dsk_rate, salary_tax_format, opened_on) VALUES
+    (t, w1, c, '1234567890', 'کافه', 'کافهٔ الف', 'تهران', 23, 'wh-1-7', '2026-03-21'),
+    (t, w2, c, '1234567891', 'انبار', 'کافهٔ الف', 'کرج', 23, 'wh-1-7', '2026-03-21'),
+    (t, w3, c, '1234567892', 'شعبهٔ سه', 'کافهٔ الف', 'قم', 23, 'wh-1-7', '2026-03-21');
   PERFORM public.cp_expect_error('INV-RUL-12 level not allowed',
     format($q$INSERT INTO rules.param_override (tenant_id, scope_level, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
               VALUES (%L, 'tenant', 'payroll.wage.min_daily', '2026-03-21', '{"amount":"1200000","unit":"IRR"}', 'company_policy', 'سیاست', %L, %L)$q$, t, u1, u1),
@@ -554,30 +686,61 @@ BEGIN
     format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
               VALUES (%L, 'workshop', %L, %L, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"800000","unit":"IRR"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, w2, u1, u2),
     'HK_RULES_OVERRIDE_BELOW_FLOOR');
-  PERFORM public.cp_expect_error('INV-RUL-12 collective agreement needs a second approver',
+  PERFORM public.cp_expect_error('INV-RUL-12 statutory floor key override needs a second approver (RV-CMP-02)',
     format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
               VALUES (%L, 'workshop', %L, %L, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"800000","unit":"IRR"}', 'collective_agreement', 'پیمان ۱۲', %L, %L)$q$, t, c, w2, u1, u1),
-    '23514');
+    'HK_RULES_OVERRIDE_SOD');
+  PERFORM public.cp_expect_error('INV-RUL-12 company policy on a floor key also needs a second approver (RV-CMP-02)',
+    format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
+              VALUES (%L, 'workshop', %L, %L, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"1200000","unit":"IRR"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, w3, u1, u1),
+    'HK_RULES_OVERRIDE_SOD');
+  PERFORM public.cp_expect_error('INV-RUL-12 collective agreement needs a second approver (any key)',
+    format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
+              VALUES (%L, 'workshop', %L, %L, 'payroll.wage.other_levels', '2026-03-21', '{"v":{"pct":"10"}}', 'collective_agreement', 'پیمان ۱۲', %L, %L)$q$, t, c, w2, u1, u1),
+    'chk:override_agreement_sod');
+  PERFORM public.cp_expect_error('INV-RUL-12 below floor only by a workshop-level collective agreement (RV-CMP-12)',
+    format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
+              VALUES (%L, 'company', %L, 'payroll.allowance.housing_monthly', '2026-03-21', '{"amount":"10","unit":"IRR"}', 'collective_agreement', 'پیمان شرکت', %L, %L)$q$, t, c, u1, u2),
+    'HK_RULES_OVERRIDE_BELOW_FLOOR');
+  PERFORM public.cp_expect_error('INV-RUL-12 below floor is compared in IRR whatever the unit (IRT ×10; RV-CMP-03)',
+    format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
+              VALUES (%L, 'workshop', %L, %L, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"99999","unit":"IRT"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, w1, u1, u2),
+    'HK_RULES_OVERRIDE_BELOW_FLOOR');
+  PERFORM public.cp_expect_error('INV-RUL-12 hourly divisor may only be lowered (ceiling; RV-CMP-02)',
+    format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
+              VALUES (%L, 'workshop', %L, %L, 'payroll.time.hourly_divisor', '2026-03-21', '{"v":"1100"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, w1, u1, u2),
+    'HK_RULES_OVERRIDE_ABOVE_CEILING');
+  PERFORM public.cp_assert(rules.value_numeric('money', '{"amount":"110000","unit":"IRT"}') = 1100000
+                           AND rules.value_numeric('money', '{"amount":"1","unit":"IRR_NEW"}') IS NULL,
+                           'INV-RUL-12 money values normalise to IRR (IRT ×10; IRR_NEW needs the dated factor)');
+  PERFORM public.cp_expect_error('INV-RUL-12 IRR_NEW without an active ir.general package is an explicit error, never a skipped check',
+    $q$SELECT rules.value_numeric_on('money', '{"amount":"1","unit":"IRR_NEW"}', '2026-04-01')$q$, 'HK_RULES_NO_ACTIVE_PACKAGE');
   PERFORM public.cp_expect_error('INV-RUL-12 override value type',
     format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
               VALUES (%L, 'workshop', %L, %L, 'payroll.wage.min_daily', '2026-03-21', '{"v":"800000"}', 'collective_agreement', 'پیمان ۱۲', %L, %L)$q$, t, c, w2, u1, u2),
     'HK_RULES_VALUE_INVALID');
   PERFORM public.cp_expect_error('INV-RUL-12 scope shape',
     format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
-              VALUES (%L, 'workshop', %L, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"1200000","unit":"IRR"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, u1, u1),
+              VALUES (%L, 'workshop', %L, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"1200000","unit":"IRR"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, u1, u2),
     '23514');
   INSERT INTO rules.param_override (tenant_id, id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
   VALUES (t, 'c5a00000-0000-7000-8000-000000000501', 'workshop', c, w2, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"800000","unit":"IRR"}',
           'collective_agreement', 'پیمان دسته‌جمعی ۱۲', u1, u2),
          (t, 'c5a00000-0000-7000-8000-000000000502', 'workshop', c, w3, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"1200000","unit":"IRR"}',
-          'company_policy', 'سیاست مزد کارگاه ۳', u1, u1);
+          'company_policy', 'سیاست مزد کارگاه ۳', u1, u2),
+         -- سیاست کارگاه ۱ بالاتر از کف امروز؛ بستهٔ ۱۴۰۵.۲ (بخش ۳) کف را از آن بالاتر می‌برد (RV-CMP-01، T19)
+         (t, 'c5a00000-0000-7000-8000-000000000503', 'workshop', c, w1, 'payroll.wage.min_daily', '2026-03-21', '{"amount":"1050000","unit":"IRR"}',
+          'company_policy', 'سیاست مزد کارگاه ۱', u1, u2),
+         (t, 'c5a00000-0000-7000-8000-000000000504', 'workshop', c, w1, 'payroll.time.hourly_divisor', '2026-03-21', '{"v":"7"}',
+          'company_policy', 'مزد ساعتی سخاوتمندانه', u1, u2);
   PERFORM public.cp_expect_error('INV-RUL-12 overlapping active overrides',
     format($q$INSERT INTO rules.param_override (tenant_id, scope_level, company_id, workshop_ref, key, effective_from, value, basis_kind, basis_ref, created_by, approved_by)
-              VALUES (%L, 'workshop', %L, %L, 'payroll.wage.min_daily', '2026-05-01', '{"amount":"1300000","unit":"IRR"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, w3, u1, u1),
+              VALUES (%L, 'workshop', %L, %L, 'payroll.wage.min_daily', '2026-05-01', '{"amount":"1300000","unit":"IRR"}', 'company_policy', 'سیاست', %L, %L)$q$, t, c, w3, u1, u2),
     '23P01');
   PERFORM public.cp_assert(rules.effective_value('payroll.wage.min_daily', '2026-04-01', '', c, w2) ->> 'amount' = '800000', 'INV-RUL-12 workshop agreement wins');
   PERFORM public.cp_assert(rules.effective_value('payroll.wage.min_daily', '2026-04-01', '', c, w3) ->> 'amount' = '1200000', 'INV-RUL-12 workshop policy wins');
   PERFORM public.cp_assert(rules.effective_value('payroll.wage.min_daily', '2026-04-01', '', c, uuidv7()) ->> 'amount' = '1000000', 'INV-RUL-12 statutory otherwise');
+  PERFORM public.cp_assert(rules.effective_value('payroll.wage.min_daily', '2026-04-01', '', c, w1) ->> 'amount' = '1050000', 'INV-RUL-12 workshop policy above the floor wins');
   PERFORM public.cp_expect_error('INV-RUL-12 override immutable',
     $q$UPDATE rules.param_override SET value = '{"amount":"1250000","unit":"IRR"}' WHERE id = 'c5a00000-0000-7000-8000-000000000502'$q$, 'HK_RULES_OVERRIDE_IMMUTABLE');
   PERFORM public.cp_expect_error('INV-RUL-12 override no delete',
@@ -591,27 +754,53 @@ END $$;
 DO $$
 DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1'; e text := current_setting('cp.engine');
         v_br jsonb := (SELECT value FROM rules.param_value WHERE id = 'c5000000-0000-7000-8000-00000000f104');
-        v_content jsonb;
+        v_content jsonb; v_pay uuid[];
 BEGIN
   PERFORM set_config('app.tenant_id', t::text, true);
   v_content := jsonb_build_object('payroll.tax.brackets_monthly', jsonb_build_object('_', v_br),
                                   'payroll.tax.rounding', jsonb_build_object('_', '{"v":"truncate"}'::jsonb),
                                   'payroll.wage.min_daily', jsonb_build_object('_', '{"amount":"1000000","unit":"IRR"}'::jsonb));
+  -- بازهٔ پوشش‌دهندهٔ اجرای حقوق: کمینه + نرخ‌ها، سقف، گرد کردن، کسر بیمه از مبنای مالیات، حداقل مبنا و فرمول مقادیر کنترلی لیست
+  v_pay := ARRAY['c5000000-0000-7000-8000-00000000f101','c5000000-0000-7000-8000-00000000f104','c5000000-0000-7000-8000-00000000f105',
+                 'c5000000-0000-7000-8000-00000000f108','c5000000-0000-7000-8000-00000000f109','c5000000-0000-7000-8000-00000000f110',
+                 'c5000000-0000-7000-8000-00000000f111','c5000000-0000-7000-8000-00000000f112','c5000000-0000-7000-8000-00000000f113',
+                 'c5000000-0000-7000-8000-00000000f114','c5000000-0000-7000-8000-00000000f115','c5000000-0000-7000-8000-00000000f116',
+                 'c5000000-0000-7000-8000-00000000f117']::uuid[];
+  -- محتوای صریح باید دقیقاً محتوای متعارف ردیف‌های ارجاع‌شده باشد (RV-CMP-04)؛ جدول پلکانی ۰٪ با ارجاع به جدول واقعی رد می‌شود
+  PERFORM public.cp_expect_error('INV-RUL-13 content must equal the cited values (no 0% table behind a real value id)',
+    format($q$INSERT INTO rules.calc_snapshot (tenant_id, company_id, calculator, engine_version, as_of_from, as_of_to, package_ids, value_ids, content, min_confidence, content_sha256)
+              VALUES (%L, %L, 'payroll.run', %L, '2026-03-21', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f001']::uuid[],
+                      ARRAY['c5000000-0000-7000-8000-00000000f104','c5000000-0000-7000-8000-00000000f105']::uuid[],
+                      '{"payroll.tax.brackets_monthly":{"_":{"rows":[{"from":"0","to":null,"rate":"0"}]}},"payroll.tax.rounding":{"_":{"v":"truncate"}}}',
+                      'high', '\x00')$q$, t, c, e), 'HK_RULES_SNAPSHOT_CONTENT');
+  PERFORM public.cp_expect_error('INV-RUL-13 cited values cover the whole snapshot period',
+    format($q$INSERT INTO rules.calc_snapshot (tenant_id, company_id, calculator, engine_version, as_of_from, as_of_to, package_ids, value_ids, content, min_confidence, content_sha256)
+              VALUES (%L, %L, 'payroll.run', %L, '2026-03-01', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f001']::uuid[],
+                      ARRAY['c5000000-0000-7000-8000-00000000f104']::uuid[], '{}', 'high', '\x00')$q$, t, c, e), 'HK_RULES_SNAPSHOT_COVERAGE');
   INSERT INTO rules.calc_snapshot (tenant_id, id, company_id, calculator, engine_version, as_of_from, as_of_to, package_ids, value_ids, content, min_confidence, content_sha256)
   VALUES (t, 'c5a00000-0000-7000-8000-000000005001', c, 'payroll.run', e, '2026-03-21', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f001']::uuid[],
-          ARRAY['c5000000-0000-7000-8000-00000000f101','c5000000-0000-7000-8000-00000000f104','c5000000-0000-7000-8000-00000000f105']::uuid[],
-          v_content, 'high', '\x00'),
+          v_pay, '{}', 'high', '\x00'),
          (t, 'c5a00000-0000-7000-8000-000000005002', c, 'payroll.run', e, '2026-03-21', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f001']::uuid[],
-          ARRAY['c5000000-0000-7000-8000-00000000f101','c5000000-0000-7000-8000-00000000f104','c5000000-0000-7000-8000-00000000f105','c5000000-0000-7000-8000-00000000f106']::uuid[],
-          v_content || '{"payroll.allowance.housing_monthly":{"_":{"amount":"3000000","unit":"IRR"}}}', 'low', '\x00'),
+          v_pay || 'c5000000-0000-7000-8000-00000000f106'::uuid, '{}', 'low', '\x00'),
          (t, 'c5a00000-0000-7000-8000-000000005003', c, 'payroll.run', '2099.1.0', '2026-03-21', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f001']::uuid[],
-          ARRAY['c5000000-0000-7000-8000-00000000f104','c5000000-0000-7000-8000-00000000f105']::uuid[], v_content, 'high', '\x00'),
+          v_pay, '{}', 'high', '\x00'),
          (t, 'c5a00000-0000-7000-8000-000000005004', c, 'tax.moadian_invoice', e, '2026-03-21', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f002']::uuid[],
           ARRAY['c5000000-0000-7000-8000-00000000f201']::uuid[], '{"tax.moadian.send_deadline_days":{"_":{"v":7}}}', 'high', '\x00'),
          (t, 'c5a00000-0000-7000-8000-000000005005', c, 'assets.depreciation', e, '2026-03-21', '2027-03-20', ARRAY['c5000000-0000-7000-8000-00000000f003']::uuid[],
-          ARRAY['c5000000-0000-7000-8000-00000000f301','c5000000-0000-7000-8000-00000000f302']::uuid[], '{"assets.depreciation.start_rule":{"_":{"v":"first_day_next_month"}}}', 'low', '\x00');
+          ARRAY['c5000000-0000-7000-8000-00000000f301','c5000000-0000-7000-8000-00000000f302']::uuid[], '{}', 'low', '\x00');
   PERFORM public.cp_assert((SELECT octet_length(content_sha256) = 32 FROM rules.calc_snapshot WHERE id = 'c5a00000-0000-7000-8000-000000005001'),
                            'INV-RUL-13 hash computed by the database');
+  INSERT INTO rules.calc_snapshot (tenant_id, id, company_id, calculator, engine_version, as_of_from, as_of_to, package_ids, value_ids, content, min_confidence, content_sha256)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000005007', c, 'payroll.run', e, '2026-03-21', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f001']::uuid[],
+          array_remove(v_pay, 'c5000000-0000-7000-8000-00000000f115'::uuid), '{}', 'high', '\x00');
+  PERFORM public.cp_assert((SELECT content @> v_content FROM rules.calc_snapshot WHERE id = 'c5a00000-0000-7000-8000-000000005001')
+                           AND rules.snapshot_value((SELECT content FROM rules.calc_snapshot WHERE id = 'c5a00000-0000-7000-8000-000000005001'),
+                                                    'payroll.ssi.list_control_totals', 'listdisk_6', '2026-04-20') ->> 'v' = 'sum_of_rows',
+                           'INV-RUL-13 content is derived from the cited values (explicit content of the same values is accepted)');
+  INSERT INTO rules.calc_snapshot (tenant_id, company_id, calculator, engine_version, as_of_from, as_of_to, package_ids, value_ids, content, min_confidence, content_sha256)
+  VALUES (t, c, 'payroll.salary_tax', e, '2026-03-21', '2026-04-20', ARRAY['c5000000-0000-7000-8000-00000000f001']::uuid[],
+          ARRAY['c5000000-0000-7000-8000-00000000f101','c5000000-0000-7000-8000-00000000f104','c5000000-0000-7000-8000-00000000f105']::uuid[],
+          v_content, 'high', '\x00');
   PERFORM public.cp_expect_error('INV-RUL-13 inactive package',
     format($q$INSERT INTO rules.calc_snapshot (tenant_id, company_id, calculator, engine_version, as_of_from, as_of_to, package_ids, value_ids, content, min_confidence, content_sha256)
               VALUES (%L, %L, 'payroll.run', %L, '2025-04-01', '2025-04-30', ARRAY['c5000000-0000-7000-8000-00000000f004']::uuid[],
@@ -692,6 +881,19 @@ BEGIN
     PERFORM public.cp_assert(s = x->>'standard_verhoeff_taxid', 'INV-TAX-01 textbook Verhoeff reproduces the wrong digit ' || s);
     PERFORM public.cp_assert(s <> x->>'taxid' AND NOT tax.taxid_valid(s), 'INV-TAX-01 textbook Verhoeff digit must be rejected ' || s);
   END LOOP;
+  -- RV-IT-12 / CR-MG22: مرز قالب (روز ۷ رقمی، سریال ۱۳ رقمی) با zfill؛ lpad رقم را می‌برید و این‌ها رد می‌شدند
+  PERFORM public.cp_assert(jsonb_array_length(v->'boundary') >= 3, 'INV-TAX-01 boundary vectors present');
+  FOR x IN SELECT * FROM jsonb_array_elements(v->'boundary') LOOP
+    PERFORM public.cp_assert(tax.taxid_control_string(x->>'memory', (x->>'day')::int, (x->>'serial')::bigint) = x->>'control',
+                             'INV-TAX-01 boundary control string is not truncated ' || (x->>'taxid'));
+    PERFORM public.cp_assert(tax.taxid_build(x->>'memory', (x->>'day')::int, (x->>'serial')::bigint) = x->>'taxid', 'INV-TAX-01 boundary build ' || (x->>'taxid'));
+    PERFORM public.cp_assert(tax.taxid_valid(x->>'taxid'), 'INV-TAX-01 boundary taxid valid ' || (x->>'taxid'));
+  END LOOP;
+  FOR x IN SELECT * FROM jsonb_array_elements(v->'out_of_range') LOOP
+    PERFORM public.cp_assert(tax.taxid_build(x->>'memory', (x->>'day')::int, (x->>'serial')::bigint) IS NULL,
+                             'INV-TAX-01 out-of-format input builds no taxid: ' || (x->>'note'));
+  END LOOP;
+  PERFORM public.cp_assert(tax.taxid_valid(NULL) = false AND tax.taxid_valid('') = false, 'INV-TAX-01 taxid_valid never returns NULL');
   FOR x IN SELECT * FROM jsonb_array_elements(v->'accepted') LOOP
     PERFORM public.cp_assert(tax.taxid_valid(x #>> '{}'), 'INV-TAX-01 accepted taxid ' || (x #>> '{}'));
   END LOOP;
@@ -1135,6 +1337,63 @@ BEGIN
                 FROM tax.invoice_issue WHERE id = 'c5a00000-0000-7000-8000-000000007101'$q$), 'HK_TAX_ISSUE_STATE');
 END $$;
 
+-- ---------- T08b: برگشت جانشین زنجیره است، صدور دوباره پس از کنار گذاشتن، سند تازه پس از withdraw، کد شعبه (INV-TAX-14، -07، -04، -25) ----------
+DO $$
+DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
+        m1 uuid := 'c5a00000-0000-7000-8000-000000006001'; t1 uuid := 'c5a00000-0000-7000-8000-000000007001';
+        t3 uuid := 'c5a00000-0000-7000-8000-000000007003'; br uuid := 'c5a00000-0000-7000-8000-0000000000b1';
+        l1 jsonb := '[{"sstid":"2710000138624","am":"2","fee":"10000","dis":"500","vra":"9"}]';
+BEGIN
+  PERFORM set_config('app.tenant_id', t::text, true);
+  -- RV-CMP-05: t3 برگشت t4 را دارد؛ برگشت دوم یا ابطالی باید به سرِ زنجیره (t4) اشاره کند، نه t3
+  PERFORM public.cp_expect_error('INV-TAX-14 a return is a chain successor: a second return must reference the latest version',
+    format($q$INSERT INTO tax.invoice (tenant_id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern, instruction_version, ref_invoice_id, root_invoice_id)
+              VALUES (%L, %L, %L, 'sales_invoice', 'c5a00000-0000-7000-8000-0000000b0005', 4, 2, 1, 'RC_IITP.IS-7.8', %L, %L)$q$, t, c, m1, t3, t1), 'HK_TAX_REF_NOT_HEAD');
+  PERFORM public.cp_expect_error('INV-TAX-14 a cancellation after a return must reference the return',
+    format($q$INSERT INTO tax.invoice (tenant_id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern, instruction_version, ref_invoice_id, root_invoice_id)
+              VALUES (%L, %L, %L, 'sales_cancellation', 'c5a00000-0000-7000-8000-0000000b0003', 3, 2, 1, 'RC_IITP.IS-7.8', %L, %L)$q$, t, c, m1, t3, t1), 'HK_TAX_REF_NOT_HEAD');
+  -- RV-CMP-22: نسخهٔ کنارگذاشته‌شده پیش از امضا سند را به pending برمی‌گرداند و صدور دوباره ممکن است
+  INSERT INTO tax.invoice (tenant_id, id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern, instruction_version)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000007030', c, m1, 'sales_invoice', 'c5a00000-0000-7000-8000-0000000b0030', 1, 2, 1, 'RC_IITP.IS-7.8');
+  PERFORM public.cp_issue(jsonb_build_object('id', 'c5a00000-0000-7000-8000-000000007130', 'invoice', 'c5a00000-0000-7000-8000-000000007030',
+                                             'indatim', public.cp_ms('2026-04-15 07:00:00+00'), 'lines', l1));
+  PERFORM public.cp_flush();
+  PERFORM public.cp_expect_error('INV-TAX-04 a document with an open issue does not return to pending',
+    $q$UPDATE tax.invoice SET status = 'pending' WHERE id = 'c5a00000-0000-7000-8000-000000007030'$q$, 'HK_TAX_INVOICE_TRANSITION');
+  UPDATE tax.invoice_issue SET status = 'abandoned', abandoned_at = now(), abandoned_reason = 'خطای داده پیش از امضا'
+   WHERE id = 'c5a00000-0000-7000-8000-000000007130';
+  PERFORM public.cp_assert((SELECT status FROM tax.invoice WHERE id = 'c5a00000-0000-7000-8000-000000007030') = 'pending',
+                           'INV-TAX-07 abandoning the only open issue returns the document to pending');
+  PERFORM public.cp_issue(jsonb_build_object('id', 'c5a00000-0000-7000-8000-000000007131', 'invoice', 'c5a00000-0000-7000-8000-000000007030', 'issue_no', 2,
+                                             'indatim', public.cp_ms('2026-04-15 08:00:00+00'), 'lines', l1));
+  PERFORM public.cp_flush();
+  PERFORM public.cp_assert((SELECT status FROM tax.invoice WHERE id = 'c5a00000-0000-7000-8000-000000007030') = 'in_progress'
+                           AND (SELECT count(DISTINCT taxid) FROM tax.invoice_issue WHERE invoice_id = 'c5a00000-0000-7000-8000-000000007030') = 2,
+                           'INV-TAX-07 reissue after an abandoned issue uses a new serial and taxid');
+  -- سند withdrawn (هرگز ثبت نشده) جلوی سند تازهٔ همان فاکتور فروش را نمی‌گیرد
+  INSERT INTO tax.invoice (tenant_id, id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern, instruction_version)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000007032', c, m1, 'sales_invoice', 'c5a00000-0000-7000-8000-0000000b0002', 1, 1, 1, 'RC_IITP.IS-7.8');
+  PERFORM public.cp_expect_error('INV-TAX-04 one live tax document per sales invoice and subject',
+    format($q$INSERT INTO tax.invoice (tenant_id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern, instruction_version)
+              VALUES (%L, %L, %L, 'sales_invoice', 'c5a00000-0000-7000-8000-0000000b0002', 1, 1, 1, 'RC_IITP.IS-7.8')$q$, t, c, m1), '23505');
+  -- RV-X3-09: شعبهٔ ثبت‌شده ⇒ صورتحساب کد همان شعبه را دارد
+  INSERT INTO tax.taxpayer_branch (tenant_id, company_id, branch_id, sbc, valid_from, basis_ref) VALUES (t, c, br, '0007', '2026-03-21', 'شعبهٔ ۷ کارپوشه');
+  PERFORM public.cp_expect_error('INV-TAX-25 one registered code per branch at a time',
+    format($q$INSERT INTO tax.taxpayer_branch (tenant_id, company_id, branch_id, sbc, valid_from) VALUES (%L, %L, %L, '0008', '2026-05-01')$q$, t, c, br),
+    'chk:taxpayer_branch_one_code');
+  INSERT INTO tax.invoice (tenant_id, id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern, instruction_version)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000007031', c, m1, 'sales_invoice', 'c5a00000-0000-7000-8000-0000000b0031', 1, 2, 1, 'RC_IITP.IS-7.8');
+  PERFORM public.cp_expect_error('INV-TAX-25 an issue of a company with registered branches names its branch',
+    format($q$SELECT public.cp_issue(jsonb_build_object('invoice', 'c5a00000-0000-7000-8000-000000007031', 'indatim', %s, 'lines', %L::jsonb))$q$,
+           public.cp_ms('2026-04-16 07:00:00+00'), l1), 'HK_TAX_BRANCH_CODE');
+  PERFORM public.cp_expect_error('INV-TAX-25 the seller branch code is the registered code of that branch',
+    format($q$SELECT public.cp_issue(jsonb_build_object('invoice', 'c5a00000-0000-7000-8000-000000007031', 'indatim', %s, 'lines', %L::jsonb,
+                                                        'branch_id', %L, 'sbc', '0001'))$q$, public.cp_ms('2026-04-16 07:00:00+00'), l1, br), 'HK_TAX_BRANCH_CODE');
+  PERFORM public.cp_issue(jsonb_build_object('invoice', 'c5a00000-0000-7000-8000-000000007031', 'indatim', public.cp_ms('2026-04-16 07:00:00+00'),
+                                             'lines', l1, 'branch_id', br, 'sbc', '0007'));
+  PERFORM public.cp_flush();
+END $$;
+
 -- ---------- T09: دفتر مالیات خرید و اعتبار مالیاتی (INV-TAX-17) ----------
 DO $$
 DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
@@ -1159,8 +1418,33 @@ BEGIN
               VALUES (%L, %L, 'purchase', 'purchase.invoice', uuidv7(), 'invoice', %L, '2026-04-15', 'jq:1405Q1', 1, 10, 1, 'registered')$q$, t, c, sup), '23514');
   PERFORM public.cp_expect_error('INV-TAX-17 returns are negative',
     format($q$INSERT INTO tax.purchase_entry (tenant_id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
+                doc_date, period_key, sign, net_amount, vat_amount, reverses_entry_id)
+              VALUES (%L, %L, 'purchase', 'purchase.invoice', uuidv7(), 'return', %L, '2026-04-15', 'jq:1405Q1', 1, 10, 1, 'c5a00000-0000-7000-8000-000000007301')$q$,
+           t, c, sup), 'chk:purchase_entry_sign');
+  -- برگشت خرید به اصل اشاره دارد، شمارش در اعتبار را از اصل به ارث می‌برد و جمعش از اصل بیشتر نیست (RV-CMP-15)
+  PERFORM public.cp_expect_error('INV-TAX-17 a purchase return names the entry it reverses',
+    format($q$INSERT INTO tax.purchase_entry (tenant_id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
                 doc_date, period_key, sign, net_amount, vat_amount)
-              VALUES (%L, %L, 'purchase', 'purchase.invoice', uuidv7(), 'return', %L, '2026-04-15', 'jq:1405Q1', 1, 10, 1)$q$, t, c, sup), '23514');
+              VALUES (%L, %L, 'purchase', 'purchase.invoice', uuidv7(), 'return', %L, '2026-04-25', 'jq:1405Q1', -1, 400000, 40000)$q$, t, c, sup),
+    'chk:purchase_entry_reversal');
+  PERFORM public.cp_expect_error_deferred('INV-TAX-17 the reversal of a credited purchase is counted too (no unapproved-return escape)',
+    format($q$INSERT INTO tax.purchase_entry (tenant_id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
+                doc_date, period_key, sign, net_amount, vat_amount, reverses_entry_id)
+              VALUES (%L, %L, 'purchase', 'purchase.return', uuidv7(), 'return', %L, '2026-04-25', 'jq:1405Q1', -1, 400000, 40000,
+                      'c5a00000-0000-7000-8000-000000007301')$q$, t, c, sup), 'HK_TAX_PURCHASE_REVERSAL');
+  INSERT INTO tax.purchase_entry (tenant_id, id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
+                                  doc_date, period_key, sign, net_amount, vat_amount, reverses_entry_id, credit_eligibility, eligibility_reason, eligibility_snapshot_id)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000007302', c, 'purchase', 'purchase.return', uuidv7(), 'return', sup, '2026-04-25', 'jq:1405Q1', -1, 400000, 40000,
+          'c5a00000-0000-7000-8000-000000007301', 'eligible', 'برگشت خرید اعتبارگرفته', 'c5a00000-0000-7000-8000-000000005004');
+  PERFORM public.cp_flush();
+  PERFORM public.cp_expect_error_deferred('INV-TAX-17 reversals never exceed the original VAT',
+    format($q$INSERT INTO tax.purchase_entry (tenant_id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
+                doc_date, period_key, sign, net_amount, vat_amount, reverses_entry_id, credit_eligibility, eligibility_reason, eligibility_snapshot_id)
+              VALUES (%L, %L, 'purchase', 'purchase.return', uuidv7(), 'cancellation', %L, '2026-04-26', 'jq:1405Q1', -1, 700000, 70000,
+                      'c5a00000-0000-7000-8000-000000007301', 'eligible', 'x', 'c5a00000-0000-7000-8000-000000005004')$q$, t, c, sup), 'HK_TAX_PURCHASE_REVERSAL');
+  PERFORM public.cp_expect_error_deferred('INV-TAX-17 the original cannot drop out of credit while its reversal stays counted',
+    $q$UPDATE tax.purchase_entry SET credit_eligibility = 'ineligible', eligibility_reason = 'بازبینی' WHERE id = 'c5a00000-0000-7000-8000-000000007301'$q$,
+    'HK_TAX_PURCHASE_REVERSAL');
   PERFORM public.cp_expect_error('INV-TAX-17 one entry per supplier taxid',
     format($q$INSERT INTO tax.purchase_entry (tenant_id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
                 doc_date, period_key, sign, net_amount, vat_amount, moadian_taxid, moadian_status)
@@ -1176,17 +1460,36 @@ DO $$
 DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
 BEGIN
   PERFORM set_config('app.tenant_id', t::text, true);
-  INSERT INTO tax.threshold_monitor (tenant_id, id, company_id, kind, tax_year, limit_amount, limit_basis, rule_snapshot_id, warn_ratio, cumulative_amount, status)
-  VALUES (t, 'c5a00000-0000-7000-8000-000000007401', c, 'art14m_ceiling', 1405, 1000000, '{"source":"param"}', 'c5a00000-0000-7000-8000-000000005004', 0.8, 100000, 'ok');
+  INSERT INTO tax.threshold_monitor (tenant_id, id, company_id, kind, tax_year, limit_amount, limit_basis, rule_snapshot_id, warn_ratio,
+                                     gross_registered, cumulative_amount, status)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000007401', c, 'art14m_ceiling', 1405, 1000000, '{"source":"param"}', 'c5a00000-0000-7000-8000-000000005004', 0.8,
+          100000, 100000, 'ok');
   PERFORM public.cp_expect_error('INV-TAX-18 status follows the amounts',
-    $q$UPDATE tax.threshold_monitor SET cumulative_amount = 850000 WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$, '23514');
-  UPDATE tax.threshold_monitor SET cumulative_amount = 850000, status = 'warning' WHERE id = 'c5a00000-0000-7000-8000-000000007401';
+    $q$UPDATE tax.threshold_monitor SET gross_registered = 850000, cumulative_amount = 850000 WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$,
+    'chk:threshold_status');
+  PERFORM public.cp_expect_error('INV-TAX-18 cumulative = registered − registered cancellations',
+    $q$UPDATE tax.threshold_monitor SET gross_registered = 850000, cumulative_amount = 900000, status = 'warning' WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$,
+    'chk:threshold_net');
+  UPDATE tax.threshold_monitor SET gross_registered = 850000, cumulative_amount = 850000, status = 'warning' WHERE id = 'c5a00000-0000-7000-8000-000000007401';
   PERFORM public.cp_expect_error('INV-TAX-18 exceeded needs the crossing date',
-    $q$UPDATE tax.threshold_monitor SET cumulative_amount = 1200000, status = 'exceeded' WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$, '23514');
-  UPDATE tax.threshold_monitor SET cumulative_amount = 1200000, status = 'exceeded', crossed_on = '2026-09-01', consequence_from = '2026-09-23'
+    $q$UPDATE tax.threshold_monitor SET gross_registered = 1200000, cumulative_amount = 1200000, status = 'exceeded' WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$,
+    'chk:threshold_crossed');
+  PERFORM public.cp_expect_error('INV-TAX-18 consequence follows the crossing',
+    $q$UPDATE tax.threshold_monitor SET gross_registered = 1200000, cumulative_amount = 1200000, status = 'exceeded', crossed_on = '2026-09-01',
+          consequence_from = '2026-08-01' WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$, 'chk:threshold_consequence');
+  UPDATE tax.threshold_monitor SET gross_registered = 1200000, cumulative_amount = 1200000, status = 'exceeded', crossed_on = '2026-09-01', consequence_from = '2026-09-23'
    WHERE id = 'c5a00000-0000-7000-8000-000000007401';
-  PERFORM public.cp_expect_error('INV-TAX-18 cumulative never decreases',
-    $q$UPDATE tax.threshold_monitor SET cumulative_amount = 1100000 WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$, 'HK_TAX_THRESHOLD_BACKWARD');
+  PERFORM public.cp_expect_error('INV-TAX-18 registered sales never decrease (independent of the limit)',
+    $q$UPDATE tax.threshold_monitor SET gross_registered = 1100000, cumulative_amount = 1100000, limit_amount = 2000000, status = 'ok'
+        WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$, 'HK_TAX_THRESHOLD_BACKWARD');
+  -- ابطال ثبت‌شده جمع خالص را کم می‌کند (RV-CMP-24)؛ تاریخ نخستین عبور می‌ماند
+  UPDATE tax.threshold_monitor SET cancelled_registered = 300000, cumulative_amount = 900000, status = 'warning'
+   WHERE id = 'c5a00000-0000-7000-8000-000000007401';
+  PERFORM public.cp_assert((SELECT cumulative_amount = 900000 AND crossed_on = '2026-09-01' FROM tax.threshold_monitor WHERE id = 'c5a00000-0000-7000-8000-000000007401'),
+                           'INV-TAX-18 registered cancellations reduce the cumulative amount; the first crossing date stays');
+  PERFORM public.cp_expect_error('INV-TAX-18 registered cancellations never decrease',
+    $q$UPDATE tax.threshold_monitor SET cancelled_registered = 0, cumulative_amount = 1200000, status = 'exceeded' WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$,
+    'HK_TAX_THRESHOLD_BACKWARD');
   PERFORM public.cp_expect_error('INV-TAX-18 crossing date fixed',
     $q$UPDATE tax.threshold_monitor SET crossed_on = '2026-08-01' WHERE id = 'c5a00000-0000-7000-8000-000000007401'$q$, 'HK_TAX_THRESHOLD_IMMUTABLE');
   PERFORM public.cp_expect_error('INV-TAX-18 one monitor per kind and year',
@@ -1194,31 +1497,42 @@ BEGIN
               VALUES (%L, %L, 'art14m_ceiling', 1405, 5, '{}', 'c5a00000-0000-7000-8000-000000005004', 0.5)$q$, t, c), '23505');
 END $$;
 
--- ---------- T11: اظهارنامهٔ فصلی ارزش افزوده (INV-TAX-19) ----------
+-- ---------- T11: اظهارنامهٔ فصلی ارزش افزوده (INV-TAX-19، INV-TAX-17) ----------
 DO $$
 DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1'; u1 uuid := 'c5000000-0000-7000-8000-0000000000e1';
-        r1 uuid := 'c5a00000-0000-7000-8000-000000007501'; r2 uuid := 'c5a00000-0000-7000-8000-000000007502';
+        r1 uuid := 'c5a00000-0000-7000-8000-000000007501'; r2 uuid := 'c5a00000-0000-7000-8000-000000007502'; r3 uuid := 'c5a00000-0000-7000-8000-000000007503';
+        sup uuid := 'c5a00000-0000-7000-8000-00000000a104';
 BEGIN
   PERFORM set_config('app.tenant_id', t::text, true);
   INSERT INTO tax.vat_return (tenant_id, id, company_id, period_key, period_start, period_end) VALUES (t, r1, c, 'jq:1405Q1', '2026-03-21', '2026-06-21');
+  INSERT INTO tax.vat_return (tenant_id, id, company_id, period_key, period_start, period_end) VALUES (t, r3, c, 'jq:1405Q2', '2026-06-22', '2026-09-22');
   PERFORM public.cp_expect_error('INV-TAX-19 returns start draft',
-    format($q$INSERT INTO tax.vat_return (tenant_id, company_id, period_key, period_start, period_end, status) VALUES (%L, %L, 'jq:1405Q2', '2026-06-22', '2026-09-22', 'computed')$q$, t, c),
+    format($q$INSERT INTO tax.vat_return (tenant_id, company_id, period_key, period_start, period_end, status) VALUES (%L, %L, 'jq:1405Q3', '2026-09-23', '2026-12-21', 'computed')$q$, t, c),
     'HK_TAX_RETURN_TRANSITION');
+  -- ثبت خرید فقط به اظهارنامهٔ همان فصل می‌پیوندد (HK_TAX_PURCHASE_PERIOD؛ پیش از این برچسب اشتباه می‌سنجید؛ RV-CMP-06/08)
+  PERFORM public.cp_expect_error('INV-TAX-17 entry joins only the VAT return of its own quarter',
+    format($q$UPDATE tax.purchase_entry SET vat_return_id = %L WHERE id = 'c5a00000-0000-7000-8000-000000007301'$q$, r3), 'HK_TAX_PURCHASE_PERIOD');
+  UPDATE tax.purchase_entry SET vat_return_id = r1 WHERE id = 'c5a00000-0000-7000-8000-000000007301';
   PERFORM public.cp_expect_error('INV-TAX-19 computed needs all figures',
-    format($q$UPDATE tax.vat_return SET status = 'computed', computed_at = now(), rule_snapshot_id = 'c5a00000-0000-7000-8000-000000005004' WHERE id = %L$q$, r1), '23514');
+    format($q$UPDATE tax.vat_return SET status = 'computed', computed_at = now(), rule_snapshot_id = 'c5a00000-0000-7000-8000-000000005004' WHERE id = %L$q$, r1),
+    'chk:vat_return_computed');
   PERFORM public.cp_expect_error('INV-TAX-19 payable = registered output − eligible input',
     format($q$UPDATE tax.vat_return SET status = 'computed', computed_at = now(), rule_snapshot_id = 'c5a00000-0000-7000-8000-000000005004',
               output_vat_registered = 1000, output_vat_unregistered = 0, output_vat_gl = 1000, input_vat_eligible = 300, input_vat_ineligible = 0,
-              input_vat_gl = 300, other_tax_output = 0, payable_amount = 800 WHERE id = %L$q$, r1), '23514');
+              input_vat_gl = 300, other_tax_output = 0, payable_amount = 800 WHERE id = %L$q$, r1), 'chk:vat_return_payable');
   UPDATE tax.vat_return SET status = 'computed', computed_at = now(), rule_snapshot_id = 'c5a00000-0000-7000-8000-000000005004',
          output_vat_registered = 1000, output_vat_unregistered = 0, output_vat_gl = 1000, input_vat_eligible = 300, input_vat_ineligible = 0,
          input_vat_gl = 300, other_tax_output = 0, payable_amount = 700 WHERE id = r1;
   INSERT INTO tax.vat_return_line (tenant_id, vat_return_id, section, category, base_amount, vat_amount, doc_count) VALUES
     (t, r1, 'output', 'rate:10', 10000, 1000, 3);
+  -- تسلیم: اعتبار ورودی ذخیره‌شده با دفتر خرید پیوندخورده می‌خواند (RV-CMP-06)
+  PERFORM public.cp_expect_error('INV-TAX-19 filed input VAT equals the linked eligible purchase entries',
+    format($q$UPDATE tax.vat_return SET status = 'filed', filed_at = now(), filed_by = %L, portal_output_vat = 1000, portal_input_credit = 300 WHERE id = %L$q$, u1, r1),
+    'HK_TAX_RETURN_INPUT_MISMATCH');
+  UPDATE tax.vat_return SET input_vat_eligible = 100000, input_vat_gl = 100000, payable_amount = -99000 WHERE id = r1;
   PERFORM public.cp_expect_error('INV-TAX-19 filing needs the portal figures',
-    format($q$UPDATE tax.vat_return SET status = 'filed', filed_at = now(), filed_by = %L WHERE id = %L$q$, u1, r1), '23514');
-  UPDATE tax.vat_return SET status = 'filed', filed_at = now(), filed_by = u1, portal_output_vat = 1000, portal_input_credit = 300, portal_tracking_no = 'TRK-1' WHERE id = r1;
-  UPDATE tax.purchase_entry SET vat_return_id = r1 WHERE id = 'c5a00000-0000-7000-8000-000000007301';
+    format($q$UPDATE tax.vat_return SET status = 'filed', filed_at = now(), filed_by = %L WHERE id = %L$q$, u1, r1), 'chk:vat_return_filed');
+  UPDATE tax.vat_return SET status = 'filed', filed_at = now(), filed_by = u1, portal_output_vat = 1000, portal_input_credit = 100000, portal_tracking_no = 'TRK-1' WHERE id = r1;
   PERFORM public.cp_expect_error('INV-TAX-19 filed return immutable',
     format($q$UPDATE tax.vat_return SET payable_amount = 1 WHERE id = %L$q$, r1), 'HK_TAX_RETURN_IMMUTABLE');
   PERFORM public.cp_expect_error('INV-TAX-19 filed return lines immutable',
@@ -1226,6 +1540,17 @@ BEGIN
     'HK_TAX_RETURN_IMMUTABLE');
   PERFORM public.cp_expect_error('INV-TAX-17 register locked after filing',
     $q$UPDATE tax.purchase_entry SET credit_eligibility = 'ineligible' WHERE id = 'c5a00000-0000-7000-8000-000000007301'$q$, 'HK_TAX_PURCHASE_LOCKED');
+  -- پس از تسلیم هیچ ثبتی به اظهارنامه اضافه نمی‌شود: نه درج مستقیم، نه پیوند بعدی (RV-CMP-06)
+  PERFORM public.cp_expect_error('INV-TAX-17 no new entry is inserted into a filed return',
+    format($q$INSERT INTO tax.purchase_entry (tenant_id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
+                doc_date, period_key, sign, net_amount, vat_amount, vat_return_id)
+              VALUES (%L, %L, 'purchase', 'purchase.invoice', uuidv7(), 'invoice', %L, '2026-04-20', 'jq:1405Q1', 1, 1000000, 100000, %L)$q$, t, c, sup, r1),
+    'HK_TAX_PURCHASE_LOCKED');
+  INSERT INTO tax.purchase_entry (tenant_id, id, company_id, source_module, source_doc_type, source_doc_id, entry_kind, supplier_party_id,
+                                  doc_date, period_key, sign, net_amount, vat_amount)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000007303', c, 'purchase', 'purchase.invoice', uuidv7(), 'invoice', sup, '2026-04-20', 'jq:1405Q1', 1, 1000000, 100000);
+  PERFORM public.cp_expect_error('INV-TAX-17 an unlinked entry cannot be attached to a filed return',
+    format($q$UPDATE tax.purchase_entry SET vat_return_id = %L WHERE id = 'c5a00000-0000-7000-8000-000000007303'$q$, r1), 'HK_TAX_PURCHASE_LOCKED');
   PERFORM public.cp_expect_error('INV-TAX-19 amendment follows a filed version',
     format($q$INSERT INTO tax.vat_return (tenant_id, company_id, period_key, period_start, period_end, version) VALUES (%L, %L, 'jq:1405Q2', '2026-06-22', '2026-09-22', 2)$q$, t, c),
     'HK_TAX_RETURN_AMEND');
@@ -1236,9 +1561,9 @@ BEGIN
   UPDATE tax.vat_return SET status = 'superseded', superseded_by = r2 WHERE id = r1;
   PERFORM public.cp_expect_error('INV-TAX-19 superseded is terminal',
     format($q$UPDATE tax.vat_return SET status = 'filed' WHERE id = %L$q$, r1), 'HK_TAX_RETURN_IMMUTABLE');
-  PERFORM public.cp_expect_error('INV-TAX-17 entry joins only its own quarter',
-    format($q$UPDATE tax.purchase_entry SET vat_return_id = %L WHERE id = 'c5a00000-0000-7000-8000-000000007301'$q$,
-           (SELECT id FROM tax.vat_return WHERE period_key = 'jq:1405Q1' AND version = 2)), 'HK_TAX_PURCHASE_LOCKED');
+  PERFORM public.cp_expect_error('INV-TAX-17 an entry of a filed return does not move to the amendment',
+    format($q$UPDATE tax.purchase_entry SET vat_return_id = %L WHERE id = 'c5a00000-0000-7000-8000-000000007301'$q$, r2), 'HK_TAX_PURCHASE_LOCKED');
+  UPDATE tax.purchase_entry SET vat_return_id = r2 WHERE id = 'c5a00000-0000-7000-8000-000000007303';
 END $$;
 
 -- ---------- T12: گزارش‌های قانونی نسخه‌دار (INV-TAX-21) ----------
@@ -1248,15 +1573,35 @@ BEGIN
   PERFORM set_config('app.tenant_id', t::text, true);
   INSERT INTO core.attachment (tenant_id, id, company_id, storage_backend, bucket, object_key, file_name, encryption_key_ref)
   VALUES (t, a, c, 'fs', 'files', 't/' || t || '/2026/07/' || a, 'art169-1405Q1.xlsx', 'kek-1');
+  INSERT INTO rules.calc_snapshot (tenant_id, id, company_id, calculator, engine_version, as_of_from, as_of_to, package_ids, value_ids, content, min_confidence, content_sha256)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000005006', c, 'tax.legal_report', current_setting('cp.engine'), '2026-03-21', '2026-06-21',
+          ARRAY['c5000000-0000-7000-8000-00000000f00a']::uuid[],
+          ARRAY['c5000000-0000-7000-8000-00000000fa01','c5000000-0000-7000-8000-00000000fa02']::uuid[], '{}', 'medium', '\x00');
   INSERT INTO tax.legal_report (tenant_id, id, company_id, report_kind, period_key, period_start, period_end, format_key, format_version, rule_snapshot_id,
                                 row_count, total_amount, total_vat, file_attachment_id, file_sha256)
   VALUES (t, 'c5a00000-0000-7000-8000-000000007601', c, 'art169_quarterly', 'jq:1405Q1', '2026-03-21', '2026-06-21', 'tax.art169.format', 'portal-1405',
-          'c5a00000-0000-7000-8000-000000005004', 12, 5000000, 450000, a, sha256('f'));
+          'c5a00000-0000-7000-8000-000000005006', 12, 5000000, 450000, a, sha256('f'));
   PERFORM public.cp_expect_error('INV-TAX-21 format key from the tax domain',
     format($q$INSERT INTO tax.legal_report (tenant_id, company_id, report_kind, period_key, period_start, period_end, format_key, format_version, rule_snapshot_id,
                 row_count, total_amount, total_vat, file_attachment_id, file_sha256)
-              VALUES (%L, %L, 'vat_summary', 'jq:1405Q1', '2026-03-21', '2026-06-21', 'payroll.format.salary_tax', 'v1', 'c5a00000-0000-7000-8000-000000005004',
+              VALUES (%L, %L, 'vat_summary', 'jq:1405Q1', '2026-03-21', '2026-06-21', 'payroll.format.salary_tax', 'v1', 'c5a00000-0000-7000-8000-000000005006',
                       1, 1, 1, %L, sha256('f'))$q$, t, c, a), '23514');
+  -- کلید قالب همان نوع گزارش است و نسخهٔ قالب در snapshot تولید هست (RV-CMP-18)
+  PERFORM public.cp_expect_error('INV-TAX-21 format key matches the report kind (a rate key is not a format)',
+    format($q$INSERT INTO tax.legal_report (tenant_id, company_id, report_kind, period_key, period_start, period_end, format_key, format_version, rule_snapshot_id,
+                row_count, total_amount, total_vat, file_attachment_id, file_sha256)
+              VALUES (%L, %L, 'art169_quarterly', 'jq:1405Q2', '2026-06-22', '2026-09-22', 'tax.vat.general_rate', 'portal-1405', 'c5a00000-0000-7000-8000-000000005006',
+                      1, 1, 1, %L, sha256('f'))$q$, t, c, a), 'chk:legal_report_format_kind');
+  PERFORM public.cp_expect_error('INV-TAX-21 format key matches the report kind (another report layout)',
+    format($q$INSERT INTO tax.legal_report (tenant_id, company_id, report_kind, period_key, period_start, period_end, format_key, format_version, rule_snapshot_id,
+                row_count, total_amount, total_vat, file_attachment_id, file_sha256)
+              VALUES (%L, %L, 'art169_quarterly', 'jq:1405Q2', '2026-06-22', '2026-09-22', 'tax.vat_summary.format', 'v1', 'c5a00000-0000-7000-8000-000000005006',
+                      1, 1, 1, %L, sha256('f'))$q$, t, c, a), 'chk:legal_report_format_kind');
+  PERFORM public.cp_expect_error('INV-TAX-21 format version is a profile of the snapshot',
+    format($q$INSERT INTO tax.legal_report (tenant_id, company_id, report_kind, period_key, period_start, period_end, format_key, format_version, rule_snapshot_id,
+                row_count, total_amount, total_vat, file_attachment_id, file_sha256)
+              VALUES (%L, %L, 'art169_quarterly', 'jq:1405Q2', '2026-06-22', '2026-09-22', 'tax.art169.format', 'portal-9999', 'c5a00000-0000-7000-8000-000000005006',
+                      1, 1, 1, %L, sha256('f'))$q$, t, c, a), 'HK_TAX_REPORT_FORMAT');
   PERFORM public.cp_expect_error('INV-TAX-21 content immutable',
     $q$UPDATE tax.legal_report SET total_amount = 1 WHERE id = 'c5a00000-0000-7000-8000-000000007601'$q$, 'HK_TAX_REPORT_IMMUTABLE');
   PERFORM public.cp_expect_error('INV-TAX-21 submission needs the tracking reference',
@@ -1280,9 +1625,7 @@ BEGIN
     (t, 'c5a00000-0000-7000-8000-00000000a106', 'E106', 'natural', 'بدون نقش', 'بی', 'نقش', '1234567890', 'override', 'کد قدیمی کارت ملی', now()),
     (t, 'c5a00000-0000-7000-8000-00000000a107', 'E107', 'natural', 'کارگر ساعتی', 'کارگر', 'ساعتی', '1234567891', 'valid', NULL, NULL);
   INSERT INTO parties.party_role (tenant_id, party_id, role) VALUES (t, 'c5a00000-0000-7000-8000-00000000a107', 'employee');
-  INSERT INTO payroll.workshop (tenant_id, id, company_id, code, name, employer_name, address, dsk_rate, salary_tax_format, opened_on) VALUES
-    (t, w1, c, '1234567890', 'کافه', 'کافهٔ الف', 'تهران', 23, 'wh-1-7', '2026-03-21'),
-    (t, w2, c, '1234567891', 'انبار', 'کافهٔ الف', 'کرج', 23, 'wh-1-7', '2026-03-21');
+  -- کارگاه‌های w1..w3 در T01 ساخته شدند
   PERFORM public.cp_expect_error('INV-PAY-01 workshop code is 10 digits',
     format($q$INSERT INTO payroll.workshop (tenant_id, company_id, code, name, employer_name, address, dsk_rate, salary_tax_format, opened_on)
               VALUES (%L, %L, '12345', 'x', 'x', 'x', 23, 'wh-1-7', '2026-03-21')$q$, t, c), '23514');
@@ -1393,6 +1736,12 @@ BEGIN
     format($q$INSERT INTO payroll.pay_item (tenant_id, company_id, code, name, statutory_class, calc_method) VALUES (%L, %L, 'F2', 'ناشناخته', 'secret_bonus', 'manual_input')$q$, t, c), '23503');
   INSERT INTO payroll.decree_item (tenant_id, company_id, decree_id, pay_item_id, basis, amount)
   VALUES (t, c, 'c5a00000-0000-7000-8000-000000004007', 'c5a00000-0000-7000-8000-000000002102', 'monthly', 3000000);
+  -- کف ساعتی با مقسوم‌علیه «رسمی» (۷٫۳۳) سنجیده می‌شود، نه با جایگزین کارگاه (۷)؛ ۱۴۵٬۰۰۰ ≥ ۱٬۰۵۰٬۰۰۰ / ۷٫۳۳ (RV-CMP-02)
+  INSERT INTO payroll.decree (tenant_id, id, company_id, employee_id, contract_id, decree_no, effective_from, reason, wage_basis, hourly_wage, created_by)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000004012', c, e3, 'c5a00000-0000-7000-8000-000000003003', 'D-12', '2026-04-15', 'correction', 'hourly', 145000, u1);
+  UPDATE payroll.decree SET status = 'approved', approved_by = u2, approved_at = now(), rule_snapshot_id = snap WHERE id = 'c5a00000-0000-7000-8000-000000004012';
+  PERFORM public.cp_assert((SELECT status FROM payroll.decree WHERE id = 'c5a00000-0000-7000-8000-000000004012') = 'approved',
+                           'INV-PAY-04 the hourly floor uses the statutory divisor, never a workshop override');
   PERFORM public.cp_expect_error('INV-PAY-03 items of an approved decree are frozen',
     format($q$INSERT INTO payroll.decree_item (tenant_id, company_id, decree_id, pay_item_id, basis, amount)
               VALUES (%L, %L, 'c5a00000-0000-7000-8000-000000004001', 'c5a00000-0000-7000-8000-000000002102', 'monthly', 3000000)$q$, t, c), 'HK_PAYROLL_DECREE_IMMUTABLE');
@@ -1456,9 +1805,9 @@ DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-00
 BEGIN
   PERFORM set_config('app.tenant_id', t::text, true);
   -- وام
-  INSERT INTO payroll.loan (tenant_id, id, company_id, employee_id, kind, principal, installment_count, start_period_key) VALUES
-    (t, l1, c, e1, 'loan', 2000000, 2, 'jm:1405-01'),
-    (t, 'c5a00000-0000-7000-8000-000000008202', c, e1, 'loan', 1000000, 1, 'jm:1405-01');
+  INSERT INTO payroll.loan (tenant_id, id, company_id, employee_id, kind, principal, installment_count, start_period_key, created_by) VALUES
+    (t, l1, c, e1, 'loan', 2000000, 2, 'jm:1405-01', u1),
+    (t, 'c5a00000-0000-7000-8000-000000008202', c, e1, 'loan', 1000000, 1, 'jm:1405-01', u1);
   INSERT INTO payroll.loan_installment (tenant_id, id, loan_id, seq, period_key, amount) VALUES
     (t, i1, l1, 1, 'jm:1405-01', 1000000), (t, 'c5a00000-0000-7000-8000-000000008302', l1, 2, 'jm:1405-02', 1000000),
     (t, 'c5a00000-0000-7000-8000-000000008303', 'c5a00000-0000-7000-8000-000000008202', 1, 'jm:1405-01', 500000);
@@ -1490,34 +1839,51 @@ BEGIN
                 unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
               VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 31, 1200000, 37200000,
                       300000000, 300000000, 262800000, 217000000, 300000000, 'half_up', 0.07, 21000000, 0.20, 60000000, 0.03, 9000000, 300000000, 0, 0, 0, 279000000)$q$,
-           t, c, r1, e1), '23514');
+           t, c, r1, e1), 'chk:payslip_ssi_base');
   PERFORM public.cp_expect_error('INV-PAY-09 contributions follow rate and rounding',
     format($q$INSERT INTO payroll.payslip (tenant_id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
                 gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
                 unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
               VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 31, 1200000, 37200000,
                       37200000, 37200000, 0, 217000000, 37200000, 'half_up', 0.07, 2604001, 0.20, 7440000, 0.03, 1116000, 37200000, 0, 0, 0, 34595999)$q$,
-           t, c, r1, e1), '23514');
+           t, c, r1, e1), 'chk:payslip_ssi_amounts');
   PERFORM public.cp_expect_error('INV-PAY-09 monthly wage = daily wage × insurance days',
     format($q$INSERT INTO payroll.payslip (tenant_id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
                 gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
                 unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
               VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 31, 1200000, 36000000,
                       37200000, 37200000, 1200000, 217000000, 37200000, 'half_up', 0.07, 2604000, 0.20, 7440000, 0.03, 1116000, 37200000, 0, 0, 0, 34596000)$q$,
-           t, c, r1, e1), '23514');
+           t, c, r1, e1), 'chk:payslip_monthly_wage');
   PERFORM public.cp_expect_error('INV-PAY-09 net pay never negative',
     format($q$INSERT INTO payroll.payslip (tenant_id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
                 gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
                 unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
               VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 0, 1200000, 0,
                       1000, 0, 0, 217000000, 0, 'half_up', 0.07, 0, 0.20, 0, 0.03, 0, 1000, 0, 0, 2000, -1000)$q$,
-           t, c, r1, e1), '23514');
+           t, c, r1, e1), 'chk:payslip_net');
+  PERFORM public.cp_expect_error('INV-PAY-09 SSI base is never below the minimum base (RV-CMP-14)',
+    format($q$INSERT INTO payroll.payslip (tenant_id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+                gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_min_base_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+                unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
+              VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 31, 900000, 27900000,
+                      27900000, 27900000, 0, 217000000, 31000000, 27900000, 'half_up', 0.07, 1953000, 0.20, 5580000, 0.03, 837000, 27900000, 0, 0, 0, 25947000)$q$,
+           t, c, r1, e1), 'chk:payslip_ssi_base');
+  PERFORM public.cp_expect_error('INV-PAY-11 taxable income = progressive − exemption − deductible SSI (RV-CMP-04)',
+    format($q$INSERT INTO payroll.payslip (tenant_id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+                gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+                unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, ssi_tax_deduction, taxable_income, salary_tax, other_deductions, net_pay)
+              VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 31, 1200000, 37200000,
+                      37200000, 37200000, 0, 217000000, 37200000, 'half_up', 0.07, 2604000, 0.20, 7440000, 0.03, 1116000, 37200000, 37200000, 651000, 30000000, 0, 0, 34596000)$q$,
+           t, c, r1, e1), 'chk:payslip_taxable');
   -- فیش معتبر با سطرها
+  -- فیش معتبر: سقف = ۷ × ۱٬۰۰۰٬۰۰۰ × ۳۱؛ حداقل مبنا = ۱٬۰۰۰٬۰۰۰ × ۳۱؛ کسر بیمه از مبنای مالیات = ۰٫۲۵ × ۲٬۸۱۴٬۰۰۰ = ۷۰۳٬۵۰۰؛
+  -- مبنای مالیات = ۴۰٬۲۰۰٬۰۰۰ − ۷۰۳٬۵۰۰ = ۳۹٬۴۹۶٬۵۰۰ ⇒ مالیات = ۱٬۰۰۰٬۰۰۰ + ۰٫۲ × ۱۹٬۴۹۶٬۵۰۰ = ۴٬۸۹۹٬۳۰۰ (همه TEST-ONLY)
   INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
-              gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
-              unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
+              gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_min_base_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+              unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, ssi_tax_deduction, taxable_income, salary_tax, other_deductions, net_pay)
   VALUES (t, p1, c, r1, e1, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 31, 1200000, 37200000,
-          42200000, 40200000, 3000000, 217000000, 40200000, 'half_up', 0.07, 2814000, 0.20, 8040000, 0.03, 1206000, 42200000, 30000000, 3000000, 1000000, 35386000);
+          42200000, 40200000, 3000000, 217000000, 31000000, 40200000, 'half_up', 0.07, 2814000, 0.20, 8040000, 0.03, 1206000, 42200000,
+          40200000, 703500, 39496500, 4899300, 1000000, 33486700);
   INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash,
                                     wh_column, dsk_bucket, source, loan_installment_id) VALUES
     (t, p1, 1, 'c5a00000-0000-7000-8000-000000002101', 'base_wage', 'earning', 37200000, true, 'progressive', true, true, 'continuous_cash', 'ROOZ', 'decree', NULL),
@@ -1535,21 +1901,58 @@ BEGIN
     format($q$INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash, dsk_bucket, source)
               VALUES (%L, %L, 9, 'loan_repayment', 'earning', 1, false, 'progressive', false, true, 'NONINSURABLE', 'manual')$q$, t, p1), 'HK_PAYROLL_LINE_CLASS');
   PERFORM public.cp_expect_error_deferred('INV-PAY-11 salary tax equals the snapshot brackets',
-    format($q$UPDATE payroll.payslip SET salary_tax = 2999000, net_pay = 35387000 WHERE id = %L$q$, p1), 'HK_PAYROLL_TAX_MISMATCH');
+    format($q$UPDATE payroll.payslip SET salary_tax = 4899000, net_pay = 33487000 WHERE id = %L$q$, p1), 'HK_PAYROLL_TAX_MISMATCH');
   PERFORM public.cp_expect_error_deferred('INV-PAY-07 loan deduction equals the installment',
     format($q$UPDATE payroll.payslip_line SET amount = 900000 WHERE payslip_id = %L AND line_no = 4;
-              UPDATE payroll.payslip SET other_deductions = 900000, net_pay = 35486000 WHERE id = %L$q$, p1, p1), 'HK_PAYROLL_LOAN_LINE');
+              UPDATE payroll.payslip SET other_deductions = 900000, net_pay = 33586700 WHERE id = %L$q$, p1, p1), 'HK_PAYROLL_LOAN_LINE');
+  -- ارقام قانونی فیش به snapshot اجرا بسته‌اند، نه ستون‌های آزاد (RV-CMP-04): نرخ صفر، سقف دلخواه، مبنای مالیات دلخواه
+  PERFORM public.cp_expect_error_deferred('INV-PAY-09 SSI rates come from the run snapshot',
+    format($q$UPDATE payroll.payslip SET ssi_employer_rate = 0, ssi_employer = 0 WHERE id = %L$q$, p1), 'HK_PAYROLL_SSI_RATES');
+  PERFORM public.cp_expect_error_deferred('INV-PAY-09 SSI rounding comes from the run snapshot',
+    format($q$UPDATE payroll.payslip SET ssi_rounding = 'truncate' WHERE id = %L$q$, p1), 'HK_PAYROLL_SSI_RATES');
+  PERFORM public.cp_expect_error_deferred('INV-PAY-09 SSI cap = multiplier × statutory minimum wage × days',
+    format($q$UPDATE payroll.payslip SET ssi_cap_amount = 300000000 WHERE id = %L$q$, p1), 'HK_PAYROLL_SSI_CAP');
+  PERFORM public.cp_expect_error_deferred('INV-PAY-09 SSI minimum base follows the snapshot rule (RV-CMP-14)',
+    format($q$UPDATE payroll.payslip SET ssi_min_base_amount = 0 WHERE id = %L$q$, p1), 'HK_PAYROLL_SSI_MIN_BASE');
+  PERFORM public.cp_expect_error_deferred('INV-PAY-11 taxable income is derived from the lines',
+    format($q$UPDATE payroll.payslip SET tax_progressive_gross = 30703500, taxable_income = 30000000, salary_tax = 3000000, net_pay = 35386000 WHERE id = %L$q$, p1),
+    'HK_PAYROLL_TAXABLE_INCOME');
+  PERFORM public.cp_expect_error_deferred('INV-PAY-11 deductible SSI uses the snapshot fraction',
+    format($q$UPDATE payroll.payslip SET ssi_tax_deduction = 0, taxable_income = 40200000, salary_tax = 5040000, net_pay = 33346000 WHERE id = %L$q$, p1),
+    'HK_PAYROLL_TAXABLE_INCOME');
+  PERFORM public.cp_expect_error_deferred('INV-PAY-11 exemption cannot exceed exemptible lines',
+    format($q$UPDATE payroll.payslip SET tax_exempt_amount = 1000000, taxable_income = 38496500, salary_tax = 4699300, net_pay = 33686700 WHERE id = %L$q$, p1),
+    'HK_PAYROLL_TAXABLE_INCOME');
   PERFORM public.cp_expect_error('INV-PAY-12 run totals equal its payslips',
     format($q$UPDATE payroll.run SET status = 'calculated', calculated_by = %L, calculated_at = now(), employee_count = 1, gross_total = 42200000 WHERE id = %L$q$, u1, r1),
     'HK_PAYROLL_RUN_TOTALS');
   UPDATE payroll.run SET status = 'calculated', calculated_by = u1, calculated_at = now(), employee_count = 1, gross_total = 42200000, ssi_employee_total = 2814000,
-         ssi_employer_total = 8040000, unemployment_total = 1206000, tax_total = 3000000, deduction_total = 1000000, net_total = 35386000 WHERE id = r1;
+         ssi_employer_total = 8040000, unemployment_total = 1206000, tax_total = 4899300, deduction_total = 1000000, net_total = 33486700 WHERE id = r1;
   PERFORM public.cp_expect_error('INV-PAY-13 attendance confirmed before approval',
     format($q$UPDATE payroll.run SET status = 'approved', approved_by = %L, approved_at = now() WHERE id = %L$q$, u2, r1), 'HK_PAYROLL_ATTENDANCE_UNCONFIRMED');
   UPDATE payroll.attendance_summary SET status = 'confirmed', confirmed_by = u2, confirmed_at = now() WHERE id = 'c5a00000-0000-7000-8000-000000002301';
   PERFORM public.cp_expect_error('INV-PAY-13 approver differs from calculator (or a recorded reason)',
     format($q$UPDATE payroll.run SET status = 'approved', approved_by = %L, approved_at = now() WHERE id = %L$q$, u1, r1), '23514');
   UPDATE payroll.run SET status = 'approved', approved_by = u2, approved_at = now() WHERE id = r1;
+  -- قسط کسرشده با تأیید اجرا «کسرشده» می‌شود (همگام‌ساز DB) و دستی جابه‌جا نمی‌شود (RV-CMP-17)
+  PERFORM public.cp_assert((SELECT status FROM payroll.loan_installment WHERE id = i1) = 'deducted', 'INV-PAY-07 run approval marks its installments deducted');
+  PERFORM public.cp_expect_error('INV-PAY-07 installments are deducted only through a payroll run',
+    $q$UPDATE payroll.loan_installment SET status = 'deducted' WHERE id = 'c5a00000-0000-7000-8000-000000008302'$q$, 'HK_PAYROLL_LOAN_TRANSITION');
+  PERFORM public.cp_expect_error('INV-PAY-07 a deducted installment is never waived or rescheduled by hand',
+    format($q$UPDATE payroll.loan_installment SET status = 'waived', waived_by = %L, waived_at = now(), waive_reason = 'بخشودگی آزمایشی' WHERE id = %L$q$, u2, i1),
+    'HK_PAYROLL_LOAN_TRANSITION');
+  PERFORM public.cp_expect_error('INV-PAY-07 a waiver records approver, time and reason',
+    $q$UPDATE payroll.loan_installment SET status = 'waived' WHERE id = 'c5a00000-0000-7000-8000-000000008302'$q$, 'chk:installment_waived');
+  PERFORM public.cp_expect_error('INV-PAY-07 the loan creator cannot waive its installment',
+    format($q$UPDATE payroll.loan_installment SET status = 'waived', waived_by = %L, waived_at = now(), waive_reason = 'بخشودگی آزمایشی' WHERE id = 'c5a00000-0000-7000-8000-000000008302'$q$, u1),
+    'HK_PAYROLL_LOAN_SOD');
+  UPDATE payroll.loan_installment SET status = 'deferred' WHERE id = 'c5a00000-0000-7000-8000-000000008302';
+  UPDATE payroll.loan_installment SET status = 'waived', waived_by = u2, waived_at = now(), waive_reason = 'بخشودگی با مصوبهٔ مدیرعامل'
+   WHERE id = 'c5a00000-0000-7000-8000-000000008302';
+  PERFORM public.cp_flush();
+  PERFORM public.cp_expect_error('INV-PAY-07 a waived installment is final',
+    $q$UPDATE payroll.loan_installment SET status = 'scheduled', waived_by = NULL, waived_at = NULL, waive_reason = NULL WHERE id = 'c5a00000-0000-7000-8000-000000008302'$q$,
+    'HK_PAYROLL_LOAN_TRANSITION');
   PERFORM public.cp_expect_error('INV-PAY-08 approved payslip immutable',
     format($q$UPDATE payroll.payslip SET taxable_income = 1 WHERE id = %L$q$, p1), 'HK_PAYROLL_RUN_IMMUTABLE');
   PERFORM public.cp_expect_error('INV-PAY-08 no new lines after approval',
@@ -1562,23 +1965,41 @@ BEGIN
   PERFORM public.cp_expect_error('INV-PAY-08 one regular run per workshop and month',
     format($q$INSERT INTO payroll.run (tenant_id, company_id, workshop_id, kind, period_key, period_start, period_end, payment_date)
               VALUES (%L, %L, %L, 'regular', 'jm:1405-01', '2026-03-21', '2026-04-20', '2026-04-21')$q$, t, c, w1), '23505');
-  UPDATE payroll.payslip SET payment_status = 'paid', payment_doc_ref = uuidv7() WHERE id = p1;
+  PERFORM public.cp_expect_error('INV-PAY-19 salary is paid only after posting (open items exist from posting)',
+    format($q$UPDATE payroll.payslip SET payment_status = 'paid', payment_doc_ref = uuidv7() WHERE id = %L$q$, p1), 'HK_PAYROLL_PAYMENT_STATE');
   -- فایل‌های دولتی
   PERFORM public.cp_expect_error('INV-PAY-14 list totals equal the approved payslips',
     format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
               VALUES (%L, %L, %L, %L, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_6', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
-                      '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814001,"DSK_TKOSO":8040000,"DSK_BIC":1206000}')$q$, t, c, w1, r1),
+                      '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814001,"DSK_TKOSO":8040000,"DSK_BIC":1206000,"DSK_BIMH":0}')$q$, t, c, w1, r1),
+    'HK_PAYROLL_FILE_TOTALS');
+  PERFORM public.cp_expect_error('INV-PAY-14 hard-job contribution total (DSK_BIMH) is checked too (RV-CMP-13)',
+    format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
+              VALUES (%L, %L, %L, %L, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_6', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
+                      '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040000,"DSK_BIC":1206000,"DSK_BIMH":5}')$q$, t, c, w1, r1),
+    'HK_PAYROLL_FILE_TOTALS');
+  PERFORM public.cp_expect_error('INV-PAY-14 the control-total formula is a dated rule of the list profile (RV-CMP-13)',
+    format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
+              VALUES (%L, %L, %L, %L, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_9', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
+                      '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040000,"DSK_BIC":1206000,"DSK_BIMH":0}')$q$, t, c, w1, r1),
+    'HK_PAYROLL_SNAPSHOT_INCOMPLETE');
+  PERFORM public.cp_expect_error('INV-PAY-14 rate_on_total profile: TKOSO = employer rate × TMASH',
+    format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
+              VALUES (%L, %L, %L, %L, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_2_7', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
+                      '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040001,"DSK_BIC":1206000,"DSK_BIMH":0}')$q$, t, c, w1, r1),
     'HK_PAYROLL_FILE_TOTALS');
   PERFORM public.cp_expect_error('INV-PAY-14 format key follows file kind',
     format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
               VALUES (%L, %L, %L, %L, 'ssi_list', 'payroll.format.salary_tax', 'listdisk_6', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
-                      '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040000,"DSK_BIC":1206000}')$q$, t, c, w1, r1),
+                      '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040000,"DSK_BIC":1206000,"DSK_BIMH":0}')$q$, t, c, w1, r1),
     '23514');
   INSERT INTO payroll.gov_file (tenant_id, id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals) VALUES
     (t, 'c5a00000-0000-7000-8000-000000008401', c, w1, r1, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_6', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
-     '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040000,"DSK_BIC":1206000}'),
+     '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040000,"DSK_BIC":1206000,"DSK_BIMH":0}'),
     (t, 'c5a00000-0000-7000-8000-000000008402', c, w1, r1, 'salary_tax', 'payroll.format.salary_tax', 'wh-1-7', 'utf-8', NULL, 'c5a00000-0000-7000-8000-000000005001',
-     '{"tax_total":3000000,"employees":1}');
+     '{"tax_total":4899300,"employees":1}'),
+    (t, 'c5a00000-0000-7000-8000-000000008403', c, w1, r1, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_2_7', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
+     '{"DSK_NUM":1,"DSK_TDD":31,"DSK_TMASH":40200000,"DSK_TBIME":2814000,"DSK_TKOSO":8040000,"DSK_BIC":1206000,"DSK_BIMH":0}');
   PERFORM public.cp_expect_error('INV-PAY-14 file content immutable',
     $q$UPDATE payroll.gov_file SET control_totals = '{}' WHERE id = 'c5a00000-0000-7000-8000-000000008401'$q$, 'HK_PAYROLL_FILE_IMMUTABLE');
   PERFORM public.cp_expect_error('INV-PAY-14 upload needs a timestamp',
@@ -1597,6 +2018,30 @@ BEGIN
   UPDATE payroll.run SET status = 'posted', posted_at = now(),
          gl_journal_id = public.cp_journal(c, '2026-04-20', 'payroll', 'payroll.run', '[{"code":"7303","dr":"1"},{"code":"6202","cr":"1"}]')
    WHERE id = r1;
+  -- نهان پرداخت پس از ثبت (RV-X2-08). در پایگاه یکپارچه (treasury نصب است) نهان باید با قلم باز خالص بخواند؛ این آزمون مستقل
+  -- قلم باز نمی‌سازد، پس آن‌جا همان رد شدن «پرداخت‌شده بدون قلم بسته» را می‌سنجد (پوشش سرتاسری در 99_integration_test)
+  IF to_regclass('treasury.open_item') IS NULL THEN
+    UPDATE payroll.payslip SET payment_status = 'paid', payment_doc_ref = uuidv7() WHERE id = p1;
+    PERFORM public.cp_expect_error('INV-PAY-19 a payment status needs its payment document',
+      format($q$UPDATE payroll.payslip SET payment_status = 'partial', payment_doc_ref = NULL WHERE id = %L$q$, p1), 'chk:payslip_paid');
+  ELSE
+    PERFORM public.cp_expect_error('INV-PAY-19 payment status mirrors the treasury open item of the net',
+      format($q$UPDATE payroll.payslip SET payment_status = 'paid', payment_doc_ref = uuidv7() WHERE id = %L$q$, p1), 'HK_PAYROLL_PAYMENT_STATE');
+  END IF;
+  -- شرایط قرارداد امضاشده (RV-CMP-16)
+  PERFORM public.cp_expect_error('INV-PAY-20 signed contract hours are fixed (part-time floor relies on them)',
+    $q$UPDATE payroll.contract SET weekly_hours = 44 WHERE id = 'c5a00000-0000-7000-8000-000000003005'$q$, 'HK_PAYROLL_CONTRACT_IMMUTABLE');
+  PERFORM public.cp_expect_error('INV-PAY-20 signed contract employment type is fixed',
+    $q$UPDATE payroll.contract SET employment_type = 'full_time', weekly_hours = NULL WHERE id = 'c5a00000-0000-7000-8000-000000003005'$q$,
+    'HK_PAYROLL_CONTRACT_IMMUTABLE');
+  PERFORM public.cp_expect_error('INV-PAY-20 signed contract hard-job flag and workshop are fixed',
+    $q$UPDATE payroll.contract SET is_hard_job = true WHERE id = 'c5a00000-0000-7000-8000-000000003001'$q$, 'HK_PAYROLL_CONTRACT_IMMUTABLE');
+  PERFORM public.cp_expect_error('INV-PAY-20 end date cannot precede an approved decree',
+    $q$UPDATE payroll.contract SET end_date = '2026-04-01' WHERE id = 'c5a00000-0000-7000-8000-000000003003'$q$, 'HK_PAYROLL_CONTRACT_END');
+  PERFORM public.cp_expect_error('INV-PAY-20 end date cannot precede a live payslip',
+    $q$UPDATE payroll.contract SET end_date = '2026-03-22' WHERE id = 'c5a00000-0000-7000-8000-000000003001'$q$, 'HK_PAYROLL_CONTRACT_END');
+  PERFORM public.cp_expect_error('INV-PAY-20 a signed contract never returns to draft',
+    $q$UPDATE payroll.contract SET status = 'draft' WHERE id = 'c5a00000-0000-7000-8000-000000003005'$q$, 'HK_PAYROLL_CONTRACT_TRANSITION');
   PERFORM public.cp_expect_error('INV-PAY-08 cancellation needs a reason',
     format($q$UPDATE payroll.run SET status = 'cancelled', cancelled_at = now(), cancel_reason = 'اشتباه' WHERE id = %L$q$, r1), 'HK_PAYROLL_REASON_REQUIRED');
   PERFORM public.cp_expect_error('INV-PAY-14 uploaded files block cancellation',
@@ -1618,15 +2063,17 @@ BEGIN
   -- اطمینان پایین ⇒ پذیرش صریح
   INSERT INTO payroll.run (tenant_id, id, company_id, workshop_id, kind, period_key, period_start, period_end, payment_date, rule_snapshot_id, engine_version)
   VALUES (t, r2, c, w2, 'regular', 'jm:1405-01', '2026-03-21', '2026-04-20', '2026-04-21', 'c5a00000-0000-7000-8000-000000005002', e);
+  -- کارمند پیمان دسته‌جمعی (مزد ۹۰۰٬۰۰۰): مبنای بیمه تا حداقل مبنا (۳۱٬۰۰۰٬۰۰۰) بالا می‌رود (RV-CMP-14)
   INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
-              gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
-              unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
+              gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_min_base_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+              unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, ssi_tax_deduction, taxable_income, salary_tax, other_deductions, net_pay)
   VALUES (t, 'c5a00000-0000-7000-8000-000000008102', c, r2, e2, 'c5a00000-0000-7000-8000-000000003002', 'c5a00000-0000-7000-8000-000000004002', 31, 31, 31, 900000, 27900000,
-          27900000, 27900000, 0, 217000000, 27900000, 'half_up', 0.07, 1953000, 0.20, 5580000, 0.03, 837000, 27900000, 27900000, 2580000, 0, 23367000);
+          27900000, 27900000, 0, 217000000, 31000000, 31000000, 'half_up', 0.07, 2170000, 0.20, 6200000, 0.03, 930000, 27900000,
+          27900000, 542500, 27357500, 2471500, 0, 23258500);
   INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash, dsk_bucket, source)
   VALUES (t, 'c5a00000-0000-7000-8000-000000008102', 1, 'c5a00000-0000-7000-8000-000000002101', 'base_wage', 'earning', 27900000, true, 'progressive', true, true, 'ROOZ', 'decree');
-  UPDATE payroll.run SET status = 'calculated', calculated_by = u1, calculated_at = now(), employee_count = 1, gross_total = 27900000, ssi_employee_total = 1953000,
-         ssi_employer_total = 5580000, unemployment_total = 837000, tax_total = 2580000, net_total = 23367000 WHERE id = r2;
+  UPDATE payroll.run SET status = 'calculated', calculated_by = u1, calculated_at = now(), employee_count = 1, gross_total = 27900000, ssi_employee_total = 2170000,
+         ssi_employer_total = 6200000, unemployment_total = 930000, tax_total = 2471500, net_total = 23258500 WHERE id = r2;
   UPDATE payroll.attendance_summary SET status = 'confirmed', confirmed_by = u2, confirmed_at = now() WHERE id = 'c5a00000-0000-7000-8000-000000002302';
   PERFORM public.cp_flush();
   PERFORM public.cp_expect_error('INV-PAY-13 low-confidence parameters need explicit acknowledgment',
@@ -1637,9 +2084,9 @@ BEGIN
   VALUES (t, r3, c, w1, 'off_cycle', 'jm:1405-02', '2026-04-21', '2026-05-21', '2026-05-22', 'c5a00000-0000-7000-8000-000000005003', '2099.1.0');
   INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
               gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
-              unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
+              unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, taxable_income, salary_tax, other_deductions, net_pay)
   VALUES (t, 'c5a00000-0000-7000-8000-000000008103', c, r3, e1, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 0, 0, 1200000, 0,
-          10000000, 0, 0, 217000000, 0, 'half_up', 0.07, 0, 0.20, 0, 0.03, 0, 10000000, 10000000, 0, 0, 10000000);
+          10000000, 0, 0, 0, 0, 'half_up', 0.07, 0, 0.20, 0, 0.03, 0, 10000000, 10000000, 10000000, 0, 0, 10000000);
   INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash, dsk_bucket, source)
   VALUES (t, 'c5a00000-0000-7000-8000-000000008103', 1, 'c5a00000-0000-7000-8000-000000002105', 'bonus_occasional', 'earning', 10000000, false, 'progressive', false, true, 'NONINSURABLE', 'manual');
   UPDATE payroll.run SET status = 'calculated', calculated_by = u1, calculated_at = now(), employee_count = 1, gross_total = 10000000, net_total = 10000000 WHERE id = r3;
@@ -1905,17 +2352,60 @@ BEGIN
     format($q$INSERT INTO assets.asset_tag (tenant_id, company_id, asset_id, tag_no, assigned_on) VALUES (%L, %L, %L, 'FA-001B', '2026-05-01')$q$, t, c, a1), '23505');
 END $$;
 
+-- ---------- T18b: جدول ماده ۱۴۹، هویت دفتر، سال مالی کاربرگ تفاوت (INV-AST-06، INV-AST-14، INV-AST-12) ----------
+DO $$
+DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
+        bg uuid := 'c5a00000-0000-7000-8000-000000009101'; bt uuid := 'c5a00000-0000-7000-8000-000000009102';
+        a1 uuid := 'c5a00000-0000-7000-8000-000000009201'; ab1t uuid := 'c5a00000-0000-7000-8000-000000009302';
+        snap uuid := 'c5a00000-0000-7000-8000-000000005005';
+BEGIN
+  PERFORM set_config('app.tenant_id', t::text, true);
+  -- RV-CMP-19: کد طبقه باید ردیف همان جدول باشد و عمر/نرخ از جدول تندتر نباشد
+  PERFORM public.cp_expect_error('INV-AST-06 tax class must be a row of the cited table',
+    format($q$UPDATE assets.asset_book SET tax_class_code = 'NO-SUCH-CLASS' WHERE id = %L$q$, ab1t), 'HK_ASSETS_TAX_CLASS_UNKNOWN');
+  PERFORM public.cp_expect_error('INV-AST-06 tax life cannot be shorter than the table',
+    format($q$UPDATE assets.asset_book SET useful_life_months = 1 WHERE id = %L$q$, ab1t), 'HK_ASSETS_TAX_RATE');
+  PERFORM public.cp_expect_error('INV-AST-06 tax method must be allowed by the table row',
+    format($q$UPDATE assets.asset_book SET method = 'declining_balance', useful_life_months = NULL, declining_rate = 50 WHERE id = %L$q$, ab1t), 'HK_ASSETS_TAX_METHOD');
+  UPDATE assets.asset_book SET useful_life_months = 180 WHERE id = ab1t;   -- کندتر از جدول مجاز است
+  -- RV-CMP-20: هویت دفتر در استفاده ثابت است
+  PERFORM public.cp_expect_error('INV-AST-14 a GL book in use cannot become a memo book',
+    format($q$UPDATE assets.book SET kind = 'tax', posts_to_gl = false WHERE id = %L$q$, bg), 'HK_ASSETS_BOOK_IN_USE');
+  PERFORM public.cp_expect_error('INV-AST-14 a tax book in use cannot start posting to the GL',
+    format($q$UPDATE assets.book SET kind = 'combined', posts_to_gl = true WHERE id = %L$q$, bt), 'HK_ASSETS_BOOK_IN_USE');
+  UPDATE assets.book SET name = 'دفتر مالیاتی ماده ۱۴۹' WHERE id = bt;
+  -- RV-CMP-21: کاربرگ تفاوت دفتری و مالیاتی به سال مالی شرکت (۱۴۰۵ از ۲۰۲۶-۰۳-۲۱)، نه سال میلادی
+  PERFORM public.cp_assert((SELECT year_start = '2026-03-21' AND fiscal_year_code = '1405' AND accounting_depreciation = 1000000
+                              FROM assets.v_book_tax_difference WHERE asset_id = a1),
+                           'INV-AST-12 book-tax difference worksheet groups by the company fiscal year');
+END $$;
+
 -- =====================================================================
 -- بخش ۳: نصب‌کننده (postgres) — بستهٔ تازهٔ عطف به ماسبق؛ نگهبان‌های فقط‌افزودنی در سطح trigger
 -- =====================================================================
 RESET ROLE;
+-- G11 RV-IT-SALESTAX: کلید یکتای چهارستونی tax.invoice هدف FK دوطرفهٔ sales.invoice (99) است. پایگاه مستقل 30 را ندارد،
+-- پس یک جدول جانشین همان FK را می‌گیرد: «فاکتور A ← سند مالیاتی فاکتور B» رد و «A ← سند خود A» پذیرفته می‌شود.
+CREATE SCHEMA cp_g11;
+CREATE TABLE cp_g11.sales_stub (tenant_id uuid NOT NULL, company_id uuid NOT NULL, id uuid PRIMARY KEY, tax_document_id uuid,
+  FOREIGN KEY (tenant_id, company_id, tax_document_id, id) REFERENCES tax.invoice (tenant_id, company_id, id, sales_invoice_id));
+DO $$
+BEGIN
+  INSERT INTO cp_g11.sales_stub VALUES ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000c1',
+                                    'c5a00000-0000-7000-8000-0000000b0001', 'c5a00000-0000-7000-8000-000000007001');
+  PERFORM public.cp_expect_error('INV-TAX-24 a sales invoice cannot point at the tax document of another sales invoice (RV-IT-SALESTAX)',
+    $q$INSERT INTO cp_g11.sales_stub VALUES ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000c1',
+                                         'c5a00000-0000-7000-8000-0000000b0002', 'c5a00000-0000-7000-8000-000000007001')$q$, '23503');
+END $$;
+DROP SCHEMA cp_g11 CASCADE;
 INSERT INTO rules.package (id, code, version, seq, covers_from, min_engine_version, payload_sha256, hksb_sha256, signer_kid,
                            published_at, authored_by, approved_by, changelog_fa, installed_via, review_due_on) VALUES
   ('c5000000-0000-7000-8000-00000000f006', 'ir.payroll', '1405.2', 3, '2026-03-21', '2026.1.0', sha256('p6'), sha256('h6'), 'rules-test-a',
    now(), 'author@platform', '{approver@platform,reviewer@platform}', 'مزد عطف به ماسبق (TEST-ONLY)', 'test_fixture', '2027-03-21');
 INSERT INTO rules.param_value (id, package_id, key, qualifier, effective_from, value, approved_on, source_ref, confidence) VALUES
+  -- کف تازه به تومان منتشر شده (۱۱۰٬۰۰۰ IRT = ۱٬۱۰۰٬۰۰۰ ریال): سنجش کف واحد را نرمال می‌کند و از کنترل نمی‌پرد (RV-CMP-03)
   ('c5000000-0000-7000-8000-00000000f601', 'c5000000-0000-7000-8000-00000000f006', 'payroll.wage.min_daily', '', '2026-03-21',
-   '{"amount":"1100000","unit":"IRR"}', '2026-05-01', 'TEST-ONLY', 'high'),
+   '{"amount":"110000","unit":"IRT"}', '2026-05-01', 'TEST-ONLY', 'high'),
   ('c5000000-0000-7000-8000-00000000f602', 'c5000000-0000-7000-8000-00000000f006', 'payroll.time.weekly_hours', '', '2026-03-21', '{"v":"44"}', NULL, 'TEST-ONLY', 'high'),
   ('c5000000-0000-7000-8000-00000000f603', 'c5000000-0000-7000-8000-00000000f006', 'payroll.time.hourly_divisor', '', '2026-03-21', '{"v":"7.33"}', NULL, 'TEST-ONLY', 'medium'),
   ('c5000000-0000-7000-8000-00000000f604', 'c5000000-0000-7000-8000-00000000f006', 'payroll.tax.brackets_monthly', '', '2026-03-21',
@@ -1936,7 +2426,23 @@ BEGIN
   PERFORM public.cp_assert((SELECT status = 'superseded' AND superseded_by = 'c5000000-0000-7000-8000-00000000f006'
                               FROM rules.package WHERE id = 'c5000000-0000-7000-8000-00000000f001'), 'INV-RUL-10 activation supersedes the previous version');
   PERFORM public.cp_assert((SELECT count(*) FROM rules.package WHERE code = 'ir.payroll' AND status = 'active') = 1, 'INV-RUL-10 one active package per code');
-  PERFORM public.cp_assert((rules.value_at('payroll.wage.min_daily', '2026-04-01')).value ->> 'amount' = '1100000', 'INV-RUL-09 retroactive value now effective');
+  PERFORM public.cp_assert((rules.value_at('payroll.wage.min_daily', '2026-04-01')).value = '{"amount":"110000","unit":"IRT"}', 'INV-RUL-09 retroactive value now effective');
+  -- رونوشت مستأجری رویداد فعال‌سازی (RV-X1-12): دسته‌ای، idempotent، فقط رویداد active
+  PERFORM public.cp_assert(rules.package_fanout((SELECT id FROM rules.package_event WHERE package_id = 'c5000000-0000-7000-8000-00000000f006' AND to_status = 'active'), 1) = 1
+                           AND rules.package_fanout((SELECT id FROM rules.package_event WHERE package_id = 'c5000000-0000-7000-8000-00000000f006' AND to_status = 'active'), 1) = 1
+                           AND rules.package_fanout((SELECT id FROM rules.package_event WHERE package_id = 'c5000000-0000-7000-8000-00000000f006' AND to_status = 'active')) = 0,
+                           'INV-RUL-17 activation is fanned out once per live tenant, in batches, idempotently');
+  PERFORM public.cp_assert((SELECT count(DISTINCT o.tenant_id) FROM core.outbox_event o WHERE o.event_type = 'rules.package.activated'
+                              AND o.aggregate_id = 'c5000000-0000-7000-8000-00000000f006') = 2
+                           AND (SELECT count(*) FROM core.outbox_delivery d JOIN core.outbox_event o ON o.tenant_id = d.tenant_id AND o.id = d.event_id
+                                 WHERE o.event_type = 'rules.package.activated' AND o.aggregate_id = 'c5000000-0000-7000-8000-00000000f006'
+                                   AND d.subscriber IN ('rules.retro_scan','rules.calendar_sync')) = 4
+                           AND NOT EXISTS (SELECT 1 FROM core.outbox_delivery d JOIN core.outbox_event o ON o.tenant_id = d.tenant_id AND o.id = d.event_id
+                                            WHERE o.event_type = 'rules.package.activated' AND d.subscriber = 'uplink'),
+                           'INV-RUL-17 each tenant copy reaches retro_scan and calendar_sync (cell status goes to uplink from package_event, not per tenant)');
+  PERFORM public.cp_expect_error('INV-RUL-17 only activation events are fanned out',
+    $q$SELECT rules.package_fanout((SELECT id FROM rules.package_event WHERE package_id = 'c5000000-0000-7000-8000-00000000f006' AND to_status = 'installing'))$q$,
+    'HK_RULES_FANOUT_EVENT');
   PERFORM public.cp_assert(EXISTS (SELECT 1 FROM rules.package_event WHERE package_id = 'c5000000-0000-7000-8000-00000000f001' AND to_status = 'superseded'),
                            'INV-RUL-08 supersession logged');
   PERFORM public.cp_expect_error('INV-RUL-02 superseded only toward withdrawn',
@@ -2030,6 +2536,11 @@ BEGIN
   INSERT INTO payroll.decree (tenant_id, id, company_id, employee_id, contract_id, decree_no, effective_from, reason, wage_basis, daily_wage, created_by)
   VALUES (t, 'c5a00000-0000-7000-8000-000000004010', c, 'c5a00000-0000-7000-8000-000000002001', 'c5a00000-0000-7000-8000-000000003001', 'D-10', '2026-06-01', 'annual_adjustment',
           'daily', 1050000, u1);
+  -- سیاست کارگاه ۱ (۱٬۰۵۰٬۰۰۰ ریال) که زمان درج بالاتر از کف بود، پس از کف تازه (۱۱۰٬۰۰۰ تومان) دیگر برنده نیست (RV-CMP-01)
+  PERFORM public.cp_assert(rules.effective_value('payroll.wage.min_daily', '2026-06-01', '', c, 'c5a00000-0000-7000-8000-000000001001')
+                           = '{"amount":"110000","unit":"IRT"}', 'INV-RUL-12 a stale floor override loses to the newer statutory floor');
+  PERFORM public.cp_assert(rules.effective_value('payroll.wage.min_daily', '2026-06-01', '', c, 'c5a00000-0000-7000-8000-000000001002') ->> 'amount' = '800000',
+                           'INV-RUL-12 a workshop collective agreement still applies below the floor');
   PERFORM public.cp_expect_error('INV-PAY-04 floor follows the newly active package',
     format($q$UPDATE payroll.decree SET status = 'approved', approved_by = %L, approved_at = now(), rule_snapshot_id = 'c5a00000-0000-7000-8000-000000005001'
               WHERE id = 'c5a00000-0000-7000-8000-000000004010'$q$, u2), 'HK_PAYROLL_BELOW_MIN_WAGE');
@@ -2082,6 +2593,178 @@ BEGIN
     $q$UPDATE payroll.gov_file SET status = 'generated' WHERE id = 'c5a00000-0000-7000-8000-000000008401'$q$, 'HK_PAYROLL_FILE_TRANSITION');
 END $$;
 
+-- ---------- T19c: کد دقیق برای نگهبان‌هایی که آزمون جهش نشان داد هرگز اجرا نمی‌شدند (RV-CMP-08، R-QUALITY) ----------
+DO $$
+DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
+        u1 uuid := 'c5000000-0000-7000-8000-0000000000e1'; u2 uuid := 'c5000000-0000-7000-8000-0000000000e2';
+        w1 uuid := 'c5a00000-0000-7000-8000-000000001001'; w2 uuid := 'c5a00000-0000-7000-8000-000000001002';
+        e1 uuid := 'c5a00000-0000-7000-8000-000000002001'; e2 uuid := 'c5a00000-0000-7000-8000-000000002002';
+        r1 uuid := 'c5a00000-0000-7000-8000-000000008001'; r5 uuid := 'c5a00000-0000-7000-8000-000000008005';
+        b2 uuid := 'c5a00000-0000-7000-8000-000000007202'; br uuid := 'c5a00000-0000-7000-8000-0000000000b1';
+        spki bytea := decode(repeat('30', 294), 'hex');
+        cols text := 'tenant_id, company_id, invoice_id, issue_no, memory_ref, memory_id, serial, number_issued_id, allocation, device_id, indatim_ms, issue_date, taxid,
+                      subject, inv_type, pattern, setm, tprdis, tdis, tadis, tvam, todam, tolam, tbill, seller_tin, payload, payload_sha256, rule_snapshot_id, send_deadline_at';
+BEGIN
+  PERFORM set_config('app.tenant_id', t::text, true);
+  -- مؤدیان: حافظه، سرآیند و تخصیص سریال نسخه
+  PERFORM public.cp_expect_error('INV-TAX-02 issue memory is the document memory',
+    format($q$INSERT INTO tax.invoice_issue (%s) SELECT tenant_id, company_id, 'c5a00000-0000-7000-8000-000000007011', 1, memory_ref, memory_id, serial, number_issued_id,
+              allocation, device_id, indatim_ms, issue_date, taxid, subject, inv_type, pattern, setm, tprdis, tdis, tadis, tvam, todam, tolam, tbill, seller_tin, payload,
+              payload_sha256, rule_snapshot_id, send_deadline_at FROM tax.invoice_issue WHERE id = 'c5a00000-0000-7000-8000-000000007101'$q$, cols), 'HK_TAX_ISSUE_MEMORY');
+  PERFORM public.cp_expect_error('INV-TAX-06 issue header equals the document (subject, type, pattern)',
+    format($q$INSERT INTO tax.invoice_issue (%s) SELECT tenant_id, company_id, 'c5a00000-0000-7000-8000-000000007010', 1, memory_ref, memory_id, serial, number_issued_id,
+              allocation, device_id, indatim_ms, issue_date, taxid, subject, inv_type, pattern, setm, tprdis, tdis, tadis, tvam, todam, tolam, tbill, seller_tin, payload,
+              payload_sha256, rule_snapshot_id, send_deadline_at FROM tax.invoice_issue WHERE id = 'c5a00000-0000-7000-8000-000000007101'$q$, cols), 'HK_TAX_ISSUE_HEADER');
+  INSERT INTO tax.invoice (tenant_id, id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern, instruction_version) VALUES
+    (t, 'c5a00000-0000-7000-8000-000000007034', c, 'c5a00000-0000-7000-8000-000000006001', 'sales_invoice', 'c5a00000-0000-7000-8000-0000000b0034', 1, 1, 1, 'RC_IITP.IS-7.8');
+  PERFORM public.cp_expect_error('INV-TAX-02 issue allocation matches the memory allocation',
+    format($q$WITH n AS (SELECT * FROM core.number_next('c5a00000-0000-7000-8000-000000006101', 'all', '{seq}', 'tax.moadian_serial', 'c5a00000-0000-7000-8000-000000007199'))
+              INSERT INTO tax.invoice_issue (id, branch_id, seller_branch_code, %s) SELECT 'c5a00000-0000-7000-8000-000000007199', %L, '0007', i.tenant_id, i.company_id,
+                     'c5a00000-0000-7000-8000-000000007034', 1,
+                     i.memory_ref, i.memory_id, n.value, n.number_id, 'device', 'c5a00000-0000-7000-8000-0000000000d1', i.indatim_ms, i.issue_date, i.taxid, 1, 1, 1, 1,
+                     i.tprdis, i.tdis, i.tadis, i.tvam, i.todam, i.tolam, i.tbill, i.seller_tin, i.payload, i.payload_sha256, i.rule_snapshot_id, i.send_deadline_at
+                FROM tax.invoice_issue i, n WHERE i.id = 'c5a00000-0000-7000-8000-000000007101'$q$, cols, br), 'HK_TAX_SERIAL_ALLOCATION');
+  PERFORM public.cp_expect_error('INV-TAX-05 credit settlement (setm=3) carries cash and credit parts',
+    format($q$SELECT public.cp_issue(jsonb_build_object('invoice', 'c5a00000-0000-7000-8000-000000007034', 'indatim', %s,
+              'lines', '[{"sstid":"2710000138624","am":"1","fee":"10000","vra":"9"}]'::jsonb, 'setm', 3, 'buyer_type', 2, 'buyer_tin', '10100302746',
+              'branch_id', %L, 'sbc', '0007'))$q$, public.cp_ms('2026-04-17 07:00:00+00'), br), 'chk:issue_settlement');
+  -- ارسال و استعلام: دستهٔ همان حافظه/آداپتر، شمارهٔ تلاش پیاپی، واکنش فقط پس از ثبت
+  PERFORM public.cp_sign('c5a00000-0000-7000-8000-000000007131');
+  PERFORM public.cp_expect_error('INV-TAX-08 attempt uses the batch memory, adapter and environment',
+    format($q$INSERT INTO tax.submission_attempt (tenant_id, company_id, issue_id, batch_id, attempt_no, request_trace_id, adapter, environment, sent_at,
+                transport_outcome, request_sha256)
+              VALUES (%L, %L, 'c5a00000-0000-7000-8000-000000007131', %L, 1, uuidv7(), 'sandbox', 'sandbox', now(), 'network_error', sha256('a'))$q$, t, c, b2),
+    'HK_TAX_BATCH_MISMATCH');
+  PERFORM public.cp_expect_error('INV-TAX-06 attempt numbers are consecutive',
+    format($q$INSERT INTO tax.submission_attempt (tenant_id, company_id, issue_id, batch_id, attempt_no, request_trace_id, adapter, environment, sent_at,
+                transport_outcome, request_sha256)
+              VALUES (%L, %L, 'c5a00000-0000-7000-8000-000000007131', %L, 5, uuidv7(), 'direct_v1_self_tsp', 'production', now(), 'network_error', sha256('a'))$q$, t, c, b2),
+    'HK_TAX_ATTEMPT_NO');
+  PERFORM public.cp_expect_error('INV-TAX-10 buyer reaction inquiry only for registered invoices',
+    $q$SELECT public.cp_inquiry('c5a00000-0000-7000-8000-000000007131', 'APPROVED')$q$, 'HK_TAX_ISSUE_STATE: reaction inquiry');
+  -- حافظه و کلید: تاریخ گواهی، کلید روی همان دستگاه امضاکننده، حافظهٔ بازنشسته منجمد
+  PERFORM public.cp_expect_error('INV-TAX-13 certificate validity dates are ordered',
+    format($q$INSERT INTO tax.memory_key (tenant_id, memory_ref, kind, custody, public_key_spki, key_bits, fingerprint_sha256, private_key_sealed,
+                certificate_der, cert_subject_serial, cert_not_before, cert_not_after, custody_contract_version, custody_contract_accepted_by, custody_contract_accepted_at)
+              VALUES (%L, 'c5a00000-0000-7000-8000-000000006004', 'certificate', 'server_kms', %L, 2048, sha256('k8'), '\x03', '\x3082', '14003778990',
+                      now(), now() - interval '1 day', 'custody-v1', %L, now())$q$, t, spki, u1), 'chk:key_cert_dates');
+  PERFORM public.cp_expect_error('INV-TAX-12 a device-held key lives on the memory signer device',
+    format($q$INSERT INTO tax.memory_key (tenant_id, memory_ref, kind, custody, public_key_spki, key_bits, fingerprint_sha256, device_id)
+              VALUES (%L, 'c5a00000-0000-7000-8000-000000006003', 'rsa_key', 'device_agent', %L, 2048, sha256('k7'), 'c5a00000-0000-7000-8000-0000000000d2')$q$, t, spki),
+    'HK_TAX_KEY_CUSTODY');
+  INSERT INTO tax.memory (tenant_id, id, company_id, memory_id, label, send_mode, adapter, environment, key_custody, allocation, serial_series_id, created_by)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000006005', c, 'DEF5GK', 'حافظهٔ کنارگذاشته', 'taxpayer', 'direct_v1_self_tsp', 'production', 'server_kms', 'server',
+          'c5a00000-0000-7000-8000-000000006106', u1);
+  UPDATE tax.memory SET status = 'retired', retired_at = now() WHERE id = 'c5a00000-0000-7000-8000-000000006005';
+  PERFORM public.cp_expect_error('INV-TAX-02 a retired memory is frozen',
+    $q$UPDATE tax.memory SET label = 'تغییر پس از بازنشستگی' WHERE id = 'c5a00000-0000-7000-8000-000000006005'$q$, 'HK_TAX_MEMORY_IMMUTABLE');
+  -- حقوق: فایل دولتی همان کارگاه و جمع مالیات؛ حساب فیش؛ قسط کارمند دیگر؛ حکم روی قرارداد غیرفعال
+  PERFORM public.cp_expect_error('INV-PAY-14 files come from a run of the same workshop',
+    format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, rule_snapshot_id, control_totals)
+              VALUES (%L, %L, %L, %L, 'salary_tax', 'payroll.format.salary_tax', 'wh-1-7', 'c5a00000-0000-7000-8000-000000005001', '{"tax_total":4899300,"employees":1}')$q$,
+           t, c, w2, r1), 'HK_PAYROLL_FILE_RUN');
+  PERFORM public.cp_expect_error('INV-PAY-14 salary tax file total equals the approved payslips',
+    format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, rule_snapshot_id, control_totals)
+              VALUES (%L, %L, %L, %L, 'salary_tax', 'payroll.format.salary_tax', 'wh-1-7', 'c5a00000-0000-7000-8000-000000005001', '{"tax_total":4899301,"employees":1}')$q$,
+           t, c, w1, r1), 'HK_PAYROLL_FILE_TOTALS');
+  INSERT INTO payroll.run (tenant_id, id, company_id, workshop_id, kind, period_key, period_start, period_end, payment_date, rule_snapshot_id, engine_version, created_by)
+  VALUES (t, r5, c, w2, 'off_cycle', 'jm:1405-03', '2026-05-22', '2026-06-21', '2026-06-22', 'c5a00000-0000-7000-8000-000000005001', current_setting('cp.engine'), u1);
+  PERFORM public.cp_expect_error('INV-PAY-09 insurable benefits = insurable raw − monthly wage (DSW_MAZ)',
+    format($q$INSERT INTO payroll.payslip (tenant_id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+                gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+                unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
+              VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003002', 'c5a00000-0000-7000-8000-000000004002', 31, 0, 0, 900000, 0,
+                      1000000, 0, 5, 0, 0, 'half_up', 0.07, 0, 0.20, 0, 0.03, 0, 1000000, 0, 0, 0, 1000000)$q$, t, c, r5, e2), 'chk:payslip_benefits');
+  PERFORM public.cp_expect_error('INV-PAY-09 total paid (DSW_TOTL) covers the insurable amount',
+    format($q$INSERT INTO payroll.payslip (tenant_id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+                gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+                unemployment_rate, unemployment, total_paid_all, taxable_income, salary_tax, other_deductions, net_pay)
+              VALUES (%L, %L, %L, %L, 'c5a00000-0000-7000-8000-000000003002', 'c5a00000-0000-7000-8000-000000004002', 31, 0, 0, 900000, 0,
+                      1000000, 1000000, 1000000, 1000000, 1000000, 'half_up', 0.07, 70000, 0.20, 200000, 0.03, 30000, 999999, 0, 0, 0, 930000)$q$, t, c, r5, e2),
+    'chk:payslip_total_paid');
+  INSERT INTO payroll.loan (tenant_id, id, company_id, employee_id, kind, principal, installment_count, start_period_key, created_by)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000008203', c, e1, 'advance', 100000, 1, 'jm:1405-03', u1);
+  INSERT INTO payroll.loan_installment (tenant_id, id, loan_id, seq, period_key, amount)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000008304', 'c5a00000-0000-7000-8000-000000008203', 1, 'jm:1405-03', 100000);
+  UPDATE payroll.loan SET status = 'active', approved_by = u2, approved_at = now() WHERE id = 'c5a00000-0000-7000-8000-000000008203';
+  PERFORM public.cp_flush();
+  PERFORM public.cp_expect_error_deferred('INV-PAY-07 a payslip deducts only installments of its own employee',
+    format($q$INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+                gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+                unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, taxable_income, salary_tax, other_deductions, net_pay)
+              VALUES (%L, 'c5a00000-0000-7000-8000-000000008105', %L, %L, %L, 'c5a00000-0000-7000-8000-000000003002', 'c5a00000-0000-7000-8000-000000004002', 31, 0, 0, 900000, 0,
+                      1000000, 0, 0, 0, 0, 'half_up', 0.07, 0, 0.20, 0, 0.03, 0, 1000000, 1000000, 1000000, 0, 100000, 900000);
+              INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash,
+                                                dsk_bucket, source, loan_installment_id) VALUES
+                (%L, 'c5a00000-0000-7000-8000-000000008105', 1, 'c5a00000-0000-7000-8000-000000002105', 'bonus_occasional', 'earning', 1000000, false, 'progressive', false, true,
+                 'NONINSURABLE', 'manual', NULL),
+                (%L, 'c5a00000-0000-7000-8000-000000008105', 2, 'c5a00000-0000-7000-8000-000000002104', 'advance_repayment', 'deduction', 100000, false, 'not_applicable', false, true,
+                 'NONE', 'loan', 'c5a00000-0000-7000-8000-000000008304')$q$, t, c, r5, e2, t, t), 'HK_PAYROLL_LOAN_LINE');
+  -- قسط ۸۳۰۱ در اجرای تأییدشدهٔ r1 کسر شده؛ فیش دوم همان کارمند در اجرای زندهٔ دیگر نمی‌تواند همان قسط را دوباره کسر کند (RV-CMP-17)
+  PERFORM public.cp_expect_error_deferred('INV-PAY-07 an installment is deducted in one live run only (RV-CMP-17)',
+    format($q$INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+                gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+                unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, taxable_income, salary_tax, other_deductions, net_pay)
+              VALUES (%L, 'c5a00000-0000-7000-8000-000000008106', %L, %L, %L, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 0, 0, 1200000, 0,
+                      2000000, 0, 0, 0, 0, 'half_up', 0.07, 0, 0.20, 0, 0.03, 0, 2000000, 2000000, 2000000, 0, 1000000, 1000000);
+              INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash,
+                                                dsk_bucket, source, loan_installment_id) VALUES
+                (%L, 'c5a00000-0000-7000-8000-000000008106', 1, 'c5a00000-0000-7000-8000-000000002105', 'bonus_occasional', 'earning', 2000000, false, 'progressive', false, true,
+                 'NONINSURABLE', 'manual', NULL),
+                (%L, 'c5a00000-0000-7000-8000-000000008106', 2, 'c5a00000-0000-7000-8000-000000002104', 'loan_repayment', 'deduction', 1000000, false, 'not_applicable', false, true,
+                 'NONE', 'loan', 'c5a00000-0000-7000-8000-000000008301')$q$, t, c, r5, e1, t, t),
+    'HK_PAYROLL_LOAN_LINE: this installment is already deducted in another live run');
+  INSERT INTO payroll.contract (tenant_id, id, company_id, employee_id, workshop_id, contract_no, kind, employment_type, start_date, status) VALUES
+    (t, 'c5a00000-0000-7000-8000-000000003006', c, e1, w1, 'C-6', 'indefinite', 'full_time', '2027-01-01', 'draft');
+  INSERT INTO payroll.decree (tenant_id, id, company_id, employee_id, contract_id, decree_no, effective_from, reason, wage_basis, daily_wage, created_by)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000004011', c, e1, 'c5a00000-0000-7000-8000-000000003006', 'D-11', '2027-01-01', 'hire', 'daily', 3000000, u1);
+  PERFORM public.cp_expect_error('INV-PAY-04 decrees are approved only on an active contract',
+    format($q$UPDATE payroll.decree SET status = 'approved', approved_by = %L, approved_at = now(), rule_snapshot_id = 'c5a00000-0000-7000-8000-000000005001'
+              WHERE id = 'c5a00000-0000-7000-8000-000000004011'$q$, u2), 'HK_PAYROLL_DECREE_CONTRACT');
+  -- snapshot 5007 (T02) قاعدهٔ حداقل مبنا را ندارد در حالی که بستهٔ آن دارد ⇒ ناقص (حذف کلید راه فرار نیست؛ RV-CMP-14)
+  PERFORM public.cp_expect_error_deferred('INV-PAY-09 a run snapshot cites the minimum-base rule its package defines',
+    format($q$INSERT INTO payroll.run (tenant_id, id, company_id, workshop_id, kind, period_key, period_start, period_end, payment_date, rule_snapshot_id, engine_version, created_by)
+              VALUES (%L, 'c5a00000-0000-7000-8000-000000008007', %L, %L, 'off_cycle', 'jm:1405-04', '2026-06-22', '2026-07-22', '2026-07-23',
+                      'c5a00000-0000-7000-8000-000000005007', current_setting('cp.engine'), %L);
+              INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+                gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+                unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, taxable_income, salary_tax, other_deductions, net_pay)
+              VALUES (%L, 'c5a00000-0000-7000-8000-000000008107', %L, 'c5a00000-0000-7000-8000-000000008007', %L, 'c5a00000-0000-7000-8000-000000003002',
+                      'c5a00000-0000-7000-8000-000000004002', 31, 0, 0, 900000, 0, 1000000, 0, 0, 0, 0, 'half_up', 0.07, 0, 0.20, 0, 0.03, 0, 1000000, 1000000, 1000000, 0, 0, 1000000);
+              INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash, dsk_bucket, source)
+              VALUES (%L, 'c5a00000-0000-7000-8000-000000008107', 1, 'c5a00000-0000-7000-8000-000000002105', 'bonus_occasional', 'earning', 1000000, false, 'progressive', false, true,
+                      'NONINSURABLE', 'manual')$q$, t, c, w2, u1, t, c, e2, t), 'HK_PAYROLL_SNAPSHOT_INCOMPLETE: run snapshot lacks payroll.ssi.min_base_rule');
+  -- لیست بیمهٔ پروفایل rate_on_total: DSK_TKOSO = گرد(۰٫۲ × TMASH)، نه Σ سهم گردشدهٔ ردیف‌ها (RV-CMP-13).
+  -- دو فیش یک‌روزه با مبنای ۱٬۰۰۰٬۰۰۳: Σ ردیف‌ها = ۲۰۰٬۰۰۱ + ۲۰۰٬۰۰۱ = ۴۰۰٬۰۰۲ ولی ۰٫۲ × ۲٬۰۰۰٬۰۰۶ = ۴۰۰٬۰۰۱ (TEST-ONLY)
+  INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+              gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_min_base_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+              unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, ssi_tax_deduction, taxable_income, salary_tax, other_deductions, net_pay) VALUES
+    (t, 'c5a00000-0000-7000-8000-000000008151', c, r5, e1, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 1, 1, 1000003, 1000003,
+     1000003, 1000003, 0, 7000000, 1000000, 1000003, 'half_up', 0.07, 70000, 0.20, 200001, 0.03, 30000, 1000003, 1000003, 17500, 982503, 0, 0, 930003),
+    (t, 'c5a00000-0000-7000-8000-000000008152', c, r5, e2, 'c5a00000-0000-7000-8000-000000003002', 'c5a00000-0000-7000-8000-000000004002', 31, 1, 1, 1000003, 1000003,
+     1000003, 1000003, 0, 7000000, 1000000, 1000003, 'half_up', 0.07, 70000, 0.20, 200001, 0.03, 30000, 1000003, 1000003, 17500, 982503, 0, 0, 930003);
+  INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash, dsk_bucket, source) VALUES
+    (t, 'c5a00000-0000-7000-8000-000000008151', 1, 'c5a00000-0000-7000-8000-000000002101', 'base_wage', 'earning', 1000003, true, 'progressive', true, true, 'ROOZ', 'decree'),
+    (t, 'c5a00000-0000-7000-8000-000000008152', 1, 'c5a00000-0000-7000-8000-000000002101', 'base_wage', 'earning', 1000003, true, 'progressive', true, true, 'ROOZ', 'decree');
+  UPDATE payroll.run SET status = 'calculated', calculated_by = u1, calculated_at = now(), employee_count = 2, gross_total = 2000006, ssi_employee_total = 140000,
+         ssi_employer_total = 400002, unemployment_total = 60000, net_total = 1860006 WHERE id = r5;
+  UPDATE payroll.run SET status = 'approved', approved_by = u2, approved_at = now() WHERE id = r5;
+  PERFORM public.cp_flush();
+  PERFORM public.cp_expect_error('INV-PAY-14 rate_on_total profile rejects the sum of rounded rows',
+    format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
+              VALUES (%L, %L, %L, %L, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_2_7', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
+                      '{"DSK_NUM":2,"DSK_TDD":2,"DSK_TMASH":2000006,"DSK_TBIME":140000,"DSK_TKOSO":400002,"DSK_BIC":60000,"DSK_BIMH":0}')$q$, t, c, w2, r5),
+    'HK_PAYROLL_FILE_TOTALS');
+  INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
+  VALUES (t, c, w2, r5, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_2_7', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
+          '{"DSK_NUM":2,"DSK_TDD":2,"DSK_TMASH":2000006,"DSK_TBIME":140000,"DSK_TKOSO":400001,"DSK_BIC":60000,"DSK_BIMH":0}');
+  PERFORM public.cp_expect_error('INV-PAY-14 sum_of_rows profile takes the sum of rounded rows',
+    format($q$INSERT INTO payroll.gov_file (tenant_id, company_id, workshop_id, run_id, kind, format_key, format_version, code_page, list_no, rule_snapshot_id, control_totals)
+              VALUES (%L, %L, %L, %L, 'ssi_list', 'payroll.format.ssi_list', 'listdisk_6', 'cp1256', '1', 'c5a00000-0000-7000-8000-000000005001',
+                      '{"DSK_NUM":2,"DSK_TDD":2,"DSK_TMASH":2000006,"DSK_TBIME":140000,"DSK_TKOSO":400001,"DSK_BIC":60000,"DSK_BIMH":0}')$q$, t, c, w2, r5),
+    'HK_PAYROLL_FILE_TOTALS');
+END $$;
+
 -- ---------- T20: جداسازی مستأجر (INV-CMP-01) ----------
 DO $$
 DECLARE tb uuid := 'c5b00000-0000-7000-8000-000000000001'; cb uuid := 'c5b00000-0000-7000-8000-0000000000c1'; n int;
@@ -2097,6 +2780,7 @@ BEGIN
        + (SELECT count(*) FROM payroll.gov_file) + (SELECT count(*) FROM payroll.leave_entry) + (SELECT count(*) FROM assets.asset)
        + (SELECT count(*) FROM assets.asset_txn) + (SELECT count(*) FROM assets.depreciation_run) + (SELECT count(*) FROM tax.v_sales_moadian_status)
        + (SELECT count(*) FROM assets.v_asset_book_balance) + (SELECT count(*) FROM payroll.v_leave_balance)
+       + (SELECT count(*) FROM tax.taxpayer_branch) + (SELECT count(*) FROM payroll.contract) + (SELECT count(*) FROM payroll.loan_installment)
     INTO n;
   PERFORM public.cp_assert(n = 0, 'INV-CMP-01 tenant B sees none of tenant A rows (tables and security_invoker views)');
   PERFORM public.cp_assert((SELECT count(*) FROM assets.ledger_subledger_fixed_assets('c5a00000-0000-7000-8000-0000000000c1', '2026-06-01')) = 0,
@@ -2138,5 +2822,160 @@ BEGIN
        VALUES ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000c1', '2026-03-21', 'called_in', 'xx')$q$, '42501');
 END $$;
 RESET ROLE;
+
+-- =====================================================================
+-- بخش ۶: همروندی واقعی با دو نشست (postgres + dblink؛ نشست‌ها با نقش hk_app) — T22
+-- نشست اول کار محدودشونده را در تراکنش باز نگه می‌دارد؛ دومی باید منتظر بماند (قفل نگرفته در pg_locks) و پس از commit اولی رد شود.
+-- پیش‌نیاز: افزونهٔ contrib «dblink» و احراز trust/peer روی سوکت محلی (مثل T29 بخش ۰۳)؛ در نبود آن NOTICE «SKIP».
+-- =====================================================================
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'dblink') THEN
+    CREATE SCHEMA IF NOT EXISTS cp_c;
+    CREATE EXTENSION IF NOT EXISTS dblink SCHEMA cp_c;
+  ELSE
+    RAISE NOTICE 'SKIP T22: the contrib extension dblink is not installed';
+  END IF;
+END $$;
+CREATE OR REPLACE FUNCTION public.cp_c_open(p_name text) RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE v_pid integer;
+BEGIN
+  PERFORM cp_c.dblink_connect(p_name, format('dbname=%s user=%s host=%s port=%s', current_database(), current_user,
+                                             split_part(current_setting('unix_socket_directories'), ',', 1), current_setting('port')));
+  PERFORM cp_c.dblink_exec(p_name, 'SET ROLE hk_app');
+  PERFORM cp_c.dblink_exec(p_name, 'BEGIN');
+  PERFORM 1 FROM cp_c.dblink(p_name, $q$SELECT set_config('app.tenant_id', 'c5a00000-0000-7000-8000-000000000001', true)$q$) AS x(v text);
+  SELECT x.pid INTO v_pid FROM cp_c.dblink(p_name, 'SELECT pg_backend_pid()') AS x(pid integer);
+  RETURN v_pid;
+END $$;
+CREATE OR REPLACE FUNCTION public.cp_c_blocked(p_pid integer) RETURNS boolean
+LANGUAGE plpgsql AS $$
+BEGIN
+  FOR i IN 1..200 LOOP
+    IF EXISTS (SELECT 1 FROM pg_locks WHERE pid = p_pid AND NOT granted) THEN RETURN true; END IF;
+    PERFORM pg_sleep(0.02);
+  END LOOP;
+  RETURN false;
+END $$;
+CREATE OR REPLACE FUNCTION public.cp_c_finish(p_name text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE v text; e text;
+BEGIN
+  BEGIN
+    SELECT x.v INTO v FROM cp_c.dblink_get_result(p_name, false) AS x(v text);
+  EXCEPTION WHEN OTHERS THEN v := NULL;
+  END;
+  e := cp_c.dblink_error_message(p_name);
+  BEGIN
+    PERFORM 1 FROM cp_c.dblink_get_result(p_name, false) AS x(v text);
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  RETURN CASE WHEN e = 'OK' THEN coalesce(v, 'OK') ELSE 'ERROR: ' || regexp_replace(e, '^ERROR:\s+', '') END;
+END $$;
+
+-- آماده‌سازی (با hk_app و commit): اجرای حقوق محاسبه‌شده با کارکرد تأییدشده؛ دو اجرای استهلاک هم‌دوره (ماهانه و سالانه)
+SET ROLE hk_app;
+DO $$
+DECLARE t uuid := 'c5a00000-0000-7000-8000-000000000001'; c uuid := 'c5a00000-0000-7000-8000-0000000000c1';
+        u1 uuid := 'c5000000-0000-7000-8000-0000000000e1'; u2 uuid := 'c5000000-0000-7000-8000-0000000000e2';
+        w3 uuid := 'c5a00000-0000-7000-8000-000000001003'; e1 uuid := 'c5a00000-0000-7000-8000-000000002001';
+        r uuid := 'c5a00000-0000-7000-8000-000000008009'; p uuid := 'c5a00000-0000-7000-8000-000000008109';
+        bt uuid := 'c5a00000-0000-7000-8000-000000009102';
+BEGIN
+  IF to_regnamespace('cp_c') IS NULL THEN RETURN; END IF;
+  PERFORM set_config('app.tenant_id', t::text, true);
+  INSERT INTO payroll.attendance_summary (tenant_id, id, company_id, workshop_id, employee_id, period_key, period_start, period_end, calendar_days, work_days,
+                                          source, status, confirmed_by, confirmed_at)
+  VALUES (t, 'c5a00000-0000-7000-8000-000000002309', c, w3, e1, 'jm:1405-02', '2026-04-21', '2026-05-21', 31, 31, 'manual', 'confirmed', u2, now());
+  INSERT INTO payroll.run (tenant_id, id, company_id, workshop_id, kind, period_key, period_start, period_end, payment_date, rule_snapshot_id, engine_version, created_by)
+  VALUES (t, r, c, w3, 'regular', 'jm:1405-02', '2026-04-21', '2026-05-21', '2026-05-22', 'c5a00000-0000-7000-8000-000000005001', current_setting('cp.engine'), u1);
+  INSERT INTO payroll.payslip (tenant_id, id, company_id, run_id, employee_id, contract_id, decree_id, calendar_days, paid_days, insurance_days, daily_wage, monthly_wage,
+              gross_earnings, insurable_raw, insurable_benefits, ssi_cap_amount, ssi_min_base_amount, ssi_base, ssi_rounding, ssi_employee_rate, ssi_employee, ssi_employer_rate, ssi_employer,
+              unemployment_rate, unemployment, total_paid_all, tax_progressive_gross, ssi_tax_deduction, taxable_income, salary_tax, other_deductions, net_pay)
+  VALUES (t, p, c, r, e1, 'c5a00000-0000-7000-8000-000000003001', 'c5a00000-0000-7000-8000-000000004001', 31, 31, 31, 1200000, 37200000,
+          42200000, 40200000, 3000000, 217000000, 31000000, 40200000, 'half_up', 0.07, 2814000, 0.20, 8040000, 0.03, 1206000, 42200000,
+          40200000, 703500, 39496500, 4899300, 0, 34486700);
+  INSERT INTO payroll.payslip_line (tenant_id, payslip_id, line_no, pay_item_id, statutory_class, kind, amount, ssi_insurable, tax_treatment, is_continuous, is_cash, dsk_bucket, source) VALUES
+    (t, p, 1, 'c5a00000-0000-7000-8000-000000002101', 'base_wage', 'earning', 37200000, true, 'progressive', true, true, 'ROOZ', 'decree'),
+    (t, p, 2, 'c5a00000-0000-7000-8000-000000002102', 'housing', 'earning', 3000000, true, 'progressive', true, true, 'MAZ', 'statutory'),
+    (t, p, 3, 'c5a00000-0000-7000-8000-000000002103', 'child', 'earning', 2000000, false, 'exempt', true, true, 'NONINSURABLE', 'statutory');
+  UPDATE payroll.run SET status = 'calculated', calculated_by = u1, calculated_at = now(), employee_count = 1, gross_total = 42200000, ssi_employee_total = 2814000,
+         ssi_employer_total = 8040000, unemployment_total = 1206000, tax_total = 4899300, net_total = 34486700 WHERE id = r;
+  INSERT INTO assets.depreciation_run (tenant_id, id, company_id, book_id, period_key, period_start, period_end, rule_snapshot_id, engine_version) VALUES
+    (t, 'c5a00000-0000-7000-8000-000000009421', c, bt, 'jm:1405-03', '2026-05-22', '2026-06-21', 'c5a00000-0000-7000-8000-000000005005', current_setting('cp.engine')),
+    (t, 'c5a00000-0000-7000-8000-000000009422', c, bt, 'jy:1405', '2026-03-21', '2027-03-20', 'c5a00000-0000-7000-8000-000000005005', current_setting('cp.engine'));
+END $$;
+RESET ROLE;
+
+-- C1 (RV-CMP-11): تأیید اجرا کارکرد را قفل اشتراکی می‌کند؛ ویرایش هم‌زمان کارکرد منتظر می‌ماند و پس از commit تأیید رد می‌شود
+DO $$
+DECLARE pid_b integer; v text;
+BEGIN
+  IF to_regnamespace('cp_c') IS NULL THEN RETURN; END IF;
+  PERFORM public.cp_c_open('a'); pid_b := public.cp_c_open('b');
+  PERFORM 1 FROM cp_c.dblink('a', $q$UPDATE payroll.run SET status = 'approved', approved_by = 'c5000000-0000-7000-8000-0000000000e2', approved_at = now()
+                                     WHERE id = 'c5a00000-0000-7000-8000-000000008009' RETURNING 'ok'$q$) AS x(v text);
+  PERFORM cp_c.dblink_send_query('b', $q$UPDATE payroll.attendance_summary SET status = 'draft', confirmed_by = NULL, confirmed_at = NULL,
+                                           work_days = 10, absence_days = 21 WHERE id = 'c5a00000-0000-7000-8000-000000002309' RETURNING 'changed'$q$);
+  PERFORM public.cp_assert(public.cp_c_blocked(pid_b), 'INV-PAY-06 a concurrent attendance edit waits for the approving transaction (RV-CMP-11)');
+  PERFORM cp_c.dblink_exec('a', 'COMMIT');
+  v := public.cp_c_finish('b');
+  PERFORM public.cp_assert(v LIKE 'ERROR: HK_PAYROLL_ATTENDANCE_LOCKED%', 'INV-PAY-06 the waiting edit is refused once the run is approved: ' || coalesce(v, '-'));
+  PERFORM cp_c.dblink_exec('b', 'ROLLBACK');
+  PERFORM cp_c.dblink_disconnect('a'); PERFORM cp_c.dblink_disconnect('b');
+  PERFORM public.cp_assert((SELECT status = 'confirmed' AND work_days = 31 FROM payroll.attendance_summary WHERE id = 'c5a00000-0000-7000-8000-000000002309'),
+                           'INV-PAY-06 attendance behind an approved run stays as approved');
+END $$;
+
+-- C2 (RV-CMP-07): دو اجرای هم‌زمان ماهانه و سالانه برای یک دفتر دارایی؛ دومی پشت قفل دفتر دارایی می‌ماند و استهلاک دوباره رد می‌شود
+DO $$
+DECLARE pid_b integer; v text;
+BEGIN
+  IF to_regnamespace('cp_c') IS NULL THEN RETURN; END IF;
+  PERFORM public.cp_c_open('a'); pid_b := public.cp_c_open('b');
+  PERFORM 1 FROM cp_c.dblink('a', $q$INSERT INTO assets.depreciation_line (tenant_id, company_id, run_id, asset_book_id, asset_id, period_start, period_end, method,
+                                        basis_amount, months, amount, nbv_before, nbv_after)
+     VALUES ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000c1', 'c5a00000-0000-7000-8000-000000009421',
+             'c5a00000-0000-7000-8000-000000009302', 'c5a00000-0000-7000-8000-000000009201', '2026-05-22', '2026-06-21', 'straight_line',
+             120000000, 1, 666666, 119000000, 118333334) RETURNING 'ok'$q$) AS x(v text);
+  PERFORM cp_c.dblink_send_query('b', $q$INSERT INTO assets.depreciation_line (tenant_id, company_id, run_id, asset_book_id, asset_id, period_start, period_end, method,
+                                        basis_amount, months, amount, nbv_before, nbv_after)
+     VALUES ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000c1', 'c5a00000-0000-7000-8000-000000009422',
+             'c5a00000-0000-7000-8000-000000009302', 'c5a00000-0000-7000-8000-000000009201', '2026-05-22', '2026-06-21', 'straight_line',
+             120000000, 1, 666666, 119000000, 118333334) RETURNING 'ok'$q$);
+  PERFORM public.cp_assert(public.cp_c_blocked(pid_b), 'INV-AST-10 a concurrent depreciation line of another run waits for the first (RV-CMP-07)');
+  PERFORM cp_c.dblink_exec('a', 'COMMIT');
+  v := public.cp_c_finish('b');
+  PERFORM public.cp_assert(v LIKE 'ERROR: HK_ASSETS_DOUBLE_DEPRECIATION%', 'INV-AST-10 the second run cannot depreciate the same month again: ' || coalesce(v, '-'));
+  PERFORM cp_c.dblink_exec('b', 'ROLLBACK');
+  PERFORM cp_c.dblink_disconnect('a'); PERFORM cp_c.dblink_disconnect('b');
+END $$;
+
+-- C3 (RV-CMP-05): دو برگشت هم‌زمان روی یک سر زنجیره؛ دومی پشت ایندکس یکتای جانشین می‌ماند و رد می‌شود
+DO $$
+DECLARE pid_b integer; v text;
+BEGIN
+  IF to_regnamespace('cp_c') IS NULL THEN RETURN; END IF;
+  PERFORM public.cp_c_open('a'); pid_b := public.cp_c_open('b');
+  PERFORM 1 FROM cp_c.dblink('a', $q$INSERT INTO tax.invoice (tenant_id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern,
+                                        instruction_version, ref_invoice_id, root_invoice_id)
+     VALUES ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000c1', 'c5a00000-0000-7000-8000-000000006002', 'sales_invoice',
+             'c5a00000-0000-7000-8000-0000000b0040', 4, 2, 1, 'RC_IITP.IS-7.8', 'c5a00000-0000-7000-8000-000000007020', 'c5a00000-0000-7000-8000-000000007020')
+     RETURNING 'ok'$q$) AS x(v text);
+  PERFORM cp_c.dblink_send_query('b', $q$INSERT INTO tax.invoice (tenant_id, company_id, memory_ref, source_kind, sales_invoice_id, subject, inv_type, pattern,
+                                        instruction_version, ref_invoice_id, root_invoice_id)
+     VALUES ('c5a00000-0000-7000-8000-000000000001', 'c5a00000-0000-7000-8000-0000000000c1', 'c5a00000-0000-7000-8000-000000006002', 'sales_invoice',
+             'c5a00000-0000-7000-8000-0000000b0041', 4, 2, 1, 'RC_IITP.IS-7.8', 'c5a00000-0000-7000-8000-000000007020', 'c5a00000-0000-7000-8000-000000007020')
+     RETURNING 'ok'$q$);
+  PERFORM public.cp_assert(public.cp_c_blocked(pid_b), 'INV-TAX-15 a concurrent return on the same head waits for the first (RV-CMP-05)');
+  PERFORM cp_c.dblink_exec('a', 'COMMIT');
+  v := public.cp_c_finish('b');
+  PERFORM public.cp_assert(v LIKE 'ERROR: duplicate key value violates unique constraint "invoice_one_live_successor"%',
+                           'INV-TAX-15 the second concurrent return is refused (one live successor per version): ' || coalesce(v, '-'));
+  PERFORM cp_c.dblink_exec('b', 'ROLLBACK');
+  PERFORM cp_c.dblink_disconnect('a'); PERFORM cp_c.dblink_disconnect('b');
+END $$;
+DROP SCHEMA IF EXISTS cp_c CASCADE;
 
 \echo 'ALL 50_compliance TESTS PASSED'

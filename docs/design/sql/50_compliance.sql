@@ -55,7 +55,9 @@ $$;
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS rules.param_def (
   key              text PRIMARY KEY CHECK (key ~ '^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,6}$'),
-  domain           text NOT NULL CHECK (domain IN ('tax','payroll','assets','calendar','currency','retention')),
+  -- 'ref': مقدار نشانگر snapshot مرجع ref.<جدول>.snapshot در بسته‌های ir.ref.* (پاسخ CR-PLT-09 بخش ۰۹) تا دروازهٔ
+  -- «دست‌کم یک مقدار و یک آزمون طلایی» برای بستهٔ مرجع هم یکسان باشد
+  domain           text NOT NULL CHECK (domain IN ('tax','payroll','assets','calendar','currency','retention','ref')),
   package_code     text NOT NULL CHECK (package_code ~ '^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$'),  -- بستهٔ مالک مقدارها
   value_type       text NOT NULL CHECK (value_type IN ('money','decimal','integer','percent','ratio','boolean','text','enum','date','table','json')),
   unit             text CHECK (unit IN ('IRR','percent','ratio','days','months','hours','years','seconds','count')),
@@ -71,7 +73,10 @@ CREATE TABLE IF NOT EXISTS rules.param_def (
   CHECK ((value_type = 'money') = (unit = 'IRR')),
   CHECK (value_type <> 'percent' OR unit = 'percent'),
   CHECK ((override_policy = 'none') = (cardinality(override_levels) = 0)),
-  CHECK (override_policy NOT IN ('floor','ceiling') OR value_type IN ('money','decimal','integer','percent','ratio'))
+  CHECK (override_policy NOT IN ('floor','ceiling') OR value_type IN ('money','decimal','integer','percent','ratio')),
+  -- کلید ref فقط نشانگر snapshot یک جدول مرجع از بستهٔ ir.ref.* است و جایگزین مستأجری ندارد (CR-PLT-09)
+  CONSTRAINT param_def_ref_marker CHECK (domain <> 'ref' OR (key ~ '^ref\.[a-z][a-z0-9_]*\.snapshot$' AND package_code ~ '^ir\.ref\.[a-z0-9_]+$'
+                                                            AND value_type = 'json' AND override_policy = 'none'))
 );
 
 -- اعتبار شکل مقدار JSON نسبت به نوع تعریف (همتای Python: hesabketab.rules.domain.values)
@@ -118,10 +123,12 @@ END $$;
 CREATE OR REPLACE FUNCTION rules.value_valid(p_type text, p_enum text[], p_value jsonb) RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$ SELECT coalesce(rules.value_valid_raw(p_type, p_enum, p_value), false) $$;
 
--- مقدار عددی قابل مقایسه (برای سیاست کف/سقف)؛ NULL برای انواع غیرعددی
+-- مقدار عددی قابل مقایسه (برای سیاست کف/سقف)؛ پول به ریال (IRR) نرمال می‌شود: IRT × ۱۰. NULL برای انواع غیرعددی و برای
+-- IRR_NEW (ضریب آن تاریخ‌دار است؛ rules.value_numeric_on). هیچ مصرف‌کننده‌ای NULL را «بی‌کنترل» تعبیر نمی‌کند (RV-CMP-03).
 CREATE OR REPLACE FUNCTION rules.value_numeric(p_type text, p_value jsonb) RETURNS numeric
 LANGUAGE sql IMMUTABLE AS $$
-  SELECT CASE WHEN p_type = 'money' AND p_value ->> 'unit' = 'IRR' THEN (p_value ->> 'amount')::numeric
+  SELECT CASE WHEN p_type = 'money' THEN CASE p_value ->> 'unit' WHEN 'IRR' THEN (p_value ->> 'amount')::numeric
+                                                                  WHEN 'IRT' THEN (p_value ->> 'amount')::numeric * 10 END
               WHEN p_type IN ('decimal','percent','ratio') THEN (p_value ->> 'v')::numeric
               WHEN p_type = 'integer' THEN (p_value ->> 'v')::numeric END
 $$;
@@ -232,12 +239,35 @@ CREATE TABLE IF NOT EXISTS rules.package_event (
 CREATE TABLE IF NOT EXISTS rules.obligation_def (
   code           text PRIMARY KEY CHECK (code ~ '^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,4}$'),
   domain         text NOT NULL CHECK (domain IN ('tax','payroll','ledger','core')),
-  frequency      text NOT NULL CHECK (frequency IN ('monthly','quarterly','semiannual','annual','per_event')),
+  frequency      text NOT NULL CHECK (frequency IN ('monthly','quarterly','semiannual','annual','per_event','per_rule')),
+  -- دورهٔ قانونی متغیر (مثلاً دفاتر الکترونیکی: شش‌ماهه برای سال آغازشده در ۱۴۰۴، فصلی از ۱۴۰۵ ⚠) کلید تاریخ‌دار قواعد است،
+  -- نه ثابت کاتالوگ؛ تقویم مقدار را در تاریخ آغاز سال مالی شرکت می‌خواند (RV-X3-07)
+  frequency_rule_key text REFERENCES rules.param_def(key),
+  -- تکلیف «احتمالی» که هنوز تأیید قانونی ندارد (مثلاً سامانهٔ جامع تجارت/انبارها و شناسهٔ رهگیری کالا برای صنف برق؛
+  -- RV-X3-12، Q-CMP-14) فقط وقتی برای شرکت قلم تقویم می‌سازد که مقدار مؤثر این کلید بولی (با جایگزین سطح شرکت) true باشد.
+  -- نبود مقدار = تأییدنشده = غیرفعال؛ هیچ فرض قانونی در کد نیست.
+  enabled_rule_key text REFERENCES rules.param_def(key),
   applies_to     text NOT NULL CHECK (applies_to IN ('company','workshop','memory')),
   title_key      text NOT NULL,
   introduced_in  text NOT NULL,
-  CHECK (split_part(code, '.', 1) = domain)
+  CHECK (split_part(code, '.', 1) = domain),
+  CHECK ((frequency = 'per_rule') = (frequency_rule_key IS NOT NULL))
 );
+
+-- کلید فعال‌سازی تکلیف باید بولی و در سطح شرکت جایگزین‌پذیر باشد (وگرنه شرکت مشمول راهی برای فعال کردن ندارد؛ RV-X3-12)
+CREATE OR REPLACE FUNCTION rules.obligation_def_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.enabled_rule_key IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM rules.param_def d WHERE d.key = NEW.enabled_rule_key AND d.value_type = 'boolean'
+          AND d.override_policy = 'any' AND 'company' = ANY (d.override_levels)) THEN
+    PERFORM core.raise_hk('HK_RULES_OBLIGATION_GATE',
+      format('obligation %s: enabled_rule_key %s must be a boolean key overridable at company level', NEW.code, NEW.enabled_rule_key));
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON rules.obligation_def;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE ON rules.obligation_def FOR EACH ROW EXECUTE FUNCTION rules.obligation_def_guard();
 
 -- طبقهٔ مالیاتی کالا/خدمت (پاسخ CR-08 بخش ۰۴): فقط هویت طبقه؛ نرخ هر طبقه مقدار تاریخ‌دار rules است
 -- (tax.vat.category_rate / tax.other_levy.rate با qualifier = code). catalog.item.tax_category_code به این جدول FK می‌گیرد (§۱۲).
@@ -335,6 +365,37 @@ DROP TRIGGER IF EXISTS trg_package_log ON rules.package;
 CREATE TRIGGER trg_package_log AFTER INSERT OR UPDATE ON rules.package
   FOR EACH ROW EXECUTE FUNCTION rules.package_log();
 
+-- رونوشت مستأجری رویداد فعال شدن بسته (RV-X1-12). rules.package سراسری است ولی outbox مستأجری؛ ردیف rules.package_event
+-- همان تراکنش فعال‌سازی «outbox سلولی» است و این تابع (اجرای hk_migrator/نگهداری، دسته‌ای پس از commit فعال‌سازی) برای هر مستأجر
+-- زنده یک رویداد rules.package.activated با شناسهٔ قطعی md5(مستأجر:رویداد) می‌سازد؛ پس اجرای دوباره رونوشت دوم نمی‌سازد و
+-- تراکنش فعال‌سازی هزاران قفل advisory نمی‌گیرد. مشترک‌ها: rules.retro_scan و rules.calendar_sync (هر دو idempotent).
+-- وضعیت توزیع سلولی (installed/active/rejected/…/golden_verified) را عامل uplink مستقیم از rules.package_event و rules.golden_run
+-- با tenant_id = NULL به 09 می‌فرستد. خروجی: تعداد رونوشت‌های تازه (۰ = تمام).
+CREATE OR REPLACE FUNCTION rules.package_fanout(p_package_event_id uuid, p_limit integer DEFAULT 500) RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE e rules.package_event; k rules.package; n integer;
+BEGIN
+  SELECT * INTO e FROM rules.package_event WHERE id = p_package_event_id;
+  IF NOT FOUND OR e.to_status <> 'active' THEN
+    PERFORM core.raise_hk('HK_RULES_FANOUT_EVENT', 'only an activation event is fanned out to tenants');
+  END IF;
+  SELECT * INTO k FROM rules.package WHERE id = e.package_id;
+  INSERT INTO core.outbox_event (tenant_id, id, event_type, aggregate_type, aggregate_id, payload)
+  SELECT t.id, md5(t.id::text || ':' || e.id::text)::uuid, 'rules.package.activated', 'rules.package', k.id,
+         jsonb_build_object('package_id', k.id, 'code', k.code, 'version', k.version, 'seq', k.seq,
+                            'package_event_id', e.id, 'activated_at', k.activated_at)
+    FROM core.tenant t
+   WHERE t.status IN ('active','read_only','suspended')
+     AND NOT EXISTS (SELECT 1 FROM core.outbox_event o WHERE o.tenant_id = t.id AND o.id = md5(t.id::text || ':' || e.id::text)::uuid)
+   ORDER BY t.id
+   LIMIT greatest(p_limit, 1)
+  ON CONFLICT DO NOTHING;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+REVOKE ALL ON FUNCTION rules.package_fanout(uuid, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION rules.package_fanout(uuid, integer) TO hk_migrator;
+
 -- محتوای بسته فقط در وضعیت installing درج می‌شود و پس از آن تغییرناپذیر است
 CREATE OR REPLACE FUNCTION rules.package_content_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -425,6 +486,18 @@ BEGIN
   RETURN v;
 END $$;
 
+-- همان value_numeric در تاریخ: IRR_NEW (ریال پس از حذف چهار صفر) با ضریب رسمی currency.redenomination.factor همان تاریخ
+-- به ریال برمی‌گردد. نبود بستهٔ ir.general خطای صریح است، نه پرش از کنترل (RV-CMP-03).
+CREATE OR REPLACE FUNCTION rules.value_numeric_on(p_type text, p_value jsonb, p_on date) RETURNS numeric
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  IF p_type = 'money' AND p_value ->> 'unit' = 'IRR_NEW' THEN
+    RETURN (p_value ->> 'amount')::numeric
+           * rules.value_numeric('decimal', (rules.value_at('currency.redenomination.factor', p_on)).value);
+  END IF;
+  RETURN rules.value_numeric(p_type, p_value);
+END $$;
+
 -- =====================================================================
 -- ۳. rules — جدول‌های مستأجری: جایگزینی مجاز، snapshot محاسبه، پیشنهاد بازمحاسبه، تقویم انطباق
 -- =====================================================================
@@ -462,7 +535,7 @@ CREATE TABLE IF NOT EXISTS rules.param_override (
          OR (scope_level = 'workshop' AND company_id IS NOT NULL AND workshop_ref IS NOT NULL)),
   CHECK ((status = 'revoked') = (revoked_at IS NOT NULL AND revoked_by IS NOT NULL AND revoke_reason IS NOT NULL)),
   -- پایین‌تر از کف قانونی فقط با پیمان دسته‌جمعی و تأییدکنندهٔ دوم (تریگر)؛ این‌جا: تفکیک وظایف
-  CHECK (basis_kind <> 'collective_agreement' OR approved_by <> created_by),
+  CONSTRAINT override_agreement_sod CHECK (basis_kind <> 'collective_agreement' OR approved_by <> created_by),
   EXCLUDE USING gist (tenant_id WITH =, scope_level WITH =, (coalesce(company_id, '00000000-0000-0000-0000-000000000000'::uuid)) WITH =,
                       (coalesce(workshop_ref, '00000000-0000-0000-0000-000000000000'::uuid)) WITH =, key WITH =, qualifier WITH =,
                       daterange(effective_from, effective_to, '[)') WITH &&) WHERE (status = 'active')
@@ -495,17 +568,27 @@ BEGIN
     PERFORM core.raise_hk('HK_RULES_OVERRIDE_IMMUTABLE', 'overrides are created active');
   END IF;
   IF d.override_policy IN ('floor','ceiling') THEN
-    v_new := rules.value_numeric(d.value_type, NEW.value);
+    -- کلید کف/سقف قانونی: تأییدکنندهٔ دوم همیشه (نه فقط برای پیمان دسته‌جمعی؛ RV-CMP-02)
+    IF NEW.approved_by = NEW.created_by THEN
+      PERFORM core.raise_hk('HK_RULES_OVERRIDE_SOD', format('an override of the statutory %s key %s needs a second approver', d.override_policy, NEW.key));
+    END IF;
+    -- مقایسه بعد از نرمال‌سازی واحد پول به ریال (IRT ×۱۰، IRR_NEW × ضریب)؛ این بررسی زمان درج فقط هشدار زودهنگام است:
+    -- ارزیاب (rules.effective_value) کف/سقف را در زمان ارزیابی با بستهٔ فعال همان روز دوباره اعمال می‌کند (RV-CMP-01)
+    v_new := rules.value_numeric_on(d.value_type, NEW.value, NEW.effective_from);
     SELECT id INTO v_pkg FROM rules.package WHERE code = d.package_code AND status = 'active';
-    SELECT min(rules.value_numeric(d.value_type, pv.value)), max(rules.value_numeric(d.value_type, pv.value)) INTO v_min, v_max
+    SELECT min(rules.value_numeric_on(d.value_type, pv.value, greatest(pv.effective_from, NEW.effective_from))),
+           max(rules.value_numeric_on(d.value_type, pv.value, greatest(pv.effective_from, NEW.effective_from))) INTO v_min, v_max
       FROM rules.param_value pv
      WHERE pv.package_id = v_pkg AND pv.key = NEW.key AND pv.qualifier = NEW.qualifier
        AND daterange(pv.effective_from, pv.effective_to, '[)') && daterange(NEW.effective_from, NEW.effective_to, '[)');
     IF v_new IS NULL OR v_max IS NULL THEN
       PERFORM core.raise_hk('HK_RULES_OVERRIDE_NO_STATUTORY', 'statutory value for the override range is unknown (no active package value)');
     END IF;
-    IF d.override_policy = 'floor' AND v_new < v_max AND NEW.basis_kind <> 'collective_agreement' THEN
-      PERFORM core.raise_hk('HK_RULES_OVERRIDE_BELOW_FLOOR', format('%s below the statutory floor %s needs a registered collective agreement', v_new, v_max));
+    -- کمتر از کف فقط با پیمان دسته‌جمعی ثبت‌شده «در سطح کارگاه» (INV-RUL-12، D-CMP-03؛ RV-CMP-12)
+    IF d.override_policy = 'floor' AND v_new < v_max
+       AND NOT (NEW.basis_kind = 'collective_agreement' AND NEW.scope_level = 'workshop') THEN
+      PERFORM core.raise_hk('HK_RULES_OVERRIDE_BELOW_FLOOR',
+        format('%s below the statutory floor %s needs a collective agreement registered at workshop level', v_new, v_max));
     END IF;
     IF d.override_policy = 'ceiling' AND v_new > v_min THEN
       PERFORM core.raise_hk('HK_RULES_OVERRIDE_ABOVE_CEILING', format('%s is above the statutory ceiling %s', v_new, v_min));
@@ -517,12 +600,16 @@ DROP TRIGGER IF EXISTS trg_override_guard ON rules.param_override;
 CREATE TRIGGER trg_override_guard BEFORE INSERT OR UPDATE OR DELETE ON rules.param_override
   FOR EACH ROW EXECUTE FUNCTION rules.param_override_guard();
 
--- مقدار مؤثر برای مستأجر جاری: کارگاه > شرکت > مستأجر > رسمی (همتای RuleEvaluator.effective)
+-- مقدار مؤثر برای مستأجر جاری: کارگاه > شرکت > مستأجر > رسمی (همتای RuleEvaluator.effective).
+-- سیاست کف/سقف «در زمان ارزیابی» با مقدار رسمی همان روز اعمال می‌شود (RV-CMP-01): جایگزینی که هنگام درج قانونی بود و بستهٔ
+-- تازه کف را از آن بالاتر برده، دیگر برنده نیست (مقدار رسمی برمی‌گردد)؛ تنها استثنا پیمان دسته‌جمعی ثبت‌شدهٔ کارگاهی زیر کف است.
 CREATE OR REPLACE FUNCTION rules.effective_value(p_key text, p_on date, p_qualifier text DEFAULT '',
                                                  p_company_id uuid DEFAULT NULL, p_workshop_ref uuid DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql STABLE AS $$
-DECLARE o rules.param_override;
+DECLARE o rules.param_override; d rules.param_def; v_stat jsonb; v_o numeric; v_s numeric;
 BEGIN
+  SELECT * INTO d FROM rules.param_def WHERE key = p_key;
+  IF NOT FOUND THEN PERFORM core.raise_hk('HK_RULES_KEY_UNKNOWN', format('unknown parameter %s', p_key)); END IF;
   SELECT * INTO o FROM rules.param_override x
    WHERE x.status = 'active' AND x.key = p_key AND x.qualifier = coalesce(p_qualifier, '')
      AND x.effective_from <= p_on AND (x.effective_to IS NULL OR p_on < x.effective_to)
@@ -531,8 +618,22 @@ BEGIN
           OR  x.scope_level = 'tenant')
    ORDER BY CASE x.scope_level WHEN 'workshop' THEN 1 WHEN 'company' THEN 2 ELSE 3 END
    LIMIT 1;
-  IF FOUND THEN RETURN o.value; END IF;
-  RETURN (rules.value_at(p_key, p_on, p_qualifier)).value;
+  IF NOT FOUND THEN RETURN (rules.value_at(p_key, p_on, p_qualifier)).value; END IF;
+  IF d.override_policy NOT IN ('floor','ceiling') THEN RETURN o.value; END IF;
+  v_stat := (rules.value_at(p_key, p_on, p_qualifier)).value;
+  v_o := rules.value_numeric_on(d.value_type, o.value, p_on);
+  v_s := rules.value_numeric_on(d.value_type, v_stat, p_on);
+  IF v_o IS NULL OR v_s IS NULL THEN
+    PERFORM core.raise_hk('HK_RULES_UNIT_UNSUPPORTED', format('cannot compare %s with the statutory %s of %s', o.value, v_stat, p_key));
+  END IF;
+  IF d.override_policy = 'floor' AND v_o < v_s
+     AND NOT (o.basis_kind = 'collective_agreement' AND o.scope_level = 'workshop') THEN
+    RETURN v_stat;
+  END IF;
+  IF d.override_policy = 'ceiling' AND v_o > v_s THEN
+    RETURN v_stat;
+  END IF;
+  RETURN o.value;
 END $$;
 
 -- snapshot قواعد مصرف‌شده در یک محاسبه (فقط‌افزودنی؛ با hash محتوا یکتا می‌شود تا میلیون‌ها فاکتور یک ردیف را بخوانند)
@@ -560,9 +661,47 @@ CREATE TABLE IF NOT EXISTS rules.calc_snapshot (
 SELECT core.enable_tenant_rls('rules.calc_snapshot');
 CREATE INDEX IF NOT EXISTS calc_snapshot_packages ON rules.calc_snapshot USING gin (package_ids);
 
+-- محتوای متعارف snapshot (همتای Python: hesabketab.rules.snapshot.canonical_content؛ بردار مشترک در آزمون طلایی):
+--   {کلید: {qualifier یا '_': مقدار}}؛ اگر یک (کلید، qualifier) چند مقدار پیوسته در دورهٔ snapshot دارد:
+--   {کلید: {q: {"@ranges": [{"from","to","value"}, …]}}}؛ و اگر جایگزین مصرف شده: "@overrides": [ردیف‌های جایگزین به ترتیب id].
+-- محتوا از روی ردیف‌های ارجاع‌شده ساخته می‌شود، پس جدول یا نرخی که در value_ids نیست نمی‌تواند در محتوا بیاید (RV-CMP-04).
+CREATE OR REPLACE FUNCTION rules.snapshot_content(p_value_ids uuid[], p_override_ids uuid[]) RETURNS jsonb
+LANGUAGE sql STABLE AS $$
+  WITH v AS (
+    SELECT pv.key, CASE WHEN pv.qualifier = '' THEN '_' ELSE pv.qualifier END AS qk, pv.effective_from, pv.effective_to, pv.value,
+           count(*) OVER (PARTITION BY pv.key, pv.qualifier) AS n
+      FROM rules.param_value pv WHERE pv.id = ANY (p_value_ids)
+  ), per_q AS (
+    SELECT key, qk,
+           CASE WHEN max(n) = 1 THEN (array_agg(value))[1]
+                ELSE jsonb_build_object('@ranges', jsonb_agg(jsonb_build_object('from', effective_from, 'to', effective_to, 'value', value)
+                                                             ORDER BY effective_from)) END AS val
+      FROM v GROUP BY key, qk
+  ), per_key AS (
+    SELECT key, jsonb_object_agg(qk, val) AS obj FROM per_q GROUP BY key
+  ), ov AS (
+    SELECT jsonb_agg(jsonb_build_object('id', o.id, 'key', o.key, 'qualifier', o.qualifier, 'scope_level', o.scope_level,
+                                        'company_id', o.company_id, 'workshop_ref', o.workshop_ref, 'effective_from', o.effective_from,
+                                        'effective_to', o.effective_to, 'value', o.value, 'basis_kind', o.basis_kind) ORDER BY o.id) AS arr
+      FROM rules.param_override o WHERE o.id = ANY (p_override_ids)
+  )
+  SELECT coalesce((SELECT jsonb_object_agg(key, obj) FROM per_key), '{}'::jsonb)
+         || CASE WHEN (SELECT arr FROM ov) IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('@overrides', (SELECT arr FROM ov)) END
+$$;
+
+-- مقدار رسمی یک کلید در یک روز از محتوای snapshot (هر دو شکل ساده و @ranges)؛ NULL اگر snapshot آن را ندارد
+CREATE OR REPLACE FUNCTION rules.snapshot_value(p_content jsonb, p_key text, p_qualifier text, p_on date) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN jsonb_typeof(x) = 'object' AND x ? '@ranges'
+              THEN (SELECT r -> 'value' FROM jsonb_array_elements(x -> '@ranges') r
+                     WHERE (r ->> 'from')::date <= p_on AND (r ->> 'to' IS NULL OR p_on < (r ->> 'to')::date) LIMIT 1)
+              ELSE x END
+    FROM (SELECT p_content -> p_key -> (CASE WHEN coalesce(p_qualifier, '') = '' THEN '_' ELSE p_qualifier END) AS x) s
+$$;
+
 CREATE OR REPLACE FUNCTION rules.calc_snapshot_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_min smallint;
+DECLARE v_min smallint; v_content jsonb; v_bad text;
 BEGIN
   IF EXISTS (SELECT 1 FROM unnest(NEW.package_ids) p WHERE NOT EXISTS
                (SELECT 1 FROM rules.package k WHERE k.id = p AND k.status = 'active')) THEN
@@ -579,6 +718,28 @@ BEGIN
   SELECT min(rules.confidence_rank(pv.confidence)) INTO v_min FROM rules.param_value pv WHERE pv.id = ANY (NEW.value_ids);
   IF rules.confidence_rank(NEW.min_confidence) IS DISTINCT FROM v_min THEN
     PERFORM core.raise_hk('HK_RULES_SNAPSHOT_CONFIDENCE', 'min_confidence must equal the lowest confidence of the values used');
+  END IF;
+  -- پوشش: هر (کلید، qualifier) در همهٔ روزهای [as_of_from, as_of_to] دقیقاً یک مقدار دارد (پیوسته، بی‌شکاف، بی‌مقدار بیرون از دوره)
+  SELECT g.key INTO v_bad FROM (
+    SELECT pv.key, pv.effective_from, pv.effective_to,
+           lag(pv.effective_to) OVER w AS prev_to, row_number() OVER w AS rn,
+           min(pv.effective_from) OVER p AS first_from, bool_or(pv.effective_to IS NULL) OVER p AS open_end,
+           max(pv.effective_to) OVER p AS last_to
+      FROM rules.param_value pv WHERE pv.id = ANY (NEW.value_ids)
+    WINDOW w AS (PARTITION BY pv.key, pv.qualifier ORDER BY pv.effective_from), p AS (PARTITION BY pv.key, pv.qualifier)) g
+   WHERE (g.rn > 1 AND g.prev_to IS DISTINCT FROM g.effective_from)
+      OR g.first_from > NEW.as_of_from OR NOT (g.open_end OR g.last_to > NEW.as_of_to)
+      OR (g.effective_to IS NOT NULL AND g.effective_to <= NEW.as_of_from) OR g.effective_from > NEW.as_of_to
+   LIMIT 1;
+  IF v_bad IS NOT NULL THEN
+    PERFORM core.raise_hk('HK_RULES_SNAPSHOT_COVERAGE', format('values of %s do not cover %s..%s exactly once', v_bad, NEW.as_of_from, NEW.as_of_to));
+  END IF;
+  -- محتوا = محتوای متعارف ساخته‌شده از همان ردیف‌ها؛ '{}' یعنی «پایگاه داده بسازد» (RV-CMP-04)
+  v_content := rules.snapshot_content(NEW.value_ids, NEW.override_ids);
+  IF NEW.content = '{}'::jsonb THEN
+    NEW.content := v_content;
+  ELSIF NEW.content IS DISTINCT FROM v_content THEN
+    PERFORM core.raise_hk('HK_RULES_SNAPSHOT_CONTENT', 'snapshot content differs from the cited parameter values and overrides');
   END IF;
   NEW.content_sha256 := sha256(convert_to(jsonb_build_object(
       'calculator', NEW.calculator, 'engine', NEW.engine_version, 'company', NEW.company_id,
@@ -881,24 +1042,35 @@ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
   SELECT CASE WHEN p ~ '^[0-9A-Fa-f]{1,15}$' THEN ('x' || lpad(p, 16, '0'))::bit(64)::bigint END
 $$;
 
--- رشتهٔ دهدهی ورودی Verhoeff: toDecimal(MEMORY_ID) + pad(day,6) + pad(serial,12)؛ حرف → کد ASCII
+-- zfill پایتون: فقط وقتی کوتاه‌تر است صفر جلو می‌گیرد و هرگز رقم نمی‌برد (lpad رشتهٔ بلندتر را کوتاه می‌کند؛ RV-IT-12/CR-MG22)
+CREATE OR REPLACE FUNCTION tax.zfill(p text, p_width integer) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+  SELECT CASE WHEN length(p) < p_width THEN lpad(p, p_width, '0') ELSE p END
+$$;
+
+-- رشتهٔ دهدهی ورودی Verhoeff: toDecimal(MEMORY_ID) + zfill(day,6) + zfill(serial,12)؛ حرف → کد ASCII.
+-- روز تا 0xFFFFF (۷ رقم دهدهی) و سریال تا 0xFFFFFFFFFF (۱۳ رقم) در بازهٔ قالب‌اند و کامل می‌آیند.
 CREATE OR REPLACE FUNCTION tax.taxid_control_string(p_memory text, p_day integer, p_serial bigint) RETURNS text
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
   SELECT string_agg(CASE WHEN ch ~ '[0-9]' THEN ch ELSE ascii(ch)::text END, '' ORDER BY ord)
-         || lpad(p_day::text, 6, '0') || lpad(p_serial::text, 12, '0')
+         || tax.zfill(p_day::text, 6) || tax.zfill(p_serial::text, 12)
     FROM unnest(string_to_array(upper(p_memory), NULL)) WITH ORDINALITY AS t(ch, ord)
 $$;
 
+-- بیرون از بازهٔ قالب (روز > 0xFFFFF، سریال > 0xFFFFFFFFFF، منفی، حافظهٔ غیر ۶ نویسه‌ای) NULL برمی‌گرداند، نه taxid بریده
 CREATE OR REPLACE FUNCTION tax.taxid_build(p_memory text, p_day integer, p_serial bigint) RETURNS text
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-  SELECT upper(p_memory) || lpad(upper(to_hex(p_day)), 5, '0') || lpad(upper(to_hex(p_serial)), 10, '0')
-         || tax.verhoeff_check_digit(tax.taxid_control_string(p_memory, p_day, p_serial))::text
+  SELECT CASE WHEN length(p_memory) = 6 AND p_day BETWEEN 0 AND 1048575 AND p_serial BETWEEN 0 AND 1099511627775 THEN
+           upper(p_memory) || lpad(upper(to_hex(p_day)), 5, '0') || lpad(upper(to_hex(p_serial)), 10, '0')
+           || tax.verhoeff_check_digit(tax.taxid_control_string(p_memory, p_day, p_serial))::text
+         END
 $$;
 
+-- همیشه true/false (هرگز NULL) تا در CHECK «نامعلوم» به‌جای «نامعتبر» نگذرد
 CREATE OR REPLACE FUNCTION tax.taxid_valid(p text) RETURNS boolean
 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
-  SELECT p IS NOT NULL AND p ~ '^[0-9A-Z]{22}$'
-         AND p = tax.taxid_build(substr(p, 1, 6), tax.hex_to_bigint(substr(p, 7, 5))::integer, tax.hex_to_bigint(substr(p, 12, 10)))
+  SELECT coalesce(p IS NOT NULL AND p ~ '^[0-9A-Z]{22}$'
+         AND p = tax.taxid_build(substr(p, 1, 6), tax.hex_to_bigint(substr(p, 7, 5))::integer, tax.hex_to_bigint(substr(p, 12, 10))), false)
 $$;
 
 -- سهم مالیات/عوارض سطر مؤدیان: همیشه قطع (truncate)، نه گرد کردن (RC_IITP؛ خطای 0204501)
@@ -933,6 +1105,28 @@ CREATE TABLE IF NOT EXISTS tax.taxpayer_profile (
 SELECT core.enable_tenant_rls('tax.taxpayer_profile');
 DROP TRIGGER IF EXISTS trg_touch ON tax.taxpayer_profile;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON tax.taxpayer_profile FOR EACH ROW EXECUTE FUNCTION core.touch_row();
+
+-- شعبه‌های ثبت‌شدهٔ فروشنده در مؤدیان (کد چهاررقمی sbc) برای هر شعبهٔ هسته، تاریخ‌دار (RV-X3-09؛ پژوهش ۰۳ پروفایل کمینهٔ مؤدی).
+-- صورتحساب شعبه کد همان شعبه را می‌گیرد؛ کد پیش‌فرض پروفایل فقط برای شرکت بی‌شعبهٔ ثبت‌شده است (tax.issue_guard).
+CREATE TABLE IF NOT EXISTS tax.taxpayer_branch (
+  tenant_id     uuid NOT NULL REFERENCES core.tenant(id),
+  id            uuid NOT NULL DEFAULT uuidv7(),
+  company_id    uuid NOT NULL,
+  branch_id     uuid NOT NULL,
+  sbc           text NOT NULL CHECK (sbc ~ '^[0-9]{4}$'),
+  valid_from    date NOT NULL,
+  valid_to      date,                                   -- انحصاری
+  basis_ref     text CHECK (char_length(basis_ref) BETWEEN 2 AND 200),   -- شمارهٔ ثبت شعبه در کارپوشه
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, branch_id) REFERENCES core.branch(tenant_id, company_id, id),
+  CHECK (valid_to IS NULL OR valid_to > valid_from),
+  -- یک کد برای هر شعبه در هر زمان، و یک شعبه برای هر کد در هر زمان
+  CONSTRAINT taxpayer_branch_one_code EXCLUDE USING gist (tenant_id WITH =, branch_id WITH =, daterange(valid_from, valid_to, '[)') WITH &&),
+  CONSTRAINT taxpayer_branch_one_branch EXCLUDE USING gist (tenant_id WITH =, company_id WITH =, sbc WITH =, daterange(valid_from, valid_to, '[)') WITH &&)
+);
+SELECT core.enable_tenant_rls('tax.taxpayer_branch');
 
 -- وضعیت فراخوان فروشنده در ارزش افزوده (تاریخ‌دار؛ «فراخوان‌نشده» ⇒ vra = ۰ طبق قاعدهٔ ۷ جدول ۴۳)
 CREATE TABLE IF NOT EXISTS tax.vat_registration (
@@ -1189,13 +1383,22 @@ CREATE TABLE IF NOT EXISTS tax.invoice (
   -- برگشت از فروش برای صادرات، بارنامه و بورس مجاز نیست
   CONSTRAINT invoice_return_pattern CHECK (subject <> 4 OR pattern NOT IN (7,8,11)),
   CONSTRAINT invoice_registered CHECK ((status = 'registered') = (registered_issue_id IS NOT NULL)),
-  CONSTRAINT invoice_withdrawn CHECK ((status = 'withdrawn') = (withdrawn_at IS NOT NULL AND char_length(btrim(coalesce(withdrawn_reason, ''))) >= 5))
+  CONSTRAINT invoice_withdrawn CHECK ((status = 'withdrawn') = (withdrawn_at IS NOT NULL AND char_length(btrim(coalesce(withdrawn_reason, ''))) >= 5)),
+  -- هدف FK چهارستونی sales.invoice (tenant_id, company_id, tax_document_id, id) در 99 (RV-IT-SALESTAX): فاکتور فروش A
+  -- فقط به سند مالیاتی‌ای اشاره می‌کند که sales_invoice_id آن خود A است؛ دو اشاره هرگز ناسازگار نمی‌شوند
+  CONSTRAINT invoice_sales_link_key UNIQUE (tenant_id, company_id, id, sales_invoice_id)
 );
 SELECT core.enable_tenant_rls('tax.invoice');
-CREATE UNIQUE INDEX IF NOT EXISTS invoice_one_per_sales_subject ON tax.invoice (tenant_id, sales_invoice_id, subject) WHERE sales_invoice_id IS NOT NULL;
--- زنجیرهٔ اصلاحی خطی و یک ابطالی برای هر نسخه
-CREATE UNIQUE INDEX IF NOT EXISTS invoice_one_successor ON tax.invoice (tenant_id, ref_invoice_id)
-  WHERE subject IN (2,3) AND status <> 'withdrawn';
+-- سند withdrawn هرگز ثبت نشده (withdraw پس از ارسال ممنوع است)، پس فاکتور فروش می‌تواند سند تازه بگیرد (RV-CMP-22)
+DROP INDEX IF EXISTS tax.invoice_one_per_sales_subject;
+CREATE UNIQUE INDEX IF NOT EXISTS invoice_one_live_per_sales_subject ON tax.invoice (tenant_id, sales_invoice_id, subject)
+  WHERE sales_invoice_id IS NOT NULL AND status <> 'withdrawn';
+-- زنجیرهٔ مرجع خطی: هر نسخه حداکثر یک جانشین زنده دارد — اصلاحی، ابطالی یا برگشت از فروش (RV-CMP-05). پس برگشت دوم،
+-- اصلاحی یا ابطالی پس از برگشت باید به سرِ زنجیره (همان برگشت ثبت‌شده) اشاره کند و برگشت‌های هم‌زمان روی یک سر پشت این
+-- ایندکس صف می‌شوند؛ چون هر برگشت با سطرهای «مرجعِ خودش» سنجیده می‌شود، مقدار برگشتی تجمعی هرگز از مقدار فروش بیشتر نمی‌شود.
+DROP INDEX IF EXISTS tax.invoice_one_successor;
+CREATE UNIQUE INDEX IF NOT EXISTS invoice_one_live_successor ON tax.invoice (tenant_id, ref_invoice_id)
+  WHERE subject IN (2,3,4) AND status <> 'withdrawn';
 CREATE INDEX IF NOT EXISTS invoice_status_idx ON tax.invoice (tenant_id, company_id, status);
 
 -- نسخهٔ صادرشده: taxid، سریال، payload امضاشدنی (تغییرناپذیر)، وضعیت ارسال
@@ -1230,6 +1433,7 @@ CREATE TABLE IF NOT EXISTS tax.invoice_issue (
   cap                       core.amount CHECK (cap >= 0),
   insp                      core.amount CHECK (insp >= 0),
   seller_tin                text NOT NULL CHECK (seller_tin ~ '^([0-9]{11}|[0-9]{14})$'),
+  branch_id                 uuid,                                                -- شعبهٔ هستهٔ صادرکننده (برای sbc و ممیزی؛ RV-X3-09)
   seller_branch_code        text CHECK (seller_branch_code ~ '^[0-9]{4}$'),
   buyer_type                smallint CHECK (buyer_type IN (1,2,3,4)),                   -- tob
   buyer_national_id         text CHECK (buyer_national_id ~ '^[0-9]{10,12}$'),          -- bid
@@ -1273,6 +1477,7 @@ CREATE TABLE IF NOT EXISTS tax.invoice_issue (
   FOREIGN KEY (tenant_id, device_id) REFERENCES core.device(tenant_id, id),
   FOREIGN KEY (tenant_id, rule_snapshot_id) REFERENCES rules.calc_snapshot(tenant_id, id),
   FOREIGN KEY (tenant_id, jws_attachment_id) REFERENCES core.attachment(tenant_id, id),
+  FOREIGN KEY (tenant_id, company_id, branch_id) REFERENCES core.branch(tenant_id, company_id, id),
   -- taxid = حافظه + روز UTC (Hex ۵) + سریال (Hex ۱۰) + رقم کنترلی Verhoeff رسمی
   CONSTRAINT issue_taxid_valid CHECK (tax.taxid_valid(taxid)),
   CONSTRAINT issue_taxid_memory CHECK (substr(taxid, 1, 6) = memory_id),
@@ -1377,8 +1582,8 @@ BEGIN
       END IF;
       -- مرجع باید سرِ زنجیره باشد: اصلاحی فعال یا ابطالی فعال روی آن نباشد
       IF EXISTS (SELECT 1 FROM tax.invoice x WHERE x.tenant_id = NEW.tenant_id AND x.ref_invoice_id = r.id
-                    AND x.subject IN (2,3) AND x.status <> 'withdrawn') THEN
-        PERFORM core.raise_hk('HK_TAX_REF_NOT_HEAD', 'refer to the latest version of the invoice (it has a corrective or cancellation)');
+                    AND x.subject IN (2,3,4) AND x.status <> 'withdrawn') THEN
+        PERFORM core.raise_hk('HK_TAX_REF_NOT_HEAD', 'refer to the latest version of the invoice (it has a corrective, cancellation or return)');
       END IF;
     END IF;
     RETURN NEW;
@@ -1390,8 +1595,13 @@ BEGIN
   IF NEW.status = OLD.status THEN RETURN NEW; END IF;
   IF NOT ((OLD.status, NEW.status) IN (('pending','in_progress'),('in_progress','registered'),('in_progress','rejected'),
                                         ('rejected','in_progress'),('pending','withdrawn'),('rejected','withdrawn'),
-                                        ('in_progress','withdrawn'))) THEN
+                                        ('in_progress','withdrawn'),('in_progress','pending'))) THEN
     PERFORM core.raise_hk('HK_TAX_INVOICE_TRANSITION', format('%s → %s is not allowed', OLD.status, NEW.status));
+  END IF;
+  -- بازگشت به pending فقط وقتی هیچ نسخهٔ در جریان یا موفقی نمانده (نسخهٔ کنارگذاشته‌شده پیش از امضا یا پس از not_received؛ RV-CMP-22)
+  IF NEW.status = 'pending' AND EXISTS (SELECT 1 FROM tax.invoice_issue i WHERE i.tenant_id = NEW.tenant_id AND i.invoice_id = NEW.id
+         AND i.status IN ('prepared','signed','sent','unknown','not_received','success')) THEN
+    PERFORM core.raise_hk('HK_TAX_INVOICE_TRANSITION', 'a document returns to pending only when no issue is open or successful');
   END IF;
   IF NEW.status = 'registered' AND NOT EXISTS (SELECT 1 FROM tax.invoice_issue i WHERE i.tenant_id = NEW.tenant_id
          AND i.id = NEW.registered_issue_id AND i.invoice_id = NEW.id AND i.status = 'success') THEN
@@ -1452,6 +1662,15 @@ BEGIN
       PERFORM core.raise_hk('HK_TAX_ISSUE_STATE', 'issues start prepared');
     ELSIF m.status <> 'active' THEN
       PERFORM core.raise_hk('HK_TAX_MEMORY_NOT_ACTIVE', format('memory %s is %s', m.memory_id, m.status));
+    END IF;
+    -- کد شعبهٔ فروشنده (sbc): اگر شرکت شعبهٔ ثبت‌شده در مؤدیان دارد، صورتحساب غیرمهاجرتی شعبهٔ هسته دارد و sbc همان کد ثبت‌شدهٔ
+    -- آن شعبه در تاریخ صدور است؛ کد پیش‌فرض پروفایل فقط برای شرکت بی‌شعبهٔ ثبت‌شده (RV-X3-09)
+    IF NEW.allocation <> 'migration' AND EXISTS (SELECT 1 FROM tax.taxpayer_branch b WHERE b.tenant_id = NEW.tenant_id AND b.company_id = NEW.company_id) THEN
+      IF NEW.branch_id IS NULL OR NEW.seller_branch_code IS DISTINCT FROM (
+           SELECT b.sbc FROM tax.taxpayer_branch b WHERE b.tenant_id = NEW.tenant_id AND b.branch_id = NEW.branch_id
+              AND b.valid_from <= NEW.issue_date AND (b.valid_to IS NULL OR NEW.issue_date < b.valid_to)) THEN
+        PERFORM core.raise_hk('HK_TAX_BRANCH_CODE', 'seller branch code must be the registered code of the issuing branch on the issue date');
+      END IF;
     END IF;
     -- تاریخچهٔ منتقل‌شده: سریال‌های قبلی زیر start_value سری (سریال تازه = بیشینهٔ قبلی + ۱)
     IF NEW.allocation = 'migration' THEN
@@ -1538,6 +1757,11 @@ BEGIN
     UPDATE tax.invoice SET status = 'registered', registered_issue_id = NEW.id WHERE tenant_id = NEW.tenant_id AND id = NEW.invoice_id;
   ELSIF NEW.status = 'failed' AND OLD.status <> 'failed' THEN
     UPDATE tax.invoice SET status = 'rejected' WHERE tenant_id = NEW.tenant_id AND id = NEW.invoice_id AND status = 'in_progress';
+  ELSIF NEW.status = 'abandoned' AND OLD.status <> 'abandoned' THEN
+    -- نسخهٔ کنارگذاشته‌شده بدون withdraw سند: سند به pending برمی‌گردد تا reissue با issue_no + 1 و سریال تازه ممکن باشد (RV-CMP-22)
+    UPDATE tax.invoice SET status = 'pending' WHERE tenant_id = NEW.tenant_id AND id = NEW.invoice_id AND status = 'in_progress'
+       AND NOT EXISTS (SELECT 1 FROM tax.invoice_issue i WHERE i.tenant_id = NEW.tenant_id AND i.invoice_id = NEW.invoice_id AND i.id <> NEW.id
+                          AND i.status IN ('prepared','signed','sent','unknown','not_received','success'));
   END IF;
   RETURN NULL;
 END $$;
@@ -1859,6 +2083,7 @@ CREATE TABLE IF NOT EXISTS tax.purchase_entry (
   credit_eligibility     text NOT NULL DEFAULT 'pending' CHECK (credit_eligibility IN ('pending','eligible','ineligible','paper_grace')),
   eligibility_reason     text,
   eligibility_snapshot_id uuid,
+  reverses_entry_id      uuid,                    -- برگشت/ابطال ← ثبت خرید اصلی (RV-CMP-15)
   vat_return_id          uuid,
   created_at             timestamptz NOT NULL DEFAULT now(),
   updated_at             timestamptz NOT NULL DEFAULT now(),
@@ -1869,11 +2094,15 @@ CREATE TABLE IF NOT EXISTS tax.purchase_entry (
   FOREIGN KEY (tenant_id, company_id) REFERENCES core.company(tenant_id, id),
   FOREIGN KEY (tenant_id, supplier_party_id) REFERENCES parties.party(tenant_id, id),
   FOREIGN KEY (tenant_id, eligibility_snapshot_id) REFERENCES rules.calc_snapshot(tenant_id, id),
+  FOREIGN KEY (tenant_id, reverses_entry_id) REFERENCES tax.purchase_entry(tenant_id, id),
   CONSTRAINT purchase_entry_sign CHECK ((entry_kind = 'invoice') = (sign = 1)),
+  -- برگشت و ابطال به ثبت اصلی اشاره دارند (جز تاریخچهٔ منتقل‌شده که اصلش در سامانه نیست)
+  CONSTRAINT purchase_entry_reversal CHECK ((entry_kind = 'invoice') = (reverses_entry_id IS NULL) OR (source_module = 'migration' AND entry_kind <> 'invoice')),
   CONSTRAINT purchase_entry_taxid CHECK (moadian_taxid IS NULL OR tax.taxid_valid(moadian_taxid)),
   CONSTRAINT purchase_entry_registered CHECK (moadian_status IN ('unknown','not_registered') OR moadian_taxid IS NOT NULL),
   -- اعتبار خرید فقط با صورتحساب نوع ۱ ثبت‌شده و تأییدشده (صریح یا سیستمی)؛ «مهلت کاغذی» تابع قاعدهٔ تاریخ‌دار
-  CONSTRAINT purchase_entry_eligible CHECK (credit_eligibility <> 'eligible'
+  -- ثبت مثبت: اعتبار فقط با نوع ۱ ثبت‌شده و تأییدشده؛ برگشت/ابطال (منفی) شمارش‌پذیری را از ثبت اصلی به ارث می‌برد (قید deferred)
+  CONSTRAINT purchase_entry_eligible CHECK (credit_eligibility <> 'eligible' OR sign = -1
         OR (moadian_inv_type = 1 AND moadian_status IN ('approved','systemic_approved'))),
   CONSTRAINT purchase_entry_decided CHECK (credit_eligibility = 'pending'
         OR (eligibility_reason IS NOT NULL AND eligibility_snapshot_id IS NOT NULL))
@@ -1894,6 +2123,9 @@ CREATE TABLE IF NOT EXISTS tax.threshold_monitor (
   limit_basis        jsonb NOT NULL CHECK (jsonb_typeof(limit_basis) = 'object'),   -- {prior_year_sales, multiplier, source}
   rule_snapshot_id   uuid NOT NULL,
   warn_ratio         numeric(5,4) NOT NULL CHECK (warn_ratio > 0 AND warn_ratio < 1),
+  -- جمع ثبت‌شده‌ها و جمع ابطال/برگشت‌های ثبت‌شده هر دو فقط بالا می‌روند؛ مبنای سقف = خالص آن‌ها (RV-CMP-24)
+  gross_registered     core.amount NOT NULL DEFAULT 0 CHECK (gross_registered >= 0),
+  cancelled_registered core.amount NOT NULL DEFAULT 0 CHECK (cancelled_registered >= 0),
   cumulative_amount  core.amount NOT NULL DEFAULT 0 CHECK (cumulative_amount >= 0),
   status             text NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','warning','exceeded')),
   crossed_on         date,
@@ -1912,7 +2144,9 @@ CREATE TABLE IF NOT EXISTS tax.threshold_monitor (
   CONSTRAINT threshold_status CHECK (status = CASE WHEN cumulative_amount > limit_amount THEN 'exceeded'
                                                    WHEN cumulative_amount >= limit_amount * warn_ratio THEN 'warning'
                                                    ELSE 'ok' END),
-  CONSTRAINT threshold_crossed CHECK ((status = 'exceeded') = (crossed_on IS NOT NULL)),
+  CONSTRAINT threshold_net CHECK (cumulative_amount = gross_registered - cancelled_registered),
+  -- تاریخ عبور نخستین عبور است و با ابطال بعدی پاک نمی‌شود (پیامد قانونی ابطال پس از عبور: پرسش باز Q-CMP-15)
+  CONSTRAINT threshold_crossed CHECK ((status = 'exceeded') <= (crossed_on IS NOT NULL)),
   CONSTRAINT threshold_consequence CHECK (consequence_from IS NULL OR crossed_on IS NOT NULL AND consequence_from >= crossed_on)
 );
 SELECT core.enable_tenant_rls('tax.threshold_monitor');
@@ -1923,8 +2157,9 @@ CREATE OR REPLACE FUNCTION tax.threshold_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN PERFORM core.raise_hk('HK_TAX_THRESHOLD_IMMUTABLE', 'threshold history is kept'); END IF;
-  IF NEW.cumulative_amount < OLD.cumulative_amount AND NEW.limit_amount = OLD.limit_amount THEN
-    PERFORM core.raise_hk('HK_TAX_THRESHOLD_BACKWARD', 'cumulative sales only grow (cancellations are separate documents)');
+  -- مستقل از تغییر سقف: ثبت‌شده‌ها و ابطال‌های ثبت‌شده هرگز کم نمی‌شوند (RV-CMP-24)
+  IF NEW.gross_registered < OLD.gross_registered OR NEW.cancelled_registered < OLD.cancelled_registered THEN
+    PERFORM core.raise_hk('HK_TAX_THRESHOLD_BACKWARD', 'registered sales and registered cancellations only grow');
   END IF;
   IF OLD.crossed_on IS NOT NULL AND NEW.crossed_on IS DISTINCT FROM OLD.crossed_on THEN
     PERFORM core.raise_hk('HK_TAX_THRESHOLD_IMMUTABLE', 'the crossing date is fixed once recorded');
@@ -2029,6 +2264,12 @@ BEGIN
        (('draft','computed'),('computed','draft'),('computed','filed'),('filed','superseded'))) THEN
     PERFORM core.raise_hk('HK_TAX_RETURN_TRANSITION', format('%s → %s is not allowed', OLD.status, NEW.status));
   END IF;
+  -- تسلیم: اعتبار ورودی ذخیره‌شده = Σ علامت × مالیات ثبت‌های پیوندخورده‌ای که در اعتبار شمرده می‌شوند (RV-CMP-06، RV-CMP-15)
+  IF NEW.status = 'filed' AND OLD.status = 'computed' AND NEW.input_vat_eligible IS DISTINCT FROM
+       (SELECT coalesce(sum(e.sign * e.vat_amount), 0) FROM tax.purchase_entry e WHERE e.tenant_id = NEW.tenant_id
+           AND e.vat_return_id = NEW.id AND e.credit_eligibility IN ('eligible','paper_grace')) THEN
+    PERFORM core.raise_hk('HK_TAX_RETURN_INPUT_MISMATCH', 'eligible input VAT differs from the linked purchase register entries');
+  END IF;
   RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON tax.vat_return;
@@ -2067,12 +2308,46 @@ BEGIN
       END IF;
     END IF;
   END IF;
+  IF NEW.vat_return_id IS NOT NULL AND (TG_OP = 'INSERT' OR NEW.vat_return_id IS DISTINCT FROM OLD.vat_return_id) THEN
+    SELECT status INTO v_status FROM tax.vat_return WHERE tenant_id = NEW.tenant_id AND id = NEW.vat_return_id;
+    -- اظهارنامهٔ تسلیم‌شده (و هر نسخهٔ بسته) ثبت تازه نمی‌پذیرد؛ رقم‌های ذخیره‌شده‌اش با دفتر خرید پیوندخورده نمی‌خواند (RV-CMP-06)
+    IF v_status NOT IN ('draft','computed') THEN
+      PERFORM core.raise_hk('HK_TAX_PURCHASE_LOCKED', format('entries join only a draft/computed VAT return (this one is %s)', v_status));
+    END IF;
+  END IF;
   IF NEW.vat_return_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM tax.vat_return r WHERE r.tenant_id = NEW.tenant_id
         AND r.id = NEW.vat_return_id AND r.company_id = NEW.company_id AND r.period_key = NEW.period_key) THEN
     PERFORM core.raise_hk('HK_TAX_PURCHASE_PERIOD', 'entry can only join the VAT return of its own company and quarter');
   END IF;
   RETURN NEW;
 END $$;
+
+-- برگشت/ابطال خرید (RV-CMP-15): به ثبت مثبت همان شرکت و تأمین‌کننده اشاره می‌کند؛ جمع برگشت‌ها از اصل بیشتر نیست؛ و «شمارش در
+-- اعتبار» (eligible یا paper_grace) آن همان اصل است، پس برگشتِ اعتبارِ گرفته‌شده هرگز از ورودی جا نمی‌ماند. برگشت در فصل خودش با
+-- علامت منفی شمرده می‌شود. همگام‌سازی: وقتی شمارش‌پذیری اصل عوض می‌شود سرویس برگشت‌هایش را در همان تراکنش به‌روز می‌کند.
+CREATE OR REPLACE FUNCTION tax.purchase_entry_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE e tax.purchase_entry; o tax.purchase_entry; v_sum numeric;
+BEGIN
+  FOR e IN SELECT x.* FROM tax.purchase_entry x
+            WHERE x.tenant_id = NEW.tenant_id AND (x.id = NEW.id OR x.reverses_entry_id = NEW.id) AND x.reverses_entry_id IS NOT NULL LOOP
+    SELECT * INTO o FROM tax.purchase_entry WHERE tenant_id = e.tenant_id AND id = e.reverses_entry_id;
+    IF o.entry_kind <> 'invoice' OR o.company_id <> e.company_id OR o.supplier_party_id <> e.supplier_party_id THEN
+      PERFORM core.raise_hk('HK_TAX_PURCHASE_REVERSAL', 'a return/cancellation reverses a purchase invoice entry of the same company and supplier');
+    END IF;
+    IF (e.credit_eligibility IN ('eligible','paper_grace')) <> (o.credit_eligibility IN ('eligible','paper_grace')) THEN
+      PERFORM core.raise_hk('HK_TAX_PURCHASE_REVERSAL', 'a return/cancellation counts toward input credit exactly when its original does');
+    END IF;
+    SELECT coalesce(sum(vat_amount), 0) INTO v_sum FROM tax.purchase_entry WHERE tenant_id = o.tenant_id AND reverses_entry_id = o.id;
+    IF v_sum > o.vat_amount THEN
+      PERFORM core.raise_hk('HK_TAX_PURCHASE_REVERSAL', format('returns/cancellations reverse %s VAT, more than the original %s', v_sum, o.vat_amount));
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_verify ON tax.purchase_entry;
+CREATE CONSTRAINT TRIGGER trg_verify AFTER INSERT OR UPDATE ON tax.purchase_entry
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION tax.purchase_entry_verify();
 DROP TRIGGER IF EXISTS trg_guard ON tax.purchase_entry;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON tax.purchase_entry FOR EACH ROW EXECUTE FUNCTION tax.purchase_entry_guard();
 DROP TRIGGER IF EXISTS trg_touch ON tax.purchase_entry;
@@ -2113,6 +2388,11 @@ CREATE TABLE IF NOT EXISTS tax.legal_report (
   FOREIGN KEY (tenant_id, company_id, superseded_by) REFERENCES tax.legal_report(tenant_id, company_id, id),
   CHECK (period_end > period_start),
   CHECK (split_part(format_key, '.', 1) = 'tax'),
+  -- کلید قالب همان نوع گزارش است (RV-CMP-18)
+  CONSTRAINT legal_report_format_kind CHECK (format_key = CASE report_kind WHEN 'art169_quarterly' THEN 'tax.art169.format'
+                                                                     WHEN 'vat_summary' THEN 'tax.vat_summary.format'
+                                                                     WHEN 'sales_register' THEN 'tax.sales_register.format'
+                                                                     WHEN 'purchase_register' THEN 'tax.purchase_register.format' END),
   CHECK ((status = 'submitted') = (submitted_at IS NOT NULL AND submission_ref IS NOT NULL) OR status = 'superseded'),
   CHECK ((status = 'superseded') = (superseded_by IS NOT NULL))
 );
@@ -2140,6 +2420,20 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON tax.legal_report;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON tax.legal_report FOR EACH ROW EXECUTE FUNCTION tax.legal_report_guard();
+
+-- نسخهٔ قالب باید پروفایلِ همان کلید در snapshot تولید باشد: فرادادهٔ فایل می‌گوید کدام چیدمان نسخه‌دار آن را ساخت (RV-CMP-18).
+-- AFTER INSERT تا CHECK «کلید = نوع گزارش» پیش از آن سنجیده شود.
+CREATE OR REPLACE FUNCTION tax.legal_report_format_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF rules.snapshot_value((SELECT content FROM rules.calc_snapshot WHERE tenant_id = NEW.tenant_id AND id = NEW.rule_snapshot_id),
+                          NEW.format_key, NEW.format_version, NEW.period_end) IS NULL THEN
+    PERFORM core.raise_hk('HK_TAX_REPORT_FORMAT', format('format %s[%s] is not in the report snapshot', NEW.format_key, NEW.format_version));
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_format ON tax.legal_report;
+CREATE TRIGGER trg_format AFTER INSERT ON tax.legal_report FOR EACH ROW EXECUTE FUNCTION tax.legal_report_format_check();
 
 -- ویوی منتشرشده برای reports/pos/دستیار: وضعیت مؤدیان هر سند فروش (فقط خواندن)
 CREATE OR REPLACE VIEW tax.v_sales_moadian_status WITH (security_invoker = true) AS
@@ -2345,6 +2639,41 @@ SELECT core.enable_tenant_rls('payroll.contract');
 DROP TRIGGER IF EXISTS trg_touch ON payroll.contract;
 CREATE TRIGGER trg_touch BEFORE UPDATE ON payroll.contract FOR EACH ROW EXECUTE FUNCTION core.touch_row();
 
+-- شرایط قرارداد امضاشده ثابت است (کف مزد، نرخ سخت و زیان‌آور و کارگاه حکم‌های تأییدشده به آن تکیه دارند؛ RV-CMP-16):
+-- تغییر نوع استخدام، ساعت، سختی کار، کارگاه یا تاریخ شروع = قرارداد تازه. فقط پایان (end_date/ended) به جلو.
+CREATE OR REPLACE FUNCTION payroll.contract_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_changed text[];
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.status <> 'draft' THEN PERFORM core.raise_hk('HK_PAYROLL_CONTRACT_IMMUTABLE', 'only draft contracts can be deleted'); END IF;
+    RETURN OLD;
+  END IF;
+  IF TG_OP = 'INSERT' THEN RETURN NEW; END IF;
+  v_changed := rules.changed_columns(to_jsonb(OLD), to_jsonb(NEW));
+  IF OLD.status <> 'draft' AND v_changed && ARRAY['company_id','employee_id','workshop_id','contract_no','kind','employment_type',
+                                                  'weekly_hours','is_hard_job','is_shift_worker','start_date','signed_on'] THEN
+    PERFORM core.raise_hk('HK_PAYROLL_CONTRACT_IMMUTABLE', format('terms of a signed contract are fixed (%s); sign a new contract',
+                                                                 array_to_string(v_changed, ',')));
+  END IF;
+  IF OLD.status IN ('ended','cancelled') AND NOT (v_changed <@ ARRAY['attachment_id','updated_at','row_version']) THEN
+    PERFORM core.raise_hk('HK_PAYROLL_CONTRACT_IMMUTABLE', format('a %s contract cannot change', OLD.status));
+  END IF;
+  IF NEW.status <> OLD.status AND NOT ((OLD.status, NEW.status) IN (('draft','active'),('draft','cancelled'),('active','ended'))) THEN
+    PERFORM core.raise_hk('HK_PAYROLL_CONTRACT_TRANSITION', format('%s → %s is not allowed', OLD.status, NEW.status));
+  END IF;
+  IF NEW.end_date IS DISTINCT FROM OLD.end_date AND NEW.end_date IS NOT NULL AND (
+       EXISTS (SELECT 1 FROM payroll.decree d WHERE d.tenant_id = NEW.tenant_id AND d.contract_id = NEW.id
+                  AND d.status = 'approved' AND d.effective_from >= NEW.end_date)
+    OR EXISTS (SELECT 1 FROM payroll.payslip p JOIN payroll.run r ON r.tenant_id = p.tenant_id AND r.id = p.run_id
+                WHERE p.tenant_id = NEW.tenant_id AND p.contract_id = NEW.id AND r.status <> 'cancelled' AND r.period_end >= NEW.end_date)) THEN
+    PERFORM core.raise_hk('HK_PAYROLL_CONTRACT_END', 'the end date precedes approved decrees or payslips of this contract');
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON payroll.contract;
+CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON payroll.contract FOR EACH ROW EXECUTE FUNCTION payroll.contract_guard();
+
 CREATE TABLE IF NOT EXISTS payroll.pay_item (
   tenant_id            uuid NOT NULL REFERENCES core.tenant(id),
   id                   uuid NOT NULL DEFAULT uuidv7(),
@@ -2436,7 +2765,7 @@ SELECT core.enable_tenant_rls('payroll.decree_item');
 -- کف قانونی مزد در تأیید حکم (مقدار مؤثر rules با جایگزین کارگاهی/پیمان دسته‌جمعی)
 CREATE OR REPLACE FUNCTION payroll.decree_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE c payroll.contract; v_min jsonb; v_week jsonb; v_div jsonb; v_floor numeric; v_changed text[];
+DECLARE c payroll.contract; v_min jsonb; v_week numeric; v_div numeric; v_floor numeric; v_changed text[]; v_cur text;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     IF OLD.status <> 'draft' THEN PERFORM core.raise_hk('HK_PAYROLL_DECREE_IMMUTABLE', 'only draft decrees can be deleted'); END IF;
@@ -2466,20 +2795,29 @@ BEGIN
   END IF;
   IF NEW.status = 'approved' AND OLD.status = 'draft' THEN
     IF c.status <> 'active' THEN PERFORM core.raise_hk('HK_PAYROLL_DECREE_CONTRACT', 'contract is not active'); END IF;
+    -- کف همیشه سنجیده می‌شود؛ واحد پول مقدار قاعده (IRR/IRT/IRR_NEW) به ریال نرمال می‌شود و ارز پایهٔ شرکت باید ریال باشد،
+    -- وگرنه خطای صریح (نه پرش بی‌صدا؛ RV-CMP-03). ردیف ارز پس از حذف چهار صفر در C-L10 می‌آید.
+    SELECT base_currency INTO v_cur FROM core.company WHERE tenant_id = NEW.tenant_id AND id = NEW.company_id;
+    IF v_cur IS DISTINCT FROM 'IRR' THEN
+      PERFORM core.raise_hk('HK_RULES_UNIT_UNSUPPORTED', format('the statutory wage floor is defined in IRR; company base currency is %s', v_cur));
+    END IF;
+    -- مزد پایه: مقدار مؤثر (پیمان دسته‌جمعی کارگاهی یا سیاست بالاتر از کف؛ کف در زمان ارزیابی اعمال می‌شود، RV-CMP-01)
     v_min := rules.effective_value('payroll.wage.min_daily', NEW.effective_from, '', NEW.company_id, c.workshop_id);
-    IF v_min ->> 'unit' = 'IRR' THEN
-      v_floor := (v_min ->> 'amount')::numeric;
-      IF c.employment_type = 'part_time' THEN
-        v_week := rules.effective_value('payroll.time.weekly_hours', NEW.effective_from, '', NEW.company_id, c.workshop_id);
-        v_floor := v_floor * c.weekly_hours / (v_week ->> 'v')::numeric;
-      ELSIF c.employment_type = 'hourly' THEN
-        v_div := rules.effective_value('payroll.time.hourly_divisor', NEW.effective_from, '', NEW.company_id, c.workshop_id);
-        v_floor := v_floor / (v_div ->> 'v')::numeric;
-      END IF;
-      IF coalesce(NEW.daily_wage, NEW.hourly_wage) < trunc(v_floor, 0) THEN
-        PERFORM core.raise_hk('HK_PAYROLL_BELOW_MIN_WAGE',
-          format('wage %s is below the statutory floor %s on %s', coalesce(NEW.daily_wage, NEW.hourly_wage), trunc(v_floor, 0), NEW.effective_from));
-      END IF;
+    v_floor := rules.value_numeric_on('money', v_min, NEW.effective_from);
+    IF v_floor IS NULL THEN
+      PERFORM core.raise_hk('HK_RULES_UNIT_UNSUPPORTED', format('cannot read the wage floor %s', v_min));
+    END IF;
+    -- تبدیل زمانی فقط با مقدار رسمی (جایگزین شرکت/کارگاه نمی‌تواند کف ساعتی یا پاره‌وقت را پایین بیاورد؛ RV-CMP-02)
+    IF c.employment_type = 'part_time' THEN
+      v_week := rules.value_numeric('decimal', (rules.value_at('payroll.time.weekly_hours', NEW.effective_from)).value);
+      v_floor := v_floor * c.weekly_hours / v_week;
+    ELSIF c.employment_type = 'hourly' THEN
+      v_div := rules.value_numeric('decimal', (rules.value_at('payroll.time.hourly_divisor', NEW.effective_from)).value);
+      v_floor := v_floor / v_div;
+    END IF;
+    IF coalesce(NEW.daily_wage, NEW.hourly_wage) < trunc(v_floor, 0) THEN
+      PERFORM core.raise_hk('HK_PAYROLL_BELOW_MIN_WAGE',
+        format('wage %s is below the statutory floor %s on %s', coalesce(NEW.daily_wage, NEW.hourly_wage), trunc(v_floor, 0), NEW.effective_from));
     END IF;
   END IF;
   IF NEW.status = 'superseded' AND NOT EXISTS (SELECT 1 FROM payroll.decree d WHERE d.tenant_id = NEW.tenant_id AND d.id = NEW.superseded_by
@@ -2804,8 +3142,9 @@ CREATE TABLE IF NOT EXISTS payroll.payslip (
   gross_earnings         core.amount NOT NULL,
   insurable_raw          core.amount NOT NULL CHECK (insurable_raw >= 0),
   insurable_benefits     core.amount NOT NULL CHECK (insurable_benefits >= 0),     -- DSW_MAZ
-  ssi_cap_amount         core.amount NOT NULL CHECK (ssi_cap_amount > 0),
-  ssi_base               core.amount NOT NULL CHECK (ssi_base >= 0),               -- DSW_MASH (سقف‌خورده)
+  ssi_cap_amount         core.amount NOT NULL CHECK (ssi_cap_amount >= 0),         -- cap_multiplier × حداقل مزد رسمی × insurance_days
+  ssi_min_base_amount    core.amount NOT NULL DEFAULT 0 CHECK (ssi_min_base_amount >= 0),   -- حداقل مبنای کسر حق بیمه (قاعدهٔ تاریخ‌دار؛ RV-CMP-14)
+  ssi_base               core.amount NOT NULL CHECK (ssi_base >= 0),               -- DSW_MASH (سقف‌خورده، نه کمتر از حداقل مبنا)
   ssi_rounding           text NOT NULL CHECK (ssi_rounding IN ('half_up','truncate','half_even')),
   ssi_employee_rate      core.rate NOT NULL CHECK (ssi_employee_rate >= 0 AND ssi_employee_rate < 1),
   ssi_employee           core.amount NOT NULL,                                     -- DSW_BIME
@@ -2816,14 +3155,17 @@ CREATE TABLE IF NOT EXISTS payroll.payslip (
   hard_job_rate          core.rate NOT NULL DEFAULT 0 CHECK (hard_job_rate >= 0 AND hard_job_rate < 1),
   hard_job_ssi           core.amount NOT NULL DEFAULT 0,
   total_paid_all         core.amount NOT NULL CHECK (total_paid_all >= 0),         -- DSW_TOTL (مشمول + غیرمشمول)
+  tax_progressive_gross  core.amount NOT NULL DEFAULT 0,                           -- Σ سطرهای earning با رفتار پلکانی/معاف تا سقف (RV-CMP-04)
+  ssi_tax_deduction      core.amount NOT NULL DEFAULT 0 CHECK (ssi_tax_deduction >= 0),   -- سهم کسرشدنی بیمهٔ کارگر از مبنای مالیات
   taxable_income         core.amount NOT NULL CHECK (taxable_income >= 0),         -- مبنای پلکانی ماه
   tax_exempt_amount      core.amount NOT NULL DEFAULT 0 CHECK (tax_exempt_amount >= 0),
   flat_tax_amount        core.amount NOT NULL DEFAULT 0 CHECK (flat_tax_amount >= 0),
   salary_tax             core.amount NOT NULL CHECK (salary_tax >= 0),
   other_deductions       core.amount NOT NULL DEFAULT 0 CHECK (other_deductions >= 0),
   net_pay                core.amount NOT NULL,
-  payment_doc_ref        uuid,                                                     -- treasury (FK در 99_cross_fk)
-  payment_status         text NOT NULL DEFAULT 'unpaid' CHECK (payment_status IN ('unpaid','paid')),
+  payment_doc_ref        uuid,                                                     -- آخرین سند پرداخت treasury (FK در 99_cross_fk)
+  -- نهان وضعیت قلم باز خالص در treasury (منبع حقیقت: treasury.open_item با مبدأ payroll/payroll.payslip؛ RV-X2-08)
+  payment_status         text NOT NULL DEFAULT 'unpaid' CHECK (payment_status IN ('unpaid','partial','paid')),
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, company_id, id),
@@ -2835,7 +3177,9 @@ CREATE TABLE IF NOT EXISTS payroll.payslip (
   CONSTRAINT payslip_days CHECK (insurance_days <= calendar_days AND paid_days <= calendar_days),
   CONSTRAINT payslip_monthly_wage CHECK (monthly_wage = daily_wage * insurance_days),
   CONSTRAINT payslip_benefits CHECK (insurable_benefits = insurable_raw - monthly_wage),
-  CONSTRAINT payslip_ssi_base CHECK (ssi_base = least(insurable_raw, ssi_cap_amount)),
+  CONSTRAINT payslip_ssi_base CHECK (ssi_base = greatest(least(insurable_raw, ssi_cap_amount), ssi_min_base_amount)
+                                     AND ssi_min_base_amount <= ssi_cap_amount),
+  CONSTRAINT payslip_taxable CHECK (taxable_income = greatest(0, tax_progressive_gross - tax_exempt_amount - ssi_tax_deduction)),
   CONSTRAINT payslip_ssi_amounts CHECK (
         ssi_employee = ledger.round_amount(ssi_base * ssi_employee_rate, 0::smallint, ssi_rounding)
     AND ssi_employer = ledger.round_amount(ssi_base * ssi_employer_rate, 0::smallint, ssi_rounding)
@@ -2843,9 +3187,11 @@ CREATE TABLE IF NOT EXISTS payroll.payslip (
     AND hard_job_ssi = ledger.round_amount(ssi_base * hard_job_rate, 0::smallint, ssi_rounding)),
   CONSTRAINT payslip_total_paid CHECK (total_paid_all >= insurable_raw),
   CONSTRAINT payslip_net CHECK (net_pay = gross_earnings - ssi_employee - salary_tax - other_deductions AND net_pay >= 0),
-  CONSTRAINT payslip_paid CHECK ((payment_status = 'paid') = (payment_doc_ref IS NOT NULL))
+  CONSTRAINT payslip_paid CHECK ((payment_status = 'unpaid') = (payment_doc_ref IS NULL))
 );
 SELECT core.enable_tenant_rls('payroll.payslip');
+-- قفل کارکرد و اقساط وام بر پایهٔ کارمند جست‌وجو می‌کنند (RV-CMP-25)
+CREATE INDEX IF NOT EXISTS payslip_employee_idx ON payroll.payslip (tenant_id, employee_id);
 
 CREATE TABLE IF NOT EXISTS payroll.loan (
   tenant_id            uuid NOT NULL REFERENCES core.tenant(id),
@@ -2858,6 +3204,7 @@ CREATE TABLE IF NOT EXISTS payroll.loan (
   start_period_key     text NOT NULL CHECK (start_period_key ~ '^jm:[0-9]{4}-(0[1-9]|1[0-2])$'),
   status               text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','active','settled','cancelled')),
   disbursement_ref     uuid,                         -- treasury (FK در 99_cross_fk)
+  created_by           uuid,
   approved_by          uuid,
   approved_at          timestamptz,
   created_at           timestamptz NOT NULL DEFAULT now(),
@@ -2867,6 +3214,7 @@ CREATE TABLE IF NOT EXISTS payroll.loan (
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, company_id, employee_id) REFERENCES payroll.employee(tenant_id, company_id, id),
   FOREIGN KEY (tenant_id, approved_by) REFERENCES core.tenant_membership(tenant_id, user_id),
+  FOREIGN KEY (tenant_id, created_by) REFERENCES core.tenant_membership(tenant_id, user_id),
   CHECK ((status IN ('active','settled')) <= (approved_by IS NOT NULL AND approved_at IS NOT NULL)),
   CHECK (kind <> 'advance' OR installment_count = 1)
 );
@@ -2882,10 +3230,17 @@ CREATE TABLE IF NOT EXISTS payroll.loan_installment (
   period_key     text NOT NULL CHECK (period_key ~ '^jm:[0-9]{4}-(0[1-9]|1[0-2])$'),
   amount         core.amount NOT NULL CHECK (amount > 0),
   status         text NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','deducted','deferred','waived')),
+  waived_by      uuid,
+  waived_at      timestamptz,
+  waive_reason   text,
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, loan_id, seq),
-  FOREIGN KEY (tenant_id, loan_id) REFERENCES payroll.loan(tenant_id, id)
+  FOREIGN KEY (tenant_id, loan_id) REFERENCES payroll.loan(tenant_id, id),
+  FOREIGN KEY (tenant_id, waived_by) REFERENCES core.tenant_membership(tenant_id, user_id),
+  -- بخشودن بدهی کارمند: تأییدکننده، زمان و دلیل ≥ ۱۰ نویسه (RV-CMP-17)
+  CONSTRAINT installment_waived CHECK ((status = 'waived') = (waived_by IS NOT NULL AND waived_at IS NOT NULL
+                                       AND char_length(btrim(coalesce(waive_reason, ''))) >= 10))
 );
 SELECT core.enable_tenant_rls('payroll.loan_installment');
 
@@ -2913,7 +3268,6 @@ CREATE TABLE IF NOT EXISTS payroll.payslip_line (
   PRIMARY KEY (id),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, payslip_id, line_no),
-  UNIQUE (tenant_id, loan_installment_id),
   FOREIGN KEY (tenant_id, payslip_id) REFERENCES payroll.payslip(tenant_id, id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, pay_item_id) REFERENCES payroll.pay_item(tenant_id, id),
   FOREIGN KEY (tenant_id, loan_installment_id) REFERENCES payroll.loan_installment(tenant_id, id),
@@ -2925,11 +3279,15 @@ CREATE TABLE IF NOT EXISTS payroll.payslip_line (
   CHECK (ssi_insurable = (dsk_bucket IN ('ROOZ','MAZ','INC','SPOUSE')) OR kind <> 'earning')
 );
 SELECT core.enable_tenant_rls('payroll.payslip_line');
+-- قسط وامِ کسرشده در اجرای لغوشده دوباره قابل کسر است؛ یکتایی «یک کسر زنده برای هر قسط» را تأیید اجرا با قفل ردیف قسط
+-- (payroll.run_after) و راستی‌آزمایی deferred فیش تضمین می‌کنند (RV-CMP-17). یکتایی سراسری پیشین (حتی روی اجرای لغوشده) برداشته شد.
+ALTER TABLE payroll.payslip_line DROP CONSTRAINT IF EXISTS payslip_line_tenant_id_loan_installment_id_key;
+CREATE INDEX IF NOT EXISTS payslip_line_installment_idx ON payroll.payslip_line (tenant_id, loan_installment_id) WHERE loan_installment_id IS NOT NULL;
 
 -- محتوای فیش فقط وقتی اجرا در draft/calculated است تغییر می‌کند
 CREATE OR REPLACE FUNCTION payroll.payslip_content_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_status text; v_run uuid; v_changed text[];
+DECLARE v_status text; v_run uuid; v_changed text[]; v_oi record; v_doc record; v_expected text; v_ok boolean;
 BEGIN
   IF TG_TABLE_NAME = 'payslip' THEN
     v_run := coalesce(NEW.run_id, OLD.run_id);
@@ -2941,10 +3299,34 @@ BEGIN
   IF v_status IN ('draft','calculated') OR (TG_OP = 'DELETE' AND v_status IS NULL) THEN
     RETURN coalesce(NEW, OLD);
   END IF;
-  -- پس از تأیید فقط وضعیت پرداخت فیش
+  -- پس از تأیید فقط نهان وضعیت پرداخت فیش، و آن هم فقط پس از ثبت (قلم باز خالص در تراکنش ثبت ساخته می‌شود؛ RV-X2-08)
   IF TG_TABLE_NAME = 'payslip' AND TG_OP = 'UPDATE' THEN
     v_changed := rules.changed_columns(to_jsonb(OLD), to_jsonb(NEW));
     IF v_changed <@ ARRAY['payment_doc_ref','payment_status'] AND v_status IN ('approved','posted') THEN
+      IF v_status <> 'posted' THEN
+        PERFORM core.raise_hk('HK_PAYROLL_PAYMENT_STATE', 'salary is paid only after the run is posted (its net open items exist from posting)');
+      END IF;
+      -- پایگاه یکپارچه (treasury نصب است؛ payroll در DAG به treasury وابسته است): نهان = وضعیت قلم باز و سند = پرداخت ثبت‌شدهٔ همین کارمند
+      IF to_regclass('treasury.open_item') IS NOT NULL THEN
+        EXECUTE $q$SELECT status, amount, allocated_amount FROM treasury.open_item
+                    WHERE tenant_id = $1 AND source_module = 'payroll' AND source_doc_type = 'payroll.payslip' AND source_doc_id = $2
+                      AND status <> 'cancelled'$q$ INTO v_oi USING NEW.tenant_id, NEW.id;
+        v_expected := CASE WHEN v_oi.status = 'closed' THEN 'paid' WHEN coalesce(v_oi.allocated_amount, 0) > 0 THEN 'partial' ELSE 'unpaid' END;
+        IF NEW.payment_status IS DISTINCT FROM v_expected THEN
+          PERFORM core.raise_hk('HK_PAYROLL_PAYMENT_STATE', format('payment status %s differs from the net open item (%s)', NEW.payment_status, v_expected));
+        END IF;
+        IF NEW.payment_doc_ref IS NOT NULL THEN
+          EXECUTE $q$SELECT d.direction, d.status FROM treasury.money_document d WHERE d.tenant_id = $1 AND d.id = $2$q$
+             INTO v_doc USING NEW.tenant_id, NEW.payment_doc_ref;
+          EXECUTE $q$SELECT EXISTS (SELECT 1 FROM treasury.money_counter_line l JOIN payroll.employee e ON e.tenant_id = l.tenant_id
+                                     WHERE l.tenant_id = $1 AND l.document_id = $2 AND e.id = $3 AND l.kind = 'party'
+                                       AND l.party_role = 'employee' AND l.party_id = e.party_id)$q$
+             INTO v_ok USING NEW.tenant_id, NEW.payment_doc_ref, NEW.employee_id;
+          IF v_doc.direction IS DISTINCT FROM 'payment' OR v_doc.status IS DISTINCT FROM 'posted' OR NOT v_ok THEN
+            PERFORM core.raise_hk('HK_PAYROLL_PAYMENT_DOC', 'payment document must be a posted payment with a line for this employee');
+          END IF;
+        END IF;
+      END IF;
       RETURN NEW;
     END IF;
   END IF;
@@ -2959,7 +3341,9 @@ CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON payroll.payslip_li
 -- راستی‌آزمایی deferred فیش: جمع سطرها، علامت‌ها، قسط وام، و مالیات پلکانی از snapshot اجرا
 CREATE OR REPLACE FUNCTION payroll.payslip_verify() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE s payroll.payslip; r payroll.run; t record; v_rows jsonb; v_mode text; v_expected numeric; v_id uuid;
+DECLARE s payroll.payslip; r payroll.run; t record; tx record; v_ct payroll.contract; v_rows jsonb; v_mode text; v_expected numeric; v_id uuid;
+        v_content jsonb; v_on date; v_job text; v_frac numeric; v_er numeric; v_rr numeric; v_ur numeric; v_hr numeric; v_capm numeric;
+        v_srnd text; v_minw numeric; v_rule jsonb; v_week numeric; v_minbase numeric; v_missing text[] := '{}';
 BEGIN
   IF TG_TABLE_NAME = 'payslip' THEN v_id := NEW.id; ELSE v_id := NEW.payslip_id; END IF;
   SELECT * INTO s FROM payroll.payslip WHERE tenant_id = NEW.tenant_id AND id = v_id;
@@ -2985,11 +3369,82 @@ BEGIN
                 AND (l.amount <> i.amount OR n.employee_id <> s.employee_id OR n.status <> 'active' OR l.kind <> 'deduction')) THEN
     PERFORM core.raise_hk('HK_PAYROLL_LOAN_LINE', 'loan deduction must equal the installment of an active loan of the same employee');
   END IF;
+  -- یک کسر زنده برای هر قسط (اجرای لغوشده حساب نمی‌شود؛ RV-CMP-17)
+  IF EXISTS (SELECT 1 FROM payroll.payslip_line l
+               JOIN payroll.payslip_line l2 ON l2.tenant_id = l.tenant_id AND l2.loan_installment_id = l.loan_installment_id AND l2.id <> l.id
+               JOIN payroll.payslip p2 ON p2.tenant_id = l2.tenant_id AND p2.id = l2.payslip_id
+               JOIN payroll.run r2 ON r2.tenant_id = p2.tenant_id AND r2.id = p2.run_id
+              WHERE l.tenant_id = s.tenant_id AND l.payslip_id = s.id AND r2.status <> 'cancelled') THEN
+    PERFORM core.raise_hk('HK_PAYROLL_LOAN_LINE', 'this installment is already deducted in another live run');
+  END IF;
   IF r.kind IN ('regular','settlement','off_cycle','eidi') THEN
-    SELECT c.content -> 'payroll.tax.brackets_monthly' -> '_' -> 'rows', c.content -> 'payroll.tax.rounding' -> '_' ->> 'v'
-      INTO v_rows, v_mode FROM rules.calc_snapshot c WHERE c.tenant_id = r.tenant_id AND c.id = r.rule_snapshot_id;
-    IF v_rows IS NULL OR v_mode IS NULL THEN
-      PERFORM core.raise_hk('HK_PAYROLL_SNAPSHOT_INCOMPLETE', 'run snapshot lacks payroll.tax.brackets_monthly / payroll.tax.rounding');
+    -- همهٔ ارقام قانونی فیش از snapshot همان اجرا (محتوای متعارف، rules.snapshot_value) و نه از ستون‌های آزاد (RV-CMP-04)
+    SELECT c2.content INTO v_content FROM rules.calc_snapshot c2 WHERE c2.tenant_id = r.tenant_id AND c2.id = r.rule_snapshot_id;
+    v_on := r.period_end;
+    SELECT * INTO v_ct FROM payroll.contract WHERE tenant_id = s.tenant_id AND id = s.contract_id;
+    SELECT ssi_job_code INTO v_job FROM payroll.employee WHERE tenant_id = s.tenant_id AND id = s.employee_id;
+    v_rows := rules.snapshot_value(v_content, 'payroll.tax.brackets_monthly', '', v_on) -> 'rows';
+    v_mode := rules.snapshot_value(v_content, 'payroll.tax.rounding', '', v_on) ->> 'v';
+    v_frac := (rules.snapshot_value(v_content, 'payroll.tax.employee_ssi_deductible_fraction', '', v_on) ->> 'v')::numeric;
+    v_er := (rules.snapshot_value(v_content, 'payroll.ssi.employee_rate', '', v_on) ->> 'v')::numeric;
+    v_rr := (rules.snapshot_value(v_content, 'payroll.ssi.employer_rate', '', v_on) ->> 'v')::numeric;
+    v_ur := (rules.snapshot_value(v_content, 'payroll.ssi.unemployment_rate', '', v_on) ->> 'v')::numeric;
+    v_capm := (rules.snapshot_value(v_content, 'payroll.ssi.cap_multiplier', '', v_on) ->> 'v')::numeric;
+    v_srnd := rules.snapshot_value(v_content, 'payroll.ssi.rounding', '', v_on) ->> 'v';
+    v_minw := rules.value_numeric_on('money', rules.snapshot_value(v_content, 'payroll.wage.min_daily', '', v_on), v_on);
+    v_hr := CASE WHEN v_ct.is_hard_job THEN (rules.snapshot_value(v_content, 'payroll.ssi.hard_job_rate', '', v_on) ->> 'v')::numeric ELSE 0 END;
+    v_rule := rules.snapshot_value(v_content, 'payroll.ssi.min_base_rule', '', v_on) -> 'v';
+    v_missing := array_remove(ARRAY[
+        CASE WHEN v_rows IS NULL THEN 'payroll.tax.brackets_monthly' END, CASE WHEN v_mode IS NULL THEN 'payroll.tax.rounding' END,
+        CASE WHEN v_frac IS NULL THEN 'payroll.tax.employee_ssi_deductible_fraction' END,
+        CASE WHEN v_er IS NULL THEN 'payroll.ssi.employee_rate' END, CASE WHEN v_rr IS NULL THEN 'payroll.ssi.employer_rate' END,
+        CASE WHEN v_ur IS NULL THEN 'payroll.ssi.unemployment_rate' END, CASE WHEN v_capm IS NULL THEN 'payroll.ssi.cap_multiplier' END,
+        CASE WHEN v_srnd IS NULL THEN 'payroll.ssi.rounding' END, CASE WHEN v_minw IS NULL THEN 'payroll.wage.min_daily' END,
+        CASE WHEN v_hr IS NULL THEN 'payroll.ssi.hard_job_rate' END,
+        -- قاعدهٔ حداقل مبنا اگر بستهٔ مصرف‌شده برای این دوره آن را دارد باید در snapshot باشد (حذف آن راه فرار نیست)
+        CASE WHEN v_rule IS NULL AND EXISTS (SELECT 1 FROM rules.calc_snapshot cs JOIN rules.param_value pv ON pv.package_id = ANY (cs.package_ids)
+                                              WHERE cs.tenant_id = r.tenant_id AND cs.id = r.rule_snapshot_id AND pv.key = 'payroll.ssi.min_base_rule'
+                                                AND pv.effective_from <= v_on AND (pv.effective_to IS NULL OR v_on < pv.effective_to))
+             THEN 'payroll.ssi.min_base_rule' END], NULL);
+    IF cardinality(v_missing) > 0 THEN
+      PERFORM core.raise_hk('HK_PAYROLL_SNAPSHOT_INCOMPLETE', format('run snapshot lacks %s', array_to_string(v_missing, ', ')));
+    END IF;
+    -- نرخ‌ها و قاعدهٔ گرد کردن سهم‌ها = snapshot؛ نرخ سخت و زیان‌آور فقط برای قرارداد سخت
+    IF (s.ssi_employee_rate, s.ssi_employer_rate, s.unemployment_rate, s.hard_job_rate, s.ssi_rounding)
+       IS DISTINCT FROM (v_er, v_rr, v_ur, v_hr, v_srnd) THEN
+      PERFORM core.raise_hk('HK_PAYROLL_SSI_RATES', 'payslip SSI rates/rounding differ from the run snapshot');
+    END IF;
+    -- سقف از حداقل مزد «رسمی» (هرگز جایگزین سیاست شرکت): cap_multiplier × min_wage_daily × insurance_days
+    IF s.ssi_cap_amount <> trunc(v_capm * v_minw * s.insurance_days) THEN
+      PERFORM core.raise_hk('HK_PAYROLL_SSI_CAP', format('SSI cap %s differs from multiplier × statutory minimum × days (%s)',
+                                                         s.ssi_cap_amount, trunc(v_capm * v_minw * s.insurance_days)));
+    END IF;
+    -- حداقل مبنای کسر حق بیمه (RV-CMP-14): {"applies_to":[نوع استخدام], "multiplier", "part_time":"none|by_hours", "exempt_job_codes":[…]}
+    v_minbase := 0;
+    IF v_rule IS NOT NULL AND v_ct.employment_type IN (SELECT jsonb_array_elements_text(coalesce(v_rule -> 'applies_to', '[]'::jsonb)))
+       AND coalesce(v_job, '') NOT IN (SELECT jsonb_array_elements_text(coalesce(v_rule -> 'exempt_job_codes', '[]'::jsonb))) THEN
+      v_minbase := v_minw * coalesce((v_rule ->> 'multiplier')::numeric, 1) * s.insurance_days;
+      IF v_ct.employment_type = 'part_time' AND v_rule ->> 'part_time' = 'by_hours' THEN
+        v_week := (rules.snapshot_value(v_content, 'payroll.time.weekly_hours', '', v_on) ->> 'v')::numeric;
+        IF v_week IS NULL THEN
+          PERFORM core.raise_hk('HK_PAYROLL_SNAPSHOT_INCOMPLETE', 'run snapshot lacks payroll.time.weekly_hours');
+        END IF;
+        v_minbase := v_minbase * v_ct.weekly_hours / v_week;
+      END IF;
+      v_minbase := trunc(v_minbase);
+    END IF;
+    IF s.ssi_min_base_amount <> v_minbase THEN
+      PERFORM core.raise_hk('HK_PAYROLL_SSI_MIN_BASE', format('SSI minimum base %s differs from the snapshot rule (%s)', s.ssi_min_base_amount, v_minbase));
+    END IF;
+    -- مبنای مالیات از سطرها: Σ پلکانی (با اقلام معاف تا سقف) − معافیت (حداکثر همان اقلام) − سهم کسرشدنی بیمهٔ کارگر
+    SELECT coalesce(sum(amount) FILTER (WHERE kind = 'earning' AND tax_treatment IN ('progressive','exempt_up_to','exempt_within_customary_limit')), 0) AS prog,
+           coalesce(sum(amount) FILTER (WHERE kind = 'earning' AND tax_treatment IN ('exempt_up_to','exempt_within_customary_limit')), 0) AS exemptible,
+           count(*) FILTER (WHERE kind = 'earning' AND tax_treatment = 'flat') AS flat_n
+      INTO tx FROM payroll.payslip_line WHERE tenant_id = s.tenant_id AND payslip_id = s.id;
+    IF s.tax_progressive_gross <> tx.prog OR s.tax_exempt_amount > tx.exemptible OR (tx.flat_n = 0 AND s.flat_tax_amount <> 0)
+       OR s.ssi_tax_deduction <> ledger.round_amount(s.ssi_employee * v_frac, 0::smallint, v_mode) THEN
+      PERFORM core.raise_hk('HK_PAYROLL_TAXABLE_INCOME', format('taxable income components differ from the lines and snapshot (progressive %s vs %s)',
+                                                               s.tax_progressive_gross, tx.prog));
     END IF;
     v_expected := ledger.round_amount(payroll.bracket_tax(s.taxable_income, v_rows), 0::smallint, v_mode) + s.flat_tax_amount;
     IF s.salary_tax <> v_expected THEN
@@ -3049,6 +3504,11 @@ BEGIN
     IF snap.min_confidence IN ('low','unverified') AND NEW.low_confidence_ack_by IS NULL THEN
       PERFORM core.raise_hk('HK_PAYROLL_LOW_CONFIDENCE', 'run uses low-confidence/unverified parameters; explicit acknowledgment required');
     END IF;
+    -- قفل اشتراکی کارکردها پیش از سنجش (RV-CMP-11): ویرایش هم‌زمان کارکرد تا commit این تأیید منتظر می‌ماند و سپس قفل‌شده را
+    -- می‌بیند؛ ویرایشی که زودتر قفل گرفته، این تأیید را منتظر می‌گذارد و سنجش بعدی (snapshot تازه) وضعیت نهایی‌اش را می‌بیند
+    PERFORM 1 FROM payroll.attendance_summary a JOIN payroll.payslip p ON p.tenant_id = a.tenant_id AND p.employee_id = a.employee_id
+     WHERE p.tenant_id = NEW.tenant_id AND p.run_id = NEW.id AND a.period_key = NEW.period_key AND NEW.kind = 'regular'
+       FOR SHARE OF a;
     IF NEW.kind = 'regular' AND EXISTS (SELECT 1 FROM payroll.payslip p
           LEFT JOIN payroll.attendance_summary a ON a.tenant_id = p.tenant_id AND a.employee_id = p.employee_id AND a.period_key = NEW.period_key
          WHERE p.tenant_id = NEW.tenant_id AND p.run_id = NEW.id AND a.status IS DISTINCT FROM 'confirmed') THEN
@@ -3066,6 +3526,31 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON payroll.run;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON payroll.run FOR EACH ROW EXECUTE FUNCTION payroll.run_guard();
+
+-- همگام‌ساز اقساط با اجرا (RV-CMP-17): «کسرشده» فقط با تأیید اجرایی که سطر آن قسط را دارد، و برگشت به «زمان‌بندی‌شده» فقط با لغو
+-- همان اجرا. به‌روزرسانی قسط در عمق trigger ≥ ۲ انجام می‌شود و نگهبان قسط فقط همین مسیر را برای «کسرشده» می‌پذیرد.
+CREATE OR REPLACE FUNCTION payroll.run_after() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.status = 'approved' AND OLD.status <> 'approved' THEN
+    IF EXISTS (SELECT 1 FROM payroll.payslip p JOIN payroll.payslip_line l ON l.tenant_id = p.tenant_id AND l.payslip_id = p.id
+                 JOIN payroll.loan_installment i ON i.tenant_id = l.tenant_id AND i.id = l.loan_installment_id
+                WHERE p.tenant_id = NEW.tenant_id AND p.run_id = NEW.id AND i.status NOT IN ('scheduled','deferred')) THEN
+      PERFORM core.raise_hk('HK_PAYROLL_LOAN_LINE', 'a deducted installment is already deducted, waived or settled');
+    END IF;
+    UPDATE payroll.loan_installment i SET status = 'deducted'
+      FROM payroll.payslip p JOIN payroll.payslip_line l ON l.tenant_id = p.tenant_id AND l.payslip_id = p.id
+     WHERE p.tenant_id = NEW.tenant_id AND p.run_id = NEW.id AND i.tenant_id = l.tenant_id AND i.id = l.loan_installment_id;
+  ELSIF NEW.status = 'cancelled' AND OLD.status IN ('approved','posted') THEN
+    UPDATE payroll.loan_installment i SET status = 'scheduled'
+      FROM payroll.payslip p JOIN payroll.payslip_line l ON l.tenant_id = p.tenant_id AND l.payslip_id = p.id
+     WHERE p.tenant_id = NEW.tenant_id AND p.run_id = NEW.id AND i.tenant_id = l.tenant_id AND i.id = l.loan_installment_id
+       AND i.status = 'deducted';
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_after ON payroll.run;
+CREATE TRIGGER trg_after AFTER UPDATE OF status ON payroll.run FOR EACH ROW EXECUTE FUNCTION payroll.run_after();
 
 -- کارکرد تأییدشده‌ای که در اجرای تأییدشده مصرف شده تغییر نمی‌کند
 CREATE OR REPLACE FUNCTION payroll.attendance_guard() RETURNS trigger
@@ -3089,9 +3574,10 @@ BEGIN
   IF TG_TABLE_NAME = 'loan' THEN v_id := NEW.id; ELSE v_id := NEW.loan_id; END IF;
   SELECT * INTO l FROM payroll.loan WHERE tenant_id = NEW.tenant_id AND id = v_id;
   IF NOT FOUND OR l.status IN ('draft','cancelled') THEN RETURN NULL; END IF;
+  -- جمع همهٔ اقساط (هر وضعیتی، حتی بخشوده) = اصل وام؛ بخشودن حساب جدا ندارد و جدول را بی‌کنترل نمی‌کند (RV-CMP-17)
   SELECT coalesce(sum(amount), 0), count(*) INTO v_sum, v_n FROM payroll.loan_installment
-   WHERE tenant_id = l.tenant_id AND loan_id = l.id AND status <> 'waived';
-  IF v_sum <> l.principal AND NOT EXISTS (SELECT 1 FROM payroll.loan_installment WHERE tenant_id = l.tenant_id AND loan_id = l.id AND status = 'waived') THEN
+   WHERE tenant_id = l.tenant_id AND loan_id = l.id;
+  IF v_sum <> l.principal THEN
     PERFORM core.raise_hk('HK_PAYROLL_LOAN_SCHEDULE', format('installments sum %s differs from principal %s', v_sum, l.principal));
   END IF;
   IF l.status = 'settled' AND EXISTS (SELECT 1 FROM payroll.loan_installment WHERE tenant_id = l.tenant_id AND loan_id = l.id
@@ -3107,17 +3593,40 @@ DROP TRIGGER IF EXISTS trg_verify ON payroll.loan_installment;
 CREATE CONSTRAINT TRIGGER trg_verify AFTER INSERT OR UPDATE ON payroll.loan_installment
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION payroll.loan_verify();
 
+-- ماشین حالت قسط (RV-CMP-17): scheduled ↔ deferred؛ scheduled|deferred → waived (تأییدکنندهٔ غیر از ایجادکنندهٔ وام + دلیل)؛
+-- scheduled|deferred ↔ deducted فقط از همگام‌ساز اجرا (payroll.run_after، عمق trigger ≥ ۲). قسط کسرشده و بخشوده دستی تغییر نمی‌کند.
 CREATE OR REPLACE FUNCTION payroll.loan_installment_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_status text;
+DECLARE l payroll.loan; v_changed text[];
 BEGIN
-  SELECT status INTO v_status FROM payroll.loan WHERE tenant_id = coalesce(NEW.tenant_id, OLD.tenant_id) AND id = coalesce(NEW.loan_id, OLD.loan_id);
-  IF v_status <> 'draft' THEN
-    IF TG_OP = 'DELETE' OR TG_OP = 'INSERT' OR rules.changed_columns(to_jsonb(OLD), to_jsonb(NEW)) <> ARRAY['status'] THEN
-      PERFORM core.raise_hk('HK_PAYROLL_LOAN_IMMUTABLE', 'schedule of an active loan only changes installment status');
+  SELECT * INTO l FROM payroll.loan WHERE tenant_id = coalesce(NEW.tenant_id, OLD.tenant_id) AND id = coalesce(NEW.loan_id, OLD.loan_id);
+  IF l.status = 'draft' THEN
+    IF TG_OP <> 'DELETE' AND NEW.status <> 'scheduled' THEN
+      PERFORM core.raise_hk('HK_PAYROLL_LOAN_TRANSITION', 'installments of a draft loan are scheduled');
     END IF;
+    RETURN coalesce(NEW, OLD);
   END IF;
-  RETURN coalesce(NEW, OLD);
+  IF TG_OP = 'DELETE' OR TG_OP = 'INSERT' THEN
+    PERFORM core.raise_hk('HK_PAYROLL_LOAN_IMMUTABLE', 'schedule of an active loan only changes installment status');
+  END IF;
+  v_changed := rules.changed_columns(to_jsonb(OLD), to_jsonb(NEW));
+  IF NOT (v_changed <@ ARRAY['status','waived_by','waived_at','waive_reason']) OR (v_changed <> '{}' AND NEW.status = OLD.status) THEN
+    PERFORM core.raise_hk('HK_PAYROLL_LOAN_IMMUTABLE', 'schedule of an active loan only changes installment status');
+  END IF;
+  IF NEW.status = OLD.status THEN RETURN NEW; END IF;
+  IF OLD.status = 'deducted' OR NEW.status = 'deducted' THEN
+    IF pg_trigger_depth() < 2 THEN
+      PERFORM core.raise_hk('HK_PAYROLL_LOAN_TRANSITION', 'installments are deducted or restored only by approving or cancelling the payroll run');
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF l.status <> 'active' OR NOT ((OLD.status, NEW.status) IN (('scheduled','deferred'),('deferred','scheduled'),('scheduled','waived'),('deferred','waived'))) THEN
+    PERFORM core.raise_hk('HK_PAYROLL_LOAN_TRANSITION', format('%s → %s is not allowed on a %s loan', OLD.status, NEW.status, l.status));
+  END IF;
+  IF NEW.status = 'waived' AND NEW.waived_by IS NOT DISTINCT FROM l.created_by THEN
+    PERFORM core.raise_hk('HK_PAYROLL_LOAN_SOD', 'a waiver of employee debt needs someone other than the loan creator');
+  END IF;
+  RETURN NEW;
 END $$;
 DROP TRIGGER IF EXISTS trg_guard ON payroll.loan_installment;
 CREATE TRIGGER trg_guard BEFORE INSERT OR UPDATE OR DELETE ON payroll.loan_installment FOR EACH ROW EXECUTE FUNCTION payroll.loan_installment_guard();
@@ -3247,7 +3756,8 @@ CREATE TRIGGER trg_immutable BEFORE UPDATE OR DELETE ON payroll.gov_file_part FO
 -- مقادیر کنترلی فایل = جمع فیش‌های اجرای تأییدشده (TDD، TMASH، TBIME، TKOSO+BIC، تعداد؛ مالیات)
 CREATE OR REPLACE FUNCTION payroll.gov_file_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE r payroll.run; t record; v_changed text[];
+DECLARE r payroll.run; t record; v_changed text[]; v_content jsonb; v_rule text; v_rr numeric; v_ur numeric; v_rnd text;
+        v_tkoso numeric; v_bic numeric;
 BEGIN
   IF TG_OP = 'DELETE' THEN PERFORM core.raise_hk('HK_PAYROLL_FILE_IMMUTABLE', 'government files are superseded, never deleted'); END IF;
   IF TG_OP = 'UPDATE' THEN
@@ -3268,13 +3778,34 @@ BEGIN
   END IF;
   SELECT count(*) FILTER (WHERE insurance_days > 0) AS num, coalesce(sum(insurance_days),0) AS tdd, coalesce(sum(ssi_base),0) AS tmash,
          coalesce(sum(ssi_employee),0) AS tbime, coalesce(sum(ssi_employer),0) AS tkoso, coalesce(sum(unemployment),0) AS bic,
-         coalesce(sum(salary_tax),0) AS tax, count(*) AS n
+         coalesce(sum(hard_job_ssi),0) AS bimh, coalesce(sum(salary_tax),0) AS tax, count(*) AS n
     INTO t FROM payroll.payslip WHERE tenant_id = NEW.tenant_id AND run_id = NEW.run_id;
-  IF NEW.kind = 'ssi_list' AND ((NEW.control_totals ->> 'DSK_NUM')::numeric, (NEW.control_totals ->> 'DSK_TDD')::numeric,
+  IF NEW.kind = 'ssi_list' THEN
+    -- فرمول DSK_TKOSO و DSK_BIC پارامتر تاریخ‌دار پروفایل لیست است (RV-CMP-13): sum_of_rows = Σ سهم گردشدهٔ هر ردیف؛
+    -- rate_on_total = نرخ × DSK_TMASH با همان قاعدهٔ گرد کردن (پژوهش ۰۴ §۳.۸). اختلاف گرد کردن با Σ فیش‌ها در ثبت فایل به GL می‌رود.
+    SELECT content INTO v_content FROM rules.calc_snapshot WHERE tenant_id = NEW.tenant_id AND id = NEW.rule_snapshot_id;
+    v_rule := rules.snapshot_value(v_content, 'payroll.ssi.list_control_totals', NEW.format_version, r.period_end) ->> 'v';
+    IF v_rule IS NULL THEN
+      PERFORM core.raise_hk('HK_PAYROLL_SNAPSHOT_INCOMPLETE', format('file snapshot lacks payroll.ssi.list_control_totals[%s]', NEW.format_version));
+    END IF;
+    IF v_rule = 'rate_on_total' THEN
+      v_rr := (rules.snapshot_value(v_content, 'payroll.ssi.employer_rate', '', r.period_end) ->> 'v')::numeric;
+      v_ur := (rules.snapshot_value(v_content, 'payroll.ssi.unemployment_rate', '', r.period_end) ->> 'v')::numeric;
+      v_rnd := rules.snapshot_value(v_content, 'payroll.ssi.rounding', '', r.period_end) ->> 'v';
+      IF v_rr IS NULL OR v_ur IS NULL OR v_rnd IS NULL THEN
+        PERFORM core.raise_hk('HK_PAYROLL_SNAPSHOT_INCOMPLETE', 'file snapshot lacks the SSI employer/unemployment rates or rounding');
+      END IF;
+      v_tkoso := ledger.round_amount(t.tmash * v_rr, 0::smallint, v_rnd);
+      v_bic := ledger.round_amount(t.tmash * v_ur, 0::smallint, v_rnd);
+    ELSE
+      v_tkoso := t.tkoso; v_bic := t.bic;
+    END IF;
+    IF ((NEW.control_totals ->> 'DSK_NUM')::numeric, (NEW.control_totals ->> 'DSK_TDD')::numeric,
         (NEW.control_totals ->> 'DSK_TMASH')::numeric, (NEW.control_totals ->> 'DSK_TBIME')::numeric,
-        (NEW.control_totals ->> 'DSK_TKOSO')::numeric, (NEW.control_totals ->> 'DSK_BIC')::numeric)
-        IS DISTINCT FROM (t.num::numeric, t.tdd::numeric, t.tmash, t.tbime, t.tkoso, t.bic) THEN
-    PERFORM core.raise_hk('HK_PAYROLL_FILE_TOTALS', 'insurance list control totals differ from the approved payslips');
+        (NEW.control_totals ->> 'DSK_TKOSO')::numeric, (NEW.control_totals ->> 'DSK_BIC')::numeric, (NEW.control_totals ->> 'DSK_BIMH')::numeric)
+        IS DISTINCT FROM (t.num::numeric, t.tdd::numeric, t.tmash, t.tbime, v_tkoso, v_bic, t.bimh) THEN
+      PERFORM core.raise_hk('HK_PAYROLL_FILE_TOTALS', 'insurance list control totals differ from the approved payslips');
+    END IF;
   END IF;
   IF NEW.kind = 'salary_tax' AND ((NEW.control_totals ->> 'tax_total')::numeric, (NEW.control_totals ->> 'employees')::numeric)
         IS DISTINCT FROM (t.tax, t.n::numeric) THEN
@@ -3331,6 +3862,23 @@ CREATE TABLE IF NOT EXISTS assets.book (
 SELECT core.enable_tenant_rls('assets.book');
 CREATE UNIQUE INDEX IF NOT EXISTS book_one_gl ON assets.book (tenant_id, company_id) WHERE posts_to_gl AND is_active;
 CREATE UNIQUE INDEX IF NOT EXISTS book_one_tax ON assets.book (tenant_id, company_id) WHERE kind IN ('tax','combined') AND is_active;
+
+-- هویت دفتر (نوع، ثبت در GL، شرکت، کد) پس از نخستین دفتر دارایی یا رویداد ثابت است؛ زیردفتر GL رویدادها را بر پایهٔ همین
+-- posts_to_gl برمی‌گزیند و تغییر آن تطبیق با دفتر کل را خراب می‌کرد (INV-AST-14؛ RV-CMP-20). فقط نام و فعال بودن تغییر می‌کند.
+CREATE OR REPLACE FUNCTION assets.book_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM assets.asset_book ab WHERE ab.tenant_id = OLD.tenant_id AND ab.book_id = OLD.id)
+     OR EXISTS (SELECT 1 FROM assets.asset_txn x WHERE x.tenant_id = OLD.tenant_id AND x.book_id = OLD.id)
+     OR EXISTS (SELECT 1 FROM assets.depreciation_run r WHERE r.tenant_id = OLD.tenant_id AND r.book_id = OLD.id) THEN
+    IF TG_OP = 'DELETE' OR NOT (rules.changed_columns(to_jsonb(OLD), to_jsonb(NEW)) <@ ARRAY['name','is_active']) THEN
+      PERFORM core.raise_hk('HK_ASSETS_BOOK_IN_USE', 'kind, GL posting, company and code of a book in use are fixed (only name and is_active change)');
+    END IF;
+  END IF;
+  RETURN coalesce(NEW, OLD);
+END $$;
+DROP TRIGGER IF EXISTS trg_guard ON assets.book;
+CREATE TRIGGER trg_guard BEFORE UPDATE OR DELETE ON assets.book FOR EACH ROW EXECUTE FUNCTION assets.book_guard();
 
 CREATE TABLE IF NOT EXISTS assets.asset (
   tenant_id              uuid NOT NULL REFERENCES core.tenant(id),
@@ -3439,7 +3987,7 @@ CREATE TRIGGER trg_touch BEFORE UPDATE ON assets.asset_book FOR EACH ROW EXECUTE
 
 CREATE OR REPLACE FUNCTION assets.asset_book_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE a assets.asset; b assets.book; v_changed text[]; v_key text;
+DECLARE a assets.asset; b assets.book; v_changed text[]; v_key text; v_row jsonb; v_from date; v_to date;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     IF EXISTS (SELECT 1 FROM assets.asset_txn t WHERE t.tenant_id = OLD.tenant_id AND t.asset_book_id = OLD.id) THEN
@@ -3456,9 +4004,26 @@ BEGIN
     PERFORM core.raise_hk('HK_ASSETS_START_BEFORE_AVAILABLE', 'depreciation cannot start before the asset is available for use');
   END IF;
   IF b.kind IN ('tax','combined') AND NEW.method <> 'none' THEN
-    SELECT key INTO v_key FROM rules.param_value WHERE id = NEW.tax_table_value_id;
+    SELECT key, effective_from, effective_to INTO v_key, v_from, v_to FROM rules.param_value WHERE id = NEW.tax_table_value_id;
     IF NEW.tax_class_code IS NULL OR v_key IS DISTINCT FROM 'assets.art149.classes' THEN
       PERFORM core.raise_hk('HK_ASSETS_TAX_CLASS_REQUIRED', 'tax book needs a class from a versioned Article 149 table value');
+    END IF;
+    -- ردیف طبقه در همان نسخهٔ جدول وجود دارد و روش/عمر/نرخ از جدول تندتر نیست (INV-AST-06؛ RV-CMP-19): هزینهٔ قابل‌قبول
+    -- مالیاتی با عمر کوتاه‌تر یا نرخ بالاتر از جدول بیش‌نمایی نمی‌شود. جدول در تاریخ شروع استهلاک معتبر است.
+    SELECT r INTO v_row FROM rules.param_value pv CROSS JOIN LATERAL jsonb_array_elements(pv.value -> 'rows') r
+     WHERE pv.id = NEW.tax_table_value_id AND r ->> 'code' = NEW.tax_class_code LIMIT 1;
+    IF v_row IS NULL THEN
+      PERFORM core.raise_hk('HK_ASSETS_TAX_CLASS_UNKNOWN', format('class %s is not a row of the cited Article 149 table', NEW.tax_class_code));
+    END IF;
+    IF NEW.depreciation_start < v_from OR (v_to IS NOT NULL AND NEW.depreciation_start >= v_to) THEN
+      PERFORM core.raise_hk('HK_ASSETS_TAX_CLASS_REQUIRED', 'the cited Article 149 table is not in force on the depreciation start date');
+    END IF;
+    IF NOT coalesce((v_row -> 'methods') ? NEW.method, false) THEN
+      PERFORM core.raise_hk('HK_ASSETS_TAX_METHOD', format('method %s is not allowed for class %s', NEW.method, NEW.tax_class_code));
+    END IF;
+    IF (NEW.method = 'straight_line' AND v_row ? 'straight_years' AND NEW.useful_life_months < (v_row ->> 'straight_years')::numeric * 12)
+       OR (NEW.method = 'declining_balance' AND v_row ? 'declining_rate' AND NEW.declining_rate > (v_row ->> 'declining_rate')::numeric) THEN
+      PERFORM core.raise_hk('HK_ASSETS_TAX_RATE', format('life/rate of class %s is faster than the Article 149 table', NEW.tax_class_code));
     END IF;
   END IF;
   IF TG_OP = 'UPDATE' AND EXISTS (SELECT 1 FROM assets.asset_txn t WHERE t.tenant_id = NEW.tenant_id AND t.asset_book_id = NEW.id
@@ -3560,6 +4125,8 @@ CREATE TABLE IF NOT EXISTS assets.depreciation_line (
   CHECK (nbv_after = nbv_before - amount)
 );
 SELECT core.enable_tenant_rls('assets.depreciation_line');
+-- مسیر داغ نگهبان هم‌پوشانی (هر درج سطر؛ RV-CMP-25): بدون این ایندکس هر درج همهٔ سطرهای مستأجر را پویش می‌کرد
+CREATE INDEX IF NOT EXISTS depreciation_line_book_period ON assets.depreciation_line (tenant_id, asset_book_id, period_start);
 
 CREATE TABLE IF NOT EXISTS assets.disposal (
   tenant_id          uuid NOT NULL REFERENCES core.tenant(id),
@@ -3758,7 +4325,9 @@ BEGIN
     PERFORM core.raise_hk('HK_ASSETS_RUN_IMMUTABLE', 'lines of a posted/cancelled run cannot change');
   END IF;
   IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-  SELECT * INTO ab FROM assets.asset_book WHERE tenant_id = NEW.tenant_id AND id = NEW.asset_book_id;
+  -- قفل ردیف دفتر دارایی پیش از سنجش هم‌پوشانی (RV-CMP-07): دو اجرای هم‌زمان (ماهانه و سالانه با period_key متفاوت) برای یک
+  -- دفتر دارایی پشت هم صف می‌شوند و دومی پس از commit اولی سطر آن را می‌بیند (سنجش بعدی snapshot تازه دارد)
+  SELECT * INTO ab FROM assets.asset_book WHERE tenant_id = NEW.tenant_id AND id = NEW.asset_book_id FOR UPDATE;
   IF ab.book_id <> rn.book_id OR ab.asset_id <> NEW.asset_id THEN
     PERFORM core.raise_hk('HK_ASSETS_TXN_BOOK', 'line asset book must belong to the run book');
   END IF;
@@ -3909,13 +4478,19 @@ CREATE OR REPLACE VIEW assets.v_asset_book_balance WITH (security_invoker = true
    GROUP BY ab.tenant_id, ab.company_id, ab.asset_id, ab.book_id, ab.id;
 
 -- تفاوت استهلاک دفتری و مالیاتی (کاربرگ تعدیلات اظهارنامهٔ عملکرد)
+-- به تفکیک سال مالی شرکت (ledger.fiscal_year؛ نه سال میلادی) و فقط استهلاک و برگشت استهلاک (نه برگشت تحصیل/واگذاری؛ RV-CMP-21)
 CREATE OR REPLACE VIEW assets.v_book_tax_difference WITH (security_invoker = true) AS
-  SELECT x.tenant_id, x.company_id, x.asset_id, date_trunc('year', x.txn_date)::date AS year_start,
+  SELECT x.tenant_id, x.company_id, x.asset_id, fy.start_date AS year_start,
          sum(x.accum_delta) FILTER (WHERE b.posts_to_gl) AS accounting_depreciation,
-         sum(x.accum_delta) FILTER (WHERE b.kind IN ('tax','combined')) AS tax_depreciation
-    FROM assets.asset_txn x JOIN assets.book b ON b.tenant_id = x.tenant_id AND b.id = x.book_id
-   WHERE x.kind IN ('depreciation','reversal')
-   GROUP BY x.tenant_id, x.company_id, x.asset_id, date_trunc('year', x.txn_date);
+         sum(x.accum_delta) FILTER (WHERE b.kind IN ('tax','combined')) AS tax_depreciation,
+         fy.id AS fiscal_year_id, fy.code AS fiscal_year_code
+    FROM assets.asset_txn x
+    JOIN assets.book b ON b.tenant_id = x.tenant_id AND b.id = x.book_id
+    JOIN ledger.fiscal_year fy ON fy.tenant_id = x.tenant_id AND fy.company_id = x.company_id
+                              AND x.txn_date BETWEEN fy.start_date AND fy.end_date
+    LEFT JOIN assets.asset_txn o ON o.tenant_id = x.tenant_id AND o.id = x.reverses_txn_id
+   WHERE x.kind = 'depreciation' OR (x.kind = 'reversal' AND o.kind = 'depreciation')
+   GROUP BY x.tenant_id, x.company_id, x.asset_id, fy.id, fy.code, fy.start_date;
 
 -- =====================================================================
 -- ۱۸. کاتالوگ‌های کدی: تعریف کلیدهای قانونی (بدون مقدار)، تکلیف‌ها، طبقه‌های حقوقی
@@ -3944,12 +4519,24 @@ INSERT INTO rules.param_def (key, domain, package_code, value_type, unit, enum_v
   ('tax.moadian.reaction_deadline_days',           'tax', 'ir.tax', 'integer', 'days', NULL, 'none', 'none', '{}', 'rules.tax.moadian.reaction_deadline_days', '1.0'),
   ('tax.moadian.error_catalog',                    'tax', 'ir.tax', 'table',   NULL, NULL, 'none',  'none', '{}', 'rules.tax.moadian.error_catalog', '1.0'),
   ('tax.art169.exclude_moadian_registered',        'tax', 'ir.tax', 'boolean', NULL, NULL, 'none',  'none', '{}', 'rules.tax.art169.exclude_moadian_registered', '1.0'),
+  -- مشمول بودن شرکت به تکالیف سامانهٔ جامع تجارت/انبارها و شناسهٔ رهگیری کالا (⚠ تأییدنشده؛ Q-CMP-14، RV-X3-12):
+  -- بسته مقدار قانونی نمی‌دهد تا مشاور تأیید کند؛ شرکت مشمول با جایگزین سطح شرکت فعال می‌کند
+  ('tax.trade_system.reporting_required',          'tax', 'ir.tax', 'boolean', NULL, NULL, 'none',  'any',  '{company}', 'rules.tax.trade_system.reporting_required', '1.0'),
+  -- نشانگرهای snapshot مرجع ({snapshot_version, rows_sha256, row_count}؛ پاسخ CR-PLT-09): ردیف‌ها در ref.* و بسته‌ها ir.ref.*
+  ('ref.sstid_vat_rate.snapshot',                  'ref', 'ir.ref.sstid',   'json', NULL, NULL, 'none', 'none', '{}', 'rules.ref.sstid_vat_rate.snapshot', '1.0'),
+  ('ref.ssi_job_code.snapshot',                    'ref', 'ir.ref.ssi_job', 'json', NULL, NULL, 'none', 'none', '{}', 'rules.ref.ssi_job_code.snapshot', '1.0'),
+  ('ref.iran_bank.snapshot',                       'ref', 'ir.ref.bank',    'json', NULL, NULL, 'none', 'none', '{}', 'rules.ref.iran_bank.snapshot', '1.0'),
   ('tax.income.legal_entity_rate',                 'tax', 'ir.tax', 'percent', 'percent', NULL, 'none', 'none', '{}', 'rules.tax.income.legal_entity_rate', '1.0'),
+  -- دورهٔ ارسال دفاتر الکترونیکی ماده ۹۵ (⚠ پژوهش ۰۳: سال آغازشده در ۱۴۰۴ شش‌ماهه، ۱۴۰۵ فصلی؛ بخشنامهٔ 200/1405/40)؛ مقدار در
+  -- تاریخ آغاز سال مالی شرکت خوانده می‌شود (RV-X3-07). همان کلیدی که مهاجرت (08 §۱۱) برای توصیهٔ تاریخ تبدیل می‌خواند
+  ('tax.eledger.period',                           'tax', 'ir.calendar', 'enum', NULL, '{semiannual,quarterly}', 'none', 'none', '{}', 'rules.tax.eledger.period', '1.0'),
   -- قالب‌های فایل (بستهٔ ir.formats)
   ('tax.eledger.format',                           'tax', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.tax.eledger.format', '1.0'),
   ('tax.art169.format',                            'tax', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.tax.art169.format', '1.0'),
   ('tax.vat_summary.format',                       'tax', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.tax.vat_summary.format', '1.0'),
   ('tax.moadian.portal_purchase_excel.format',     'tax', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.tax.moadian.portal_purchase_excel.format', '1.0'),
+  ('tax.sales_register.format',                    'tax', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.tax.sales_register.format', '1.0'),
+  ('tax.purchase_register.format',                 'tax', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.tax.purchase_register.format', '1.0'),
   ('payroll.format.ssi_list',                      'payroll', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.payroll.format.ssi_list', '1.0'),
   ('payroll.format.salary_tax',                    'payroll', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.payroll.format.salary_tax', '1.0'),
   ('payroll.format.attendance_excel',              'payroll', 'ir.formats', 'json', NULL, NULL, 'profile', 'none', '{}', 'rules.payroll.format.attendance_excel', '1.0'),
@@ -3967,7 +4554,8 @@ INSERT INTO rules.param_def (key, domain, package_code, value_type, unit, enum_v
   ('payroll.eidi.cap_days_of_min_wage',            'payroll', 'ir.payroll', 'integer', 'days', NULL, 'none', 'none', '{}', 'rules.payroll.eidi.cap_days_of_min_wage', '1.0'),
   ('payroll.severance.days_per_year',              'payroll', 'ir.payroll', 'integer', 'days', NULL, 'none', 'floor', '{company,workshop}', 'rules.payroll.severance.days_per_year', '1.0'),
   ('payroll.time.weekly_hours',                    'payroll', 'ir.payroll', 'decimal', 'hours', NULL, 'none', 'none', '{}', 'rules.payroll.time.weekly_hours', '1.0'),
-  ('payroll.time.hourly_divisor',                  'payroll', 'ir.payroll', 'decimal', NULL, NULL, 'none', 'any', '{company,workshop}', 'rules.payroll.time.hourly_divisor', '1.0'),
+  -- سقف: جایگزین فقط مقسوم‌علیه کوچک‌تر (مزد ساعتی سخاوتمندانه‌تر) می‌پذیرد؛ کف مزد ساعتی همیشه با مقدار رسمی (RV-CMP-02)
+  ('payroll.time.hourly_divisor',                  'payroll', 'ir.payroll', 'decimal', NULL, NULL, 'none', 'ceiling', '{company,workshop}', 'rules.payroll.time.hourly_divisor', '1.0'),
   ('payroll.time.night_window',                    'payroll', 'ir.payroll', 'json', NULL, NULL, 'none', 'none', '{}', 'rules.payroll.time.night_window', '1.0'),
   ('payroll.rate.overtime',                        'payroll', 'ir.payroll', 'ratio', 'ratio', NULL, 'none', 'floor', '{company,workshop}', 'rules.payroll.rate.overtime', '1.0'),
   ('payroll.rate.night',                           'payroll', 'ir.payroll', 'ratio', 'ratio', NULL, 'none', 'floor', '{company,workshop}', 'rules.payroll.rate.night', '1.0'),
@@ -3984,6 +4572,11 @@ INSERT INTO rules.param_def (key, domain, package_code, value_type, unit, enum_v
   ('payroll.ssi.cap_multiplier',                   'payroll', 'ir.payroll', 'decimal', NULL, NULL, 'none', 'none', '{}', 'rules.payroll.ssi.cap_multiplier', '1.0'),
   ('payroll.ssi.rounding',                         'payroll', 'ir.payroll', 'enum', NULL, '{half_up,truncate,half_even}', 'none', 'none', '{}', 'rules.payroll.ssi.rounding', '1.0'),
   ('payroll.ssi.small_workshop_exemption',         'payroll', 'ir.payroll', 'json', NULL, NULL, 'none', 'none', '{}', 'rules.payroll.ssi.small_workshop_exemption', '1.0'),
+  -- حداقل مبنای کسر حق بیمه (پژوهش ۰۴ §۳.۶: حداقل مزد روزانه، جز مشاغل با دستمزد مقطوع ⚠):
+  -- {"v":{"applies_to":["full_time","part_time","hourly"],"multiplier":"1","part_time":"none|by_hours","exempt_job_codes":[…]}} (RV-CMP-14)
+  ('payroll.ssi.min_base_rule',                    'payroll', 'ir.payroll', 'json', NULL, NULL, 'none', 'none', '{}', 'rules.payroll.ssi.min_base_rule', '1.0'),
+  -- فرمول مقادیر کنترلی DSK_TKOSO/DSK_BIC لیست بیمه برای هر پروفایل (qualifier = listdisk_6 …): Σ ردیف‌ها یا نرخ × TMASH (RV-CMP-13)
+  ('payroll.ssi.list_control_totals',              'payroll', 'ir.payroll', 'enum', NULL, '{sum_of_rows,rate_on_total}', 'profile', 'none', '{}', 'rules.payroll.ssi.list_control_totals', '1.0'),
   ('payroll.tax.brackets_monthly',                 'payroll', 'ir.payroll', 'table', NULL, NULL, 'none', 'none', '{}', 'rules.payroll.tax.brackets_monthly', '1.0'),
   ('payroll.tax.annual_exemption',                 'payroll', 'ir.payroll', 'money', 'IRR', NULL, 'none', 'none', '{}', 'rules.payroll.tax.annual_exemption', '1.0'),
   ('payroll.tax.eidi_exemption_fraction',          'payroll', 'ir.payroll', 'ratio', 'ratio', NULL, 'none', 'none', '{}', 'rules.payroll.tax.eidi_exemption_fraction', '1.0'),
@@ -4008,6 +4601,8 @@ INSERT INTO rules.param_def (key, domain, package_code, value_type, unit, enum_v
   ('currency.redenomination.factor',               'currency', 'ir.general', 'decimal', NULL, NULL, 'none', 'none', '{}', 'rules.currency.redenomination.factor', '1.0'),
   ('retention.accounting_records.years',           'retention', 'ir.general', 'integer', 'years', NULL, 'none', 'none', '{}', 'rules.retention.accounting_records.years', '1.0')
 ON CONFLICT (key) DO NOTHING;
+-- اعمال دوبارهٔ این فایل روی کاتالوگ پیشین: سیاست جایگزینی مقسوم‌علیه ساعتی از «any» به «ceiling» (RV-CMP-02)
+UPDATE rules.param_def SET override_policy = 'ceiling' WHERE key = 'payroll.time.hourly_divisor' AND override_policy <> 'ceiling';
 
 INSERT INTO rules.tax_category (code, kind, title_key, introduced_in) VALUES
   ('standard',     'vat',        'tax_category.standard', '1.0'),
@@ -4019,14 +4614,18 @@ INSERT INTO rules.tax_category (code, kind, title_key, introduced_in) VALUES
   ('municipal',    'other_levy', 'tax_category.municipal', '1.0')
 ON CONFLICT (code) DO NOTHING;
 
-INSERT INTO rules.obligation_def (code, domain, frequency, applies_to, title_key, introduced_in) VALUES
-  ('tax.vat.quarterly_return',     'tax',     'quarterly',  'company',  'obligation.tax.vat.quarterly_return', '1.0'),
-  ('tax.art169.quarterly_list',    'tax',     'quarterly',  'company',  'obligation.tax.art169.quarterly_list', '1.0'),
-  ('tax.eledger.periodic',         'tax',     'quarterly',  'company',  'obligation.tax.eledger.periodic', '1.0'),
-  ('tax.income.annual_return',     'tax',     'annual',     'company',  'obligation.tax.income.annual_return', '1.0'),
-  ('tax.moadian.cert_renewal',     'tax',     'per_event',  'memory',   'obligation.tax.moadian.cert_renewal', '1.0'),
-  ('payroll.ssi.monthly_list',     'payroll', 'monthly',    'workshop', 'obligation.payroll.ssi.monthly_list', '1.0'),
-  ('payroll.salary_tax.remit',     'payroll', 'per_event',  'workshop', 'obligation.payroll.salary_tax.remit', '1.0')
+INSERT INTO rules.obligation_def (code, domain, frequency, frequency_rule_key, applies_to, title_key, introduced_in) VALUES
+  ('tax.vat.quarterly_return',     'tax',     'quarterly',  NULL,                 'company',  'obligation.tax.vat.quarterly_return', '1.0'),
+  ('tax.art169.quarterly_list',    'tax',     'quarterly',  NULL,                 'company',  'obligation.tax.art169.quarterly_list', '1.0'),
+  ('tax.eledger.periodic',         'tax',     'per_rule',   'tax.eledger.period', 'company',  'obligation.tax.eledger.periodic', '1.0'),
+  ('tax.income.annual_return',     'tax',     'annual',     NULL,                 'company',  'obligation.tax.income.annual_return', '1.0'),
+  ('tax.moadian.cert_renewal',     'tax',     'per_event',  NULL,                 'memory',   'obligation.tax.moadian.cert_renewal', '1.0'),
+  ('payroll.ssi.monthly_list',     'payroll', 'monthly',    NULL,                 'workshop', 'obligation.payroll.ssi.monthly_list', '1.0'),
+  ('payroll.salary_tax.remit',     'payroll', 'per_event',  NULL,                 'workshop', 'obligation.payroll.salary_tax.remit', '1.0')
+ON CONFLICT (code) DO NOTHING;
+-- تکلیف احتمالی صنف برق، پیش‌فرض غیرفعال (RV-X3-12، Q-CMP-14): دوره و سررسید پس از تأیید با calendar.due_rule همین کد می‌آیند
+INSERT INTO rules.obligation_def (code, domain, frequency, frequency_rule_key, enabled_rule_key, applies_to, title_key, introduced_in) VALUES
+  ('tax.trade_system.reporting',   'tax',     'per_event',  NULL, 'tax.trade_system.reporting_required', 'company', 'obligation.tax.trade_system.reporting', '1.0')
 ON CONFLICT (code) DO NOTHING;
 
 INSERT INTO payroll.statutory_class (code, kind, allows_negative, description_key, introduced_in) VALUES
@@ -4126,6 +4725,8 @@ INSERT INTO core.permission (code, module, scope_dimensions, risk, allow_service
   ('payroll.run.post',          'payroll', '{company}', 'critical',  false, false, 'perm.payroll.run.post', '1.0'),
   ('payroll.run.cancel',        'payroll', '{company}', 'critical',  false, false, 'perm.payroll.run.cancel', '1.0'),
   ('payroll.payslip.read',      'payroll', '{company}', 'critical',  false, false, 'perm.payroll.payslip.read', '1.0'),
+  -- گزارش تجمیعی هزینهٔ حقوق بدون هیچ دادهٔ فردی (PayrollQuery.cost_summary؛ پاسخ C-AS-08 بخش ۱۰)
+  ('payroll.report.read',       'payroll', '{company}', 'sensitive', true,  false, 'perm.payroll.report.read', '1.0'),
   ('payroll.loan.manage',       'payroll', '{company}', 'sensitive', false, false, 'perm.payroll.loan.manage', '1.0'),
   ('payroll.file.generate',     'payroll', '{company}', 'sensitive', false, false, 'perm.payroll.file.generate', '1.0'),
   ('assets.asset.read',         'assets',  '{company,branch}', 'normal', true, false, 'perm.assets.asset.read', '1.0'),
@@ -4176,7 +4777,12 @@ INSERT INTO core.event_subscriber (subscriber, ordered, max_attempts, requires_w
   ('tax.party_merge',      true,  25, false, '1.0'),
   ('payroll.party_merge',  true,  25, false, '1.0'),
   ('assets.party_merge',   true,  25, false, '1.0'),
-  ('assets.year_close',    true,  25, false, '1.0')
+  ('assets.year_close',    true,  25, false, '1.0'),
+  -- مصرف‌کننده‌های اعلام‌شده در 04 §۶ (RV-X1-12): تغییر هویت خریدار ← نسخه‌های امضانشده (prepared) کنار گذاشته و با
+  -- پروفایل تازه دوباره صادر می‌شوند و نسخه‌های ارسال‌شده اعلان «اصلاحی لازم است» می‌گیرند؛ تغییر sstid/طبقهٔ کالا ← بی‌اعتبار
+  -- کردن نهان ماشین‌حساب و اعلان برای اسناد pending همان کالا. هیچ‌کدام سند ثبت‌شده را عوض نمی‌کند.
+  ('tax.party_identity_sync', true,  25, false, '1.0'),
+  ('tax.item_sync',           false, 25, false, '1.0')
 ON CONFLICT DO NOTHING;
 INSERT INTO core.event_subscription (event_type, subscriber) VALUES
   ('rules.package.activated',   'rules.retro_scan'),
@@ -4185,8 +4791,17 @@ INSERT INTO core.event_subscription (event_type, subscriber) VALUES
   ('parties.party.merged',      'tax.party_merge'),
   ('parties.party.merged',      'payroll.party_merge'),
   ('parties.party.merged',      'assets.party_merge'),
-  ('ledger.year.closed',        'assets.year_close')
+  -- نام رویداد تولیدکننده (03 §۵ و §۶: ledger.fiscal_year.closed/reopened)؛ بازگشایی کار بستن سال دارایی را برمی‌گرداند
+  ('parties.party.identity_changed', 'tax.party_identity_sync'),
+  ('catalog.item.updated',      'tax.item_sync'),
+  ('ledger.fiscal_year.closed',   'assets.year_close'),
+  ('ledger.fiscal_year.reopened', 'assets.year_close')
 ON CONFLICT DO NOTHING;
+-- وضعیت توزیع بسته در صفحهٔ کنترل (installed/active/rejected/superseded/withdrawn/golden_verified) سلولی است، نه مستأجری:
+-- عامل uplink آن را از rules.package_event و rules.golden_run (سراسری) با tenant_id = NULL می‌فرستد؛ پس uplink مشترک
+-- رونوشت‌های مستأجری rules.package.activated نیست تا هر رویداد N بار (یک بار برای هر مستأجر) نرود (RV-X1-12).
+-- اشتراک نادرست پیشین (رویدادی که هیچ تولیدکننده‌ای ندارد؛ RV-LEDGER-11) در اعمال دوباره پاک می‌شود
+DELETE FROM core.event_subscription WHERE event_type = 'ledger.year.closed' AND subscriber = 'assets.year_close';
 
 INSERT INTO core.notification_category (code, module, is_mandatory, default_channels, description_key) VALUES
   ('tax.moadian_deadline',   'tax',     true,  '{in_app,sms}', 'ntf.tax.moadian_deadline'),
@@ -4207,6 +4822,7 @@ INSERT INTO core.export_table_registry (schema_name, table_name, module, mode, e
   ('rules','tenant_pack_event',     'rules',   'rows', 810, '{}', '{}', NULL),
   ('rules','pack_artifact',         'rules',   'rows', 812, '{}', '{}', NULL),
   ('tax','taxpayer_profile',        'tax',     'rows', 820, '{}', '{}', NULL),
+  ('tax','taxpayer_branch',         'tax',     'rows', 821, '{}', '{}', NULL),
   ('tax','vat_registration',        'tax',     'rows', 822, '{}', '{}', NULL),
   ('tax','memory',                  'tax',     'rows', 824, '{}', '{}', NULL),
   ('tax','memory_key',              'tax',     'rows', 826, '{}', '{private_key_sealed}', 'sealed with the source KEK; the import hook re-seals with the target KeyManager'),
@@ -4270,7 +4886,7 @@ GRANT SELECT, INSERT, UPDATE ON rules.param_override, rules.recalc_proposal, rul
 GRANT SELECT, INSERT, UPDATE, DELETE ON rules.compliance_item TO hk_app;
 GRANT SELECT, INSERT ON rules.calc_snapshot, rules.tenant_pack_event TO hk_app;
 -- tax
-GRANT SELECT, INSERT, UPDATE ON tax.taxpayer_profile, tax.vat_registration, tax.memory_key, tax.invoice, tax.invoice_issue,
+GRANT SELECT, INSERT, UPDATE ON tax.taxpayer_profile, tax.taxpayer_branch, tax.vat_registration, tax.memory_key, tax.invoice, tax.invoice_issue,
                                 tax.send_batch, tax.purchase_entry, tax.threshold_monitor, tax.legal_report TO hk_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON tax.memory, tax.vat_return, tax.vat_return_line TO hk_app;
 GRANT SELECT, INSERT ON tax.invoice_issue_line, tax.submission_attempt, tax.inquiry_log TO hk_app;
